@@ -94,6 +94,8 @@ static void RemoveProcFromArray(int code, Datum arg);
 static void ProcKill(int code, Datum arg);
 static void AuxiliaryProcKill(int code, Datum arg);
 static void CheckDeadLock(void);
+static void acquire_all_lockline(void);
+static void release_all_lockline(void);
 
 
 /*
@@ -1689,8 +1691,6 @@ ProcLockWakeup(LockMethod lockMethodTable, LOCK *lock)
 static void
 CheckDeadLock(void)
 {
-	int			i;
-
 	/*
 	 * Acquire exclusive lock on the entire shared lock data structures. Must
 	 * grab LWLocks in partition-number order to avoid LWLock deadlock.
@@ -1701,8 +1701,7 @@ CheckDeadLock(void)
 	 * section, so that this routine cannot be interrupted by cancel/die
 	 * interrupts.
 	 */
-	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
-		LWLockAcquire(LockHashPartitionLockByIndex(i), LW_EXCLUSIVE);
+	acquire_all_lockline();
 
 	/*
 	 * Check to see if we've been awoken by anyone in the interim.
@@ -1754,6 +1753,20 @@ CheckDeadLock(void)
 		 * RemoveFromWaitQueue took care of waking up any such processes.
 		 */
 	}
+	else if (deadlock_state == DS_EXTERNAL_LOCK)
+	{
+		/*
+		 * K.Suzuki: Release LWLocks to wait for remote site deadlock check
+		 */
+		release_all_lockline();
+		deadlock_state = GlobalDeadlockCheck(MyProc);
+		acquire_all_lockline();
+		if (deadlock_state == DS_HARD_DEADLOCK)
+		{
+			Assert(MyProc->waitLock != NULL);
+			RemoveFromWaitQueue(MyProc, LockTagHashCode(&(MyProc->waitLock->tag)));
+		}
+	}
 
 	/*
 	 * And release locks.  We do this in reverse order for two reasons: (1)
@@ -1763,9 +1776,27 @@ CheckDeadLock(void)
 	 * behavior inside LWLockRelease.
 	 */
 check_done:
-	for (i = NUM_LOCK_PARTITIONS; --i >= 0;)
-		LWLockRelease(LockHashPartitionLockByIndex(i));
+	release_all_lockline();
 }
+
+static void
+acquire_all_lockline(void)
+{
+	int ii;
+
+	for (ii = 0; ii < NUM_LOCK_PARTITIONS; ii++)
+	LWLockAcquire(LockHashPartitionLockByIndex(ii), LW_EXCLUSIVE);
+}
+
+static void
+release_all_lockline(void)
+{
+	int ii;
+
+	for (ii = 0; ii < NUM_LOCK_PARTITIONS; ii++)
+	LWLockRelease(LockHashPartitionLockByIndex(ii));
+}
+
 
 /*
  * CheckDeadLockAlert - Handle the expiry of deadlock_timeout.

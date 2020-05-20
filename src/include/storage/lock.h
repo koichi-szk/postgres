@@ -145,9 +145,17 @@ typedef enum LockTagType
 	LOCKTAG_VIRTUALTRANSACTION, /* virtual transaction (ditto) */
 	LOCKTAG_SPECULATIVE_TOKEN,	/* speculative insertion Xid and token */
 	LOCKTAG_OBJECT,				/* non-relation database object */
+	LOCKTAG_EXTERNAL,           /* External lock to represent child remote transaction */
+								/* ID info for an external txn is pgprocno, pid, xid and serial no. */
+								/* All the above is taken from the lock group leader */
 	LOCKTAG_USERLOCK,			/* reserved for old contrib/userlock code */
 	LOCKTAG_ADVISORY			/* advisory user locks */
 } LockTagType;
+
+/*
+ * Encapsulation of DEADLOCK_INFO
+ */
+typedef struct DEADLOCK_INFO DEADLOCK_INFO;
 
 #define LOCKTAG_LAST_TYPE	LOCKTAG_ADVISORY
 
@@ -471,6 +479,17 @@ typedef struct BlockedProcsData
 	int			maxpids;		/* Allocated length of waiter_pids[] array */
 } BlockedProcsData;
 
+typedef struct ExternalLockInfo
+{
+	int			pid;
+	int			pgprocno;
+	LocalTransactionId	txnid;
+	int			serno;
+	char	   *dsn;
+	int			target_pid;
+	int			target_pgprocno;
+	LocalTransactionId	target_txn;
+} ExternalLockInfo;
 
 /* Result codes for LockAcquire() */
 typedef enum
@@ -488,9 +507,77 @@ typedef enum
 	DS_NO_DEADLOCK,				/* no deadlock detected */
 	DS_SOFT_DEADLOCK,			/* deadlock avoided by queue rearrangement */
 	DS_HARD_DEADLOCK,			/* deadlock, no way out but ERROR */
-	DS_BLOCKED_BY_AUTOVACUUM	/* no deadlock; queue blocked by autovacuum
+	DS_BLOCKED_BY_AUTOVACUUM,	/* no deadlock; queue blocked by autovacuum
 								 * worker */
+	DS_EXTERNAL_LOCK,			/* waiting for remote transaction, need global deadlock detection */
+	DS_GLOBAL_ERROR				/* Used only to report internal error in global deadlock detection */
 } DeadLockState;
+
+
+/*
+ * Information saved about each edge in a detected deadlock cycle.  This
+ * is used to print a diagnostic message upon failure.
+ *
+ * Note: because we want to examine this info after releasing the lock
+ * manager's partition locks, we can't just store LOCK and PGPROC pointers;
+ * we must extract out all the info we want to be able to print.
+ *
+ * K.Suzuki: この構造体の中に Global に使う wait-for-graph を入れておくといいかも。
+ *           EDBE は作業用で、こちらは完成した DeadlockCycle になっているから。
+ *           必要な情報を追加しておく。
+ *           実際には、これは static な deadlockDetails 配列上ですべて操作
+ *           されるので、ここに必要なコードを追加すれば global 用の WfG が
+ *           作れる。
+ */
+
+#define WfG_HAS_EXTERNAL_LOCK	0x00000001
+#define WfG_HAS_VISITED_PROC	0x00000002
+
+#define WfG_GLOBAL_MAGIC		0x80800001
+#define WfG_LOCAL_MAGIC			0x80880001
+
+typedef struct DEADLOCK_INFO
+{
+    LOCKTAG     locktag;        /* ID of awaited lock object */
+    LOCKMODE    lockmode;       /* type of lock we're waiting for */
+    int         pid;            /* PID of blocked backend */
+    /*
+     * K.Suzuki: The following is used for global deadlock detection.
+     *           These information is backed up here to check if there are no change
+     *           in PID and TXID and Wait-for-graph is globally stable.
+     */
+    int         pgprocno;       /* PGPROC index of the blocked backend */
+    TransactionId   txid;       /* Transacito ID of the blocked backend */
+} DEADLOCK_INFO;
+
+typedef struct LOCAL_WFG
+{
+	int32			 	 local_wfg_magic;		/* Not needed but provide a workspace to check */
+	int32			 	 local_wfg_flag;
+	int64			 	 database_system_identifier;
+	int32				 visitedProcPid;		/* PID of visitedProc[0], exist only in the origin node */
+	int32			     visitedProcPgprocno;	/* pgprocno of visitedProc[0], exist only in the origin node */
+	int32				 visitedProcLxid;		/* lxid of visitedProc[0], exist only in the origin node */
+	int32			 	 nDeadlockInfo;
+	DEADLOCK_INFO		*deadlock_info;
+	ExternalLockInfo	*external_lock;
+	int32				 local_wfg_trailor;		/* Not needed but provide a workspace to check */
+} LOCAL_WFG;
+
+/*
+ * is_text[i], txtsize[i] and local_wfg[i] represents local WfG for i-th node.
+ * if is_text is true, local_wfg[i] is binary stream representation of WfG, which is used
+ * if version of local WfG is different from current one.  Otherwise, this is LOCAL_WFG *
+ */
+typedef struct GLOBAL_WFG
+{
+	int32	  global_wfg_magic;
+	int32	  nLocalWfg;
+	bool	 *is_text;
+	int32	 *txtsize;
+	void	**local_wfg;		/* if (is_tex) then this is char *, otherwise LOCAL_WFG */
+	int32	  global_wfg_trailor;
+} GLOBAL_WFG;
 
 /*
  * The lockmgr's shared hash tables are partitioned to reduce contention.
@@ -517,6 +604,12 @@ typedef enum
  */
 #define LockHashPartitionLockByProc(leader_pgproc) \
 	LockHashPartitionLock((leader_pgproc)->pgprocno)
+
+#define CompleteExternalLock(l) \
+	do { (l)->locktag_type = LOCKTAG_EXTERNAL; \
+		 (l)->locktag_lockmethodid = DEFAULT_LOCKMETHOD; \
+	} while (0)
+
 
 /*
  * function prototypes
@@ -583,15 +676,48 @@ extern void RememberSimpleDeadLock(PGPROC *proc1,
 extern void InitDeadLockChecking(void);
 
 extern int	LockWaiterCount(const LOCKTAG *locktag);
+DEADLOCK_INFO *GetDeadLockInfo(int *nInfo);
+
 
 #ifdef LOCK_DEBUG
 extern void DumpLocks(PGPROC *proc);
 extern void DumpAllLocks(void);
 #endif
 
+/* GUC to control global deadlock detection */
+extern bool enable_global_deadlock_detection;
+
 /* Lock a VXID (used to wait for a transaction to finish) */
 extern void VirtualXactLockTableInsert(VirtualTransactionId vxid);
 extern void VirtualXactLockTableCleanup(void);
 extern bool VirtualXactLock(VirtualTransactionId vxid, bool wait);
+
+/* Functions for External Lock */
+extern	void	set_locktag_external(LOCKTAG *locktag, PGPROC *proc, bool incr);
+extern	LockAcquireResult ExternalLockAcquire(PGPROC *proc, LOCKTAG *locktag);
+extern	bool	ExternalLockRelease(LOCKTAG *locktag);
+extern	bool	ExternalLockWaitProc(const LOCKTAG *locktag, PGPROC *proc);
+extern	bool	ExternalLockWait(const LOCKTAG *locktag);
+extern	bool	ExternalLockUnWaitProc(const LOCKTAG *locktag, PGPROC *proc);
+extern	bool	ExternalLockUnWait(const LOCKTAG *locktag);
+extern	bool	ExernalLockWait(const LOCKTAG *locktag);
+extern	bool	ExternalLockSetProperties(LOCKTAG *locktag,
+					PGPROC *proc, char *dsn, int target_pgprocno,
+					int target_pid, TransactionId target_xid, bool update_flag);
+extern DEADLOCK_INFO *BuildLocalDeadlockInfo(int *nInfo);
+extern ExternalLockInfo *GetExternalLockProperties(const LOCKTAG *locktag);
+extern void FreeExternalLockProperties(ExternalLockInfo *ext_lockinfo);
+
+/* Functions for Global deadlock detection */
+
+extern StringInfo	 SerializeLocalWfG(LOCAL_WFG *local_wfg);
+extern LOCAL_WFG 	*DeserializeLocalWfG(char *buf);
+extern GLOBAL_WFG	*AddToGlobalWfG(GLOBAL_WFG *g_wfg, LOCAL_WFG *local_wfg);
+extern GLOBAL_WFG	*AddToGlobalWfG_Stream(GLOBAL_WFG *g_wfg, char *local_wfg_s, int32 size);
+extern StringInfo	 SerializeGlobalWfG(GLOBAL_WFG *g_wfg);
+extern GLOBAL_WFG	*DeserializeGlobalWfG(char *buf);
+extern DeadLockState GlobalDeadlockCheck(PGPROC *proc);
+extern DeadLockState GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, char **returning_wfg);
+extern GLOBAL_WFG   *DeserializeGlobalWfG(char *buf);
 
 #endif							/* LOCK_H */

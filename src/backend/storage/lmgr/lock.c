@@ -30,6 +30,8 @@
 #include "postgres.h"
 
 #include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "access/transam.h"
@@ -53,9 +55,11 @@
 /* This configuration variable is used to set the lock table size */
 int			max_locks_per_xact; /* set by guc.c */
 
+/* GUC parameter to enable global deadlock detection */
+bool	enable_global_deadlock_detection;
+
 #define NLOCKENTS() \
 	mul_size(max_locks_per_xact, add_size(MaxBackends, max_prepared_xacts))
-
 
 /*
  * Data structures defining the semantics of the standard lock methods.
@@ -213,6 +217,13 @@ static bool FastPathUnGrantRelationLock(Oid relid, LOCKMODE lockmode);
 static bool FastPathTransferRelationLocks(LockMethod lockMethodTable,
 										  const LOCKTAG *locktag, uint32 hashcode);
 static PROCLOCK *FastPathGetRelationLockEntry(LOCALLOCK *locallock);
+static bool checkExternalLockTag(const LOCKTAG *locktag, PGPROC *proc);
+static bool externalLockFileUnlink(LOCKTAG *locktag);
+static bool externalLockFileUnlinkProc(const LOCKTAG *locktag, PGPROC *proc);
+static LOCK *findLock(const LOCKTAG *locktag);
+static char *findExternalLockFileName(const LOCKTAG *locktag);
+ExternalLockInfo *GetExternalLockProperties(const LOCKTAG *locktag);
+static bool read_line(int f, StringInfo s);
 
 /*
  * To make the fast-path lock mechanism work, we must have some way of
@@ -359,6 +370,7 @@ static void LockRefindAndRelease(LockMethod lockMethodTable, PGPROC *proc,
 								 bool decrement_strong_lock_count);
 static void GetSingleProcBlockerStatusData(PGPROC *blocked_proc,
 										   BlockedProcsData *data);
+static bool externalLockFileUnlinkProc(const LOCKTAG *locktag, PGPROC *proc);
 
 
 /*
@@ -4494,3 +4506,355 @@ LockWaiterCount(const LOCKTAG *locktag)
 
 	return waiters;
 }
+
+#define get_leader_proc(proc) \
+	((proc)->lockGroupLeader ? (proc) : (proc)->lockGroupLeader)
+
+/*
+ *set_locktag_external
+ *
+ * Set LOCKTAG for external lock
+ */
+void
+set_locktag_external(LOCKTAG *locktag, PGPROC *proc, bool incr)
+{
+	PGPROC *leader;
+	Assert(locktag);
+
+	leader = get_leader_proc(proc);
+	locktag->locktag_field1 = leader->pgprocno;
+	locktag->locktag_field2 = leader->pid;
+	locktag->locktag_field3 = proc->lxid;
+	locktag->locktag_field4 = leader->external_lock_no;
+	locktag->locktag_type = LOCKTAG_EXTERNAL;
+	locktag->locktag_lockmethodid = DEFAULT_LOCKMETHOD;
+	if (incr)
+		leader->external_lock_no++;
+	return;
+}
+
+
+LockAcquireResult
+ExternalLockAcquire(PGPROC *proc, LOCKTAG *locktag)
+{
+	LockAcquireResult	rv;
+	PGPROC *leader;
+
+	Assert(locktag);
+	Assert(proc);
+
+	leader = get_leader_proc(proc);
+	locktag->locktag_field1 = leader->pgprocno;
+	locktag->locktag_field2 = leader->pid;
+	locktag->locktag_field3 = proc->lxid;
+	locktag->locktag_field4 = leader->external_lock_no;
+	locktag->locktag_type = LOCKTAG_EXTERNAL;
+	locktag->locktag_lockmethodid = DEFAULT_LOCKMETHOD;
+
+	rv =  LockAcquireExtended(locktag, AccessExclusiveLock, false, true,
+							   true, NULL);
+	if (rv == LOCKACQUIRE_OK)
+		leader->external_lock_no++;
+	return rv;
+}
+
+bool
+ExternalLockRelease(LOCKTAG *locktag)
+{
+	bool rv;
+
+	rv = LockRelease(locktag, AccessExclusiveLock, false);
+	if (rv != true)
+		return rv;
+	externalLockFileUnlink(locktag);
+	return rv;
+}
+
+#if 0
+bool
+ExternalLockWaitProc(const LOCKTAG *locktag, PGPROC *proc)
+{
+	LOCK   *lock;
+	bool	found;
+
+	if (checkExternalLockTag(locktag, proc) != true)
+		return false;
+	if (proc->waitLock)
+		return false;
+	lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash,
+												(const void *) locktag,
+												LockTagHashCode(locktag),
+												HASH_FIND,
+												&found);
+	if (!lock)
+		return false;
+	proc->waitLock = lock;
+}
+
+bool
+ExternalLockWait(const LOCKTAG *locktag)
+{
+	bool rv;
+
+	rv = ExternalLockWaitProc(locktag, MyProc);
+	if (rv != true)
+		return rv;
+
+	externalLockFileUnlinkProc(locktag, MyProc);
+	return rv;
+}
+#endif
+
+bool
+ExternalLockUnWaitProc(const LOCKTAG *locktag, PGPROC *proc)
+{
+	if (!proc->waitLock)
+		return false;
+	if (memcmp(locktag, &(proc->waitLock->tag), sizeof(LOCKTAG)))
+		return false;
+	if (checkExternalLockTag(locktag, proc) != true)
+		return false;
+	proc->waitLock = NULL;
+	return true;
+}
+
+bool
+ExternalLockUnWait(const LOCKTAG *locktag)
+{
+	return ExternalLockUnWaitProc(locktag, MyProc);
+}
+
+
+/*
+ * Check if given process is eligible to wait for given external lock
+ */
+static bool
+checkExternalLockTag(const LOCKTAG *locktag, PGPROC *proc)
+{
+	PGPROC *leader = get_leader_proc(proc);
+
+	if ((locktag->locktag_type != LOCKTAG_EXTERNAL) ||
+		(locktag->locktag_lockmethodid != DEFAULT_LOCKMETHOD))
+		return false;
+	if ((locktag->locktag_field1 != leader->pgprocno) ||
+		(locktag->locktag_field2 != leader->pid) ||
+		(locktag->locktag_field3 != proc->lxid))
+		return false;
+	if (locktag->locktag_field4 > leader->external_lock_no)
+		return false;
+	if (findLock(locktag) == NULL)
+		return false;
+	return true;
+}
+
+/*
+ * Set external lock as "Waiting"
+ */
+bool
+ExernalLockWait(const LOCKTAG *locktag)
+{
+	return ExternalLockWaitProc(locktag, MyProc);
+}
+
+bool
+ExternalLockWaitProc(const LOCKTAG *locktag, PGPROC *proc)
+{
+	LOCK	*lock;
+	
+	if (checkExternalLockTag(locktag, proc) != true)
+	{
+		elog(ERROR, "Locktag type error.  Should be LOCKTAG_EXTERNAL\n");
+		return false;
+	}
+	lock = findLock(locktag);
+	if (lock == NULL)
+		/* Specified lock does not exist */
+		return false;
+	if (proc->waitLock != NULL)
+	{
+		/* Already wating for some lock. Internal eror. */
+		elog(ERROR, "Process is already waiting for another lock.\n");
+		return false;
+	}
+	proc->waitLock = lock;
+	return true;
+}
+
+bool
+ExternalLockSetProperties(LOCKTAG *locktag,
+						  PGPROC *proc,
+						  char *dsn,
+						  int target_pgprocno,
+						  int target_pid,
+						  TransactionId target_xid,
+						  bool update_flag)
+{
+	char		   *lockFname;
+	StringInfoData	externalLockFileData;
+	struct stat		statbuf;
+	int				lockF;
+
+	/*
+	 * Check if locktag and proc satisfy the eligibility.
+	 */
+	if (checkExternalLockTag(locktag, proc) != true)
+		return false;
+
+	lockFname = findExternalLockFileName(locktag);
+	/*
+	 * Check if the target file exists
+	 */
+	if (stat(lockFname, &statbuf) == 0)
+	{
+		if (update_flag == false)
+		{
+			pfree(lockFname);
+			return false;
+		}
+		if (statbuf.st_mode != S_IFREG)
+		{
+			pfree(lockFname);
+			elog(ERROR, "Specified external lock file is not a regular file.");
+			return false;
+		}
+	}
+	initStringInfo(&externalLockFileData);
+	appendStringInfo(&externalLockFileData, "%s\n%d\n%d\n%d", dsn, target_pgprocno, target_pid, target_xid);
+	lockF = open(lockFname, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
+	if (lockF < 0)
+		elog(ERROR, "Could not open external lock file, %s", lockFname);
+	if (write(lockF, externalLockFileData.data, externalLockFileData.len) != externalLockFileData.len)
+		elog(ERROR, "Could not write to external lock file, %s", lockFname);
+	close(lockF);
+	pfree(lockFname);
+	pfree(externalLockFileData.data);
+	return true;
+}
+
+ExternalLockInfo *
+GetExternalLockProperties(const LOCKTAG *locktag)
+{
+	int					lockF;
+	ExternalLockInfo   *output;
+	StringInfoData		linebuf;
+	char			   *lockfname;
+	LOCK			   *lock;
+
+	lock = findLock(locktag);
+	if (lock == NULL)
+		return NULL;
+	if (locktag->locktag_type != LOCKTAG_EXTERNAL)
+		return NULL;
+	lockfname = findExternalLockFileName(locktag);
+	lockF = open(lockfname, O_RDONLY);
+	if (lockF < 0)
+		elog(ERROR, "Could not open external lock file, %s", lockfname);
+	pfree(lockfname);
+	output = (ExternalLockInfo *)palloc(sizeof(ExternalLockInfo));
+	output->pgprocno = locktag->locktag_field1;
+	output->pid = locktag->locktag_field2;
+	output->txnid = locktag->locktag_field3;
+	output->serno = locktag->locktag_field4;
+
+	/* read dsn */
+	initStringInfo(&linebuf);
+	read_line(lockF, &linebuf);
+	output->dsn = pstrdup(linebuf.data);
+	/* Read target pgprocno */
+	read_line(lockF, &linebuf);
+	output->target_pgprocno = atoi(linebuf.data);
+	/* Read target pid */
+	read_line(lockF, &linebuf);
+	output->target_pid = atoi(linebuf.data);
+	/* Read target xid */
+	read_line(lockF, &linebuf);
+	output->target_txn = atoi(linebuf.data);
+	close(lockF);
+	pfree(linebuf.data);
+	return output;
+}
+
+static char *
+findExternalLockFileName(const LOCKTAG *locktag)
+{
+	StringInfoData	fname;
+
+	initStringInfo(&fname);
+	appendStringInfo(&fname, "%s/pg_external_locks/%016x%016x", DataDir, locktag->locktag_field2, locktag->locktag_field4);
+	return fname.data;
+}
+
+static LOCK *
+findLock(const LOCKTAG *locktag)
+{
+	bool	found;
+	LOCK   *lock;
+
+	lock = (LOCK *)hash_search_with_hash_value(LockMethodLockHash,
+											   (const void *) locktag,
+											   LockTagHashCode(locktag),
+											   HASH_FIND,
+											   &found);
+	if (!found)
+		elog(DEBUG3, "No lock found. %%1: %d, %%2: %d, %%3: %d, %%4: %d, %%5: %d, %%6: %d",
+				locktag->locktag_field1, locktag->locktag_field2,
+				locktag->locktag_field3, locktag->locktag_field4,
+				locktag->locktag_type, locktag->locktag_lockmethodid);
+	return found ? lock : NULL;
+}
+
+static bool
+read_line(int f, StringInfo s)
+{
+	char	inbuf;
+	int		ll;
+
+	resetStringInfo(s);
+	while(true)
+	{
+		ll = read(f, &inbuf, 1);
+		if (ll == 0)
+			goto fmterr;
+		if (inbuf == '\n')
+			break;
+		appendStringInfoChar(s, inbuf);
+	}
+	return true;
+
+fmterr:
+	close(f);
+	elog(ERROR, "Exernal lock file format error.");
+	return false;
+}
+
+void
+FreeExternalLockProperties(ExternalLockInfo *ext_lockinfo)
+{
+	if (ext_lockinfo->dsn)
+		pfree(ext_lockinfo->dsn);
+	pfree(ext_lockinfo);
+}
+
+
+static bool
+externalLockFileUnlinkProc(const LOCKTAG *locktag, PGPROC *proc)
+{
+	char *externalLockFilePath;
+	int	rv;
+
+	if (checkExternalLockTag(locktag, proc) == true)
+		return false;
+
+	externalLockFilePath = findExternalLockFileName(locktag);
+
+	rv = unlink(externalLockFilePath);
+	pfree(externalLockFilePath);
+	return (rv == 0 ? true : false);
+}
+
+static bool
+externalLockFileUnlink(LOCKTAG *locktag)
+{
+	return(externalLockFileUnlinkProc(locktag, MyProc));
+}
+
