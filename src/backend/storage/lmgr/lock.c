@@ -3,7 +3,7 @@
  * lock.c
  *	  POSTGRES primary lock mechanism
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,19 +19,40 @@
  *	  For the most part, this code should be invoked via lmgr.c
  *	  or another lock-management module, not directly.
  *
+ * Notes for additional lock type
+ *
+ *	  Added lock type EXTERNAL_LOCK for global deadlock detection.
+ *	  This represents remote transaction which the backend is waiting
+ *	  for.
+ *
+ *    Because blocking backend is not in this postgres instance,
+ *	  this lock is held by the waiting backend and is waited by the same
+ *	  backend.
+ *
+ *    For this, EXTERNAL_LOCK needs dedicated API to handle.
+ *    These API are used by deadlock detection internals and modules
+ *	  which issue remote transactions.
+ *
  *	Interface:
  *
  *	InitLocks(), GetLocksMethodTable(), GetLockTagsMethodTable(),
  *	LockAcquire(), LockRelease(), LockReleaseAll(),
  *	LockCheckConflicts(), GrantLock()
  *
+ * Interface for external lock:
+ *
+ *  set_locktag_external(), ExternalLockAcquire(), ExternalLockRelease(),
+ *  ExternalLockUnWaitProc(), ExternalLockUnWait(), ExernalLockWait(),
+ *  ExternalLockWaitProc(), ExternalLockSetProperties(),
+ *  GetExternalLockProperties(), FreeExternalLockProperties()
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include <signal.h>
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include "access/transam.h"
@@ -217,6 +238,9 @@ static bool FastPathUnGrantRelationLock(Oid relid, LOCKMODE lockmode);
 static bool FastPathTransferRelationLocks(LockMethod lockMethodTable,
 										  const LOCKTAG *locktag, uint32 hashcode);
 static PROCLOCK *FastPathGetRelationLockEntry(LOCALLOCK *locallock);
+/*
+ * Additional functions to support external lock.
+ */
 static bool checkExternalLockTag(const LOCKTAG *locktag, PGPROC *proc);
 static bool externalLockFileUnlink(LOCKTAG *locktag);
 static bool externalLockFileUnlinkProc(const LOCKTAG *locktag, PGPROC *proc);
@@ -370,6 +394,8 @@ static void LockRefindAndRelease(LockMethod lockMethodTable, PGPROC *proc,
 								 bool decrement_strong_lock_count);
 static void GetSingleProcBlockerStatusData(PGPROC *blocked_proc,
 										   BlockedProcsData *data);
+
+/* Additional function for external lock */
 static bool externalLockFileUnlinkProc(const LOCKTAG *locktag, PGPROC *proc);
 
 
@@ -4507,6 +4533,13 @@ LockWaiterCount(const LOCKTAG *locktag)
 	return waiters;
 }
 
+/*
+ * ---------------------------------------------------------------------------------
+ *
+ * Dedicated API for external lock.
+ *
+ * ---------------------------------------------------------------------------------
+ */
 #define get_leader_proc(proc) \
 	((proc)->lockGroupLeader ? (proc) : (proc)->lockGroupLeader)
 

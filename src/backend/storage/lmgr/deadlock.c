@@ -89,10 +89,8 @@ static bool ExpandConstraints(EDGE *constraints, int nConstraints);
 static bool TopoSort(LOCK *lock, EDGE *constraints, int nConstraints,
 					 PGPROC **ordering);
 
-uint64 get_database_system_id(void);
 static LOCAL_WFG *BuildLocalWfG(PGPROC *origin);
 static void  free_local_wfg(LOCAL_WFG *local_wfg);
-static const char * locktag_type_name(int type);
 static void hold_all_lockline(void);
 static void release_all_lockline(void);
 static void release_all_lockline(void);
@@ -100,6 +98,11 @@ static void release_all_lockline(void);
 static void PrintLockQueue(LOCK *lock, const char *info);
 #endif
 static bool external_lock_is_same(ExternalLockInfo *one, ExternalLockInfo *two);
+static StringInfo SerializeLocalWfG(LOCAL_WFG *local_wfg);
+static LOCAL_WFG *DeserializeLocalWfG(char *buf);
+static GLOBAL_WFG *AddToGlobalWfG(GLOBAL_WFG *g_wfg, LOCAL_WFG *local_wfg);
+static StringInfo SerializeGlobalWfG(GLOBAL_WFG *g_wfg);
+static GLOBAL_WFG *DeserializeGlobalWfG(char *buf);
 
 /* WFG utility functions */
 static void  appendBinaryStringInfoInt64(StringInfo str, int64 value);
@@ -1391,7 +1394,7 @@ BuildLocalWfG(PGPROC *origin)
 	return local_wfg;
 }
 
-StringInfo
+static StringInfo
 SerializeLocalWfG(LOCAL_WFG *local_wfg)
 {
 	int				ii;
@@ -1473,7 +1476,7 @@ SerializeLocalWfG(LOCAL_WFG *local_wfg)
 	return str;
 }
 
-LOCAL_WFG *
+static LOCAL_WFG *
 DeserializeLocalWfG(char *buf)
 {
 	LOCAL_WFG	*wfg;
@@ -1573,49 +1576,35 @@ get_database_system_id(void)
 	return system_identifier;
 }
 
-static const char *
-locktag_type_name(int type)
+const char *
+locktagTypeName(LockTagType type)
 {
-	static const char *LOCKTAG_RELATION_STR = "LOCKTAG_RELATION";
-	static const char *LOCKTAG_RELATION_EXTEND_STR = "LOCKTAG_RELATION_EXTEND";
-	static const char *LOCKTAG_PAGE_STR = "LOCKTAG_PAGE";
-	static const char *LOCKTAG_TUPLE_STR = "LOCKTAG_TUPLE";
-	static const char *LOCKTAG_TRANSACTION_STR = "LOCKTAG_TRANSACTION";
-	static const char *LOCKTAG_VIRTUALTRANSACTION_STR = "LOCKTAG_VIRTUALTRANSACTION";
-	static const char *LOCKTAG_SPECULATIVE_TOKEN_STR = "LOCKTAG_SPECULATIVE_TOKEN";
-	static const char *LOCKTAG_OBJECT_STR = "LOCKTAG_OBJECT";
-	static const char *LOCKTAG_USERLOCK_STR = "LOCKTAG_USERLOCK";
-	static const char *LOCKTAG_ADVISORY_STR = "LOCKTAG_ADVISORY";
-	static const char *LOCKTAG_EXTERNAL_STR = "LOCKTAG_EXTERNAL";
-
-	switch (type)
+	switch(type)
 	{
 		case LOCKTAG_RELATION:
-			return LOCKTAG_RELATION_STR;
+			return "LOCKTAG_RELATION";
 		case LOCKTAG_RELATION_EXTEND:
-			return LOCKTAG_RELATION_EXTEND_STR;
+			return "LOCKTAG_RELATION_EXTEND";
 		case LOCKTAG_PAGE:
-			return LOCKTAG_PAGE_STR;
+			return "LOCKTAG_PAGE";
 		case LOCKTAG_TUPLE:
-			return LOCKTAG_TUPLE_STR;
+			return "LOCKTAG_TUPLE";
 		case LOCKTAG_TRANSACTION:
-			return LOCKTAG_TRANSACTION_STR;
+			return "LOCKTAG_TRANSACTION";
 		case LOCKTAG_VIRTUALTRANSACTION:
-			return LOCKTAG_VIRTUALTRANSACTION_STR;
+			return "LOCKTAG_VIRTUALTRANSACTION";
 		case LOCKTAG_SPECULATIVE_TOKEN:
-			return LOCKTAG_SPECULATIVE_TOKEN_STR;
+			return "LOCKTAG_SPECULATIVE_TOKEN";
 		case LOCKTAG_OBJECT:
-			return LOCKTAG_OBJECT_STR;
+			return "LOCKTAG_OBJECT";
 		case LOCKTAG_USERLOCK:
-			return LOCKTAG_USERLOCK_STR;
-		case LOCKTAG_ADVISORY:
-			return LOCKTAG_ADVISORY_STR;
+			return "LOCKTAG_USERLOCK";
 		case LOCKTAG_EXTERNAL:
-			return LOCKTAG_EXTERNAL_STR;
-		default:
-			return NULL;
+			return "LOCKTAG_EXTERNAL";
+		case LOCKTAG_ADVISORY:
+			return "LOCKTAG_ADVISORY";
 	}
-	return NULL;
+	return "LOCKTAG_NO_SUCH_TYPE";
 }
 
 static GLOBAL_WFG *
@@ -1649,19 +1638,21 @@ addToGlobalWfg_int(GLOBAL_WFG *g_wfg, void *data, bool is_text, int size)
 	return g_wfg;
 }
 
-GLOBAL_WFG *
+static GLOBAL_WFG *
 AddToGlobalWfG(GLOBAL_WFG *g_wfg, LOCAL_WFG *local_wfg)
 {
 	return addToGlobalWfg_int(g_wfg, (void *)local_wfg, false, -1);
 }
 
+#if 0
 GLOBAL_WFG *
 AddToGlobalWfG_Stream(GLOBAL_WFG *g_wfg, char *local_wfg_s, int32 size)
 {
 	return addToGlobalWfg_int(g_wfg, (void *)local_wfg_s, true, size);
 }
+#endif
 
-StringInfo
+static StringInfo
 SerializeGlobalWfG(GLOBAL_WFG *g_wfg)
 {
 	int			ii;
@@ -1706,7 +1697,7 @@ SerializeGlobalWfG(GLOBAL_WFG *g_wfg)
 
 }
 
-GLOBAL_WFG *
+static GLOBAL_WFG *
 DeserializeGlobalWfG(char *buf)
 {
 	int			 ii;
@@ -2290,6 +2281,7 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
 	HeapTupleData	 tupleData;
 	HeapTuple		 tuple = &tupleData;
 	char			*values[2];
+
 	Datum			 result;
 	DeadLockState	 state = DS_NO_DEADLOCK;
 
@@ -2712,4 +2704,3 @@ external_lock_is_same(ExternalLockInfo *one, ExternalLockInfo *two)
 		return false;
 	return true;
 }
-

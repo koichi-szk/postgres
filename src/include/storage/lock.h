@@ -693,6 +693,8 @@ extern void VirtualXactLockTableCleanup(void);
 extern bool VirtualXactLock(VirtualTransactionId vxid, bool wait);
 
 /* Functions for External Lock */
+extern	uint64	get_database_system_id(void);
+extern	const char *locktagTypeName(LockTagType type);
 extern	void	set_locktag_external(LOCKTAG *locktag, PGPROC *proc, bool incr);
 extern	LockAcquireResult ExternalLockAcquire(PGPROC *proc, LOCKTAG *locktag);
 extern	bool	ExternalLockRelease(LOCKTAG *locktag);
@@ -710,14 +712,7 @@ extern void FreeExternalLockProperties(ExternalLockInfo *ext_lockinfo);
 
 /* Functions for Global deadlock detection */
 
-extern StringInfo	 SerializeLocalWfG(LOCAL_WFG *local_wfg);
-extern LOCAL_WFG 	*DeserializeLocalWfG(char *buf);
-extern GLOBAL_WFG	*AddToGlobalWfG(GLOBAL_WFG *g_wfg, LOCAL_WFG *local_wfg);
-extern GLOBAL_WFG	*AddToGlobalWfG_Stream(GLOBAL_WFG *g_wfg, char *local_wfg_s, int32 size);
-extern StringInfo	 SerializeGlobalWfG(GLOBAL_WFG *g_wfg);
-extern GLOBAL_WFG	*DeserializeGlobalWfG(char *buf);
 extern DeadLockState GlobalDeadlockCheck(PGPROC *proc);
 extern DeadLockState GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, char **returning_wfg);
-extern GLOBAL_WFG   *DeserializeGlobalWfG(char *buf);
 
 #endif							/* LOCK_H */

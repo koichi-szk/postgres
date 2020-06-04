@@ -13,7 +13,8 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = lmgr.o lock.o proc.o deadlock.o lwlock.o lwlocknames.o spin.o \
-	s_lock.o predicate.o condition_variable.o external_lock_test.o
+	s_lock.o predicate.o condition_variable.o
+
 
 include $(top_srcdir)/src/backend/common.mk
 

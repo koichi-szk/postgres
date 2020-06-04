@@ -32,8 +32,8 @@
 #include "postgres.h"
 
 #include <signal.h>
-#include <unistd.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -1765,6 +1765,11 @@ CheckDeadLock(void)
 		{
 			Assert(MyProc->waitLock != NULL);
 			RemoveFromWaitQueue(MyProc, LockTagHashCode(&(MyProc->waitLock->tag)));
+		}
+		else if (deadlock_state == DS_GLOBAL_ERROR)
+		{
+			release_all_lockline();
+			elog(ERROR, "Internal error in global deadlock detection.");
 		}
 	}
 

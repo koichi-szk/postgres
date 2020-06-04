@@ -51,6 +51,8 @@ ifeq ($(with_systemd),yes)
 LIBS += -lsystemd
 endif
 
+LIBS += ../../src/interfaces/libpq/libpq.a
+
 ##########################################################################
 
 all: submake-libpgport submake-catalog-headers submake-utils-headers postgres $(POSTGRES_IMP)
