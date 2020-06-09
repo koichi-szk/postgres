@@ -4541,7 +4541,7 @@ LockWaiterCount(const LOCKTAG *locktag)
  * ---------------------------------------------------------------------------------
  */
 #define get_leader_proc(proc) \
-	((proc)->lockGroupLeader ? (proc) : (proc)->lockGroupLeader)
+	((proc)->lockGroupLeader ? (proc)->lockGroupLeader : proc)
 
 /*
  *set_locktag_external
@@ -4684,7 +4684,7 @@ checkExternalLockTag(const LOCKTAG *locktag, PGPROC *proc)
  * Set external lock as "Waiting"
  */
 bool
-ExernalLockWait(const LOCKTAG *locktag)
+ExternalLockWait(const LOCKTAG *locktag)
 {
 	return ExternalLockWaitProc(locktag, MyProc);
 }

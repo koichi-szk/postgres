@@ -2704,3 +2704,11 @@ external_lock_is_same(ExternalLockInfo *one, ExternalLockInfo *two)
 		return false;
 	return true;
 }
+
+DEADLOCK_INFO *
+GetDeadLockInfo(int32 *nInfo)
+{
+	*nInfo = nDeadlockDetails;
+	return deadlockDetails;
+}
+
