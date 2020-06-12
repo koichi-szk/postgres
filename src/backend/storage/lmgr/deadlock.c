@@ -2065,7 +2065,7 @@ GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, char **r
 	global_wfg_text = binary2text(global_wfg_bin->data, global_wfg_bin->len);
 
 	/* Build remote query */
-	appendStringInfo(&query, "SELECT * FROM pg_global_deadlock_check('%s');", global_wfg_text);
+	appendStringInfo(&query, "SELECT * FROM pg_global_deadlock_check_from_remote('%s');", global_wfg_text);
 	pfree(global_wfg_text);
 	pfree(global_wfg_bin);
 
@@ -2165,7 +2165,7 @@ GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, char **r
 		 * Check if the current EXTERNAL LOCK is consistent with WfG
 		 */
 		resetStringInfo(&query);
-		appendStringInfo(&query, "SELECT * FROM pg_global_deadock_recheck(1, '%s');", returned_wfg);
+		appendStringInfo(&query, "SELECT * FROM pg_global_deadock_recheck_from_remote(1, '%s');", returned_wfg);
 		res = PQexec(conn, query.data);
 		if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
@@ -2210,10 +2210,6 @@ nodeadlock:
 	return state;
 }
 
-PG_FUNCTION_INFO_V1(pg_deadlock_check_from_remote);
-PG_FUNCTION_INFO_V1(pg_global_deadlock_check_from_remote);
-PG_FUNCTION_INFO_V1(pg_global_deadlock_recheck_from_remote);
-
 static DeadLockState
 GlobalDeadlockRecheckRemote(int myPos, char *global_wfg_text, ExternalLockInfo *external_lock)
 {
@@ -2224,7 +2220,7 @@ GlobalDeadlockRecheckRemote(int myPos, char *global_wfg_text, ExternalLockInfo *
 	DeadLockState	 state;
 
 	initStringInfo(&query);
-	appendStringInfo(&query, "SELECT pg_global_deadlock_recheck(%d, '%s');", myPos, global_wfg_text);
+	appendStringInfo(&query, "SELECT pg_global_deadlock_recheck_from_remote(%d, '%s');", myPos, global_wfg_text);
 
 	conn = PQconnectdb(external_lock->dsn);
 	if (conn == NULL || PQstatus(conn) == CONNECTION_BAD)
@@ -2258,10 +2254,12 @@ returning:
 /*
  * Function name
  *
- *	SQL function name: pg_global_deadlock_check(IN test, OUT record)
+ *	SQL function name: pg_global_deadlock_check_from_remote(IN test, OUT record)
  *
  *  Return value is one tuple: (dead_lock_state int, wfg text)
  */
+PG_FUNCTION_INFO_V1(pg_global_deadlock_check_from_remote);
+
 Datum
 pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
 {
@@ -2295,7 +2293,7 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
 	/*
 	 * Deserialize received Global WFG
 	 */
-	global_wfg_text = PG_GETARG_CSTRING(1);
+	global_wfg_text = PG_GETARG_CSTRING(0);
 	global_wfg_stream = hexa2bin(global_wfg_text, strlen(global_wfg_text), &size);
 	global_wfg = DeserializeGlobalWfG(global_wfg_stream);
 	pfree(global_wfg_text);
@@ -2498,6 +2496,9 @@ returning:
  *
  * Return value is one integer: DeadlockState
  */
+
+PG_FUNCTION_INFO_V1(pg_global_deadlock_recheck_from_remote);
+
 Datum
 pg_global_deadlock_recheck_from_remote(PG_FUNCTION_ARGS)
 {
@@ -2524,8 +2525,8 @@ pg_global_deadlock_recheck_from_remote(PG_FUNCTION_ARGS)
 	 * so we must have the same deadlock information.
 	 */
 
-	my_pos = PG_GETARG_INT32(1);
-	global_wfg_text = PG_GETARG_CSTRING(2);
+	my_pos = PG_GETARG_INT32(0);
+	global_wfg_text = PG_GETARG_CSTRING(1);
 	global_wfg_stream = hexa2bin(global_wfg_text, strlen(global_wfg_text), &size);
 	global_wfg = DeserializeGlobalWfG(global_wfg_stream);
 	pfree(global_wfg_stream);
