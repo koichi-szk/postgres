@@ -10676,4 +10676,24 @@
   proname => 'pg_partition_root', prorettype => 'regclass',
   proargtypes => 'regclass', prosrc => 'pg_partition_root' },
 
+# functions used in global deadlock detection internals
+{ oid => '6122', descr => 'global deadlock check for remote transaction',
+  proname => 'pg_global_deadlock_check_from_remote', procost => '10',
+  provolatile => 'v', prorettype => 'record', proargtypes => 'cstring',
+  proallargtypes => '{cstring,int4,text}', proargmodes => '{i,o,o}',
+  proargnames => '{wfg_in,deadlock_state,wfg_out}',
+  prosrc => 'pg_global_deadlock_check_from_remote' },
+{ oid => '6123', descr => 'global deadlock recheck for remote transaction',
+  proname => 'pg_global_deadlock_recheck_from_remote', procost => '10',
+  provolatile => 'v', prorettype => 'int4', proargtypes => 'int4 cstring',
+  proallargtypes => '{int4,cstring,int4}', proargmodes => '{i,i,o}',
+  proargnames => '{pos,wfg_in,deadlock_state}',
+  prosrc => 'pg_global_deadlock_recheck_from_remote' },
+{ oid => '6124', descr => 'obtain target process properties for global deadlock check setup',
+  proname => 'pg_global_deadlock_check_describe_backend', procost => '10',
+  provolatile => 'v', prorettype => 'record', proargtypes => 'int4',
+  proallargtypes => '{int4,int4,int4,int4}', proargmodes => '{i,o,o,o}',
+  proargnames => '{pid-in,pid,pgprocno,lxid}',
+  prosrc => 'pg_global_deadlock_check_describe_backend' },
+
 ]

@@ -103,6 +103,7 @@ static LOCAL_WFG *DeserializeLocalWfG(char *buf);
 static GLOBAL_WFG *AddToGlobalWfG(GLOBAL_WFG *g_wfg, LOCAL_WFG *local_wfg);
 static StringInfo SerializeGlobalWfG(GLOBAL_WFG *g_wfg);
 static GLOBAL_WFG *DeserializeGlobalWfG(char *buf);
+static PGPROC *find_pgproc(int pid);
 
 /* WFG utility functions */
 static void  appendBinaryStringInfoInt64(StringInfo str, int64 value);
@@ -2437,7 +2438,7 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
 			/* Build return value */
 			tupd = CreateTemplateTupleDesc(2);
 			TupleDescInitEntry(tupd, 1, "deadlock_state", INT4OID, -1, 0);
-			TupleDescInitEntry(tupd, 2, "wfg", TEXTOID, -1, 0);
+			TupleDescInitEntry(tupd, 2, "wfg_out", TEXTOID, -1, 0);
 			snprintf(values[0], 32, "%d", DS_NO_DEADLOCK);
 			values[1]=global_wfg_text;
 			tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(tupd), values);
@@ -2466,7 +2467,7 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
 			/* Build return value */
 			tupd = CreateTemplateTupleDesc(2);
 			TupleDescInitEntry(tupd, 1, "deadlock_state", INT4OID, -1, 0);
-			TupleDescInitEntry(tupd, 2, "wfg", TEXTOID, -1, 0);
+			TupleDescInitEntry(tupd, 2, "wfg_out", TEXTOID, -1, 0);
 			snprintf(values[0], 32, "%d", DS_NO_DEADLOCK);
 			values[1]=returning_global_wfg;
 			tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(tupd), values);
@@ -2480,7 +2481,7 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
 returning:
 	tupd = CreateTemplateTupleDesc(2);
 	TupleDescInitEntry(tupd, 1, "deadlock_state", INT4OID, -1, 0);
-	TupleDescInitEntry(tupd, 2, "wfg", TEXTOID, -1, 0);
+	TupleDescInitEntry(tupd, 2, "wfg_out", TEXTOID, -1, 0);
 	snprintf(values[0], 32, "%d", state);
 	values[1]="";
 	tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(tupd), values);
@@ -2661,7 +2662,72 @@ returning:
 	PG_RETURN_INT32(state);
 }
 
+/*
+ * Function
+ *
+ * SQL function name: pg_global_deadlock_check_describe_backend(IN int, OUT record)
+ *
+ * Return value is one integer: DeadlockState
+ */
 
+PG_FUNCTION_INFO_V1(pg_global_deadlock_check_describe_backend);
+
+Datum
+pg_global_deadlock_check_describe_backend(PG_FUNCTION_ARGS)
+{
+#define CHARLEN 32
+#define NCOLUMN 3
+	int32	 pgprocno;
+	int32	 lxid;
+	int32	 pid;
+	PGPROC	*proc;
+	int		 ii;
+
+	/* Used to return the result */
+	TupleDesc		 tupd;
+	HeapTupleData	 tupleData;
+	HeapTuple		 tuple = &tupleData;
+	char			*values[NCOLUMN];
+	char			 Values[NCOLUMN][CHARLEN];
+	Datum			 result;
+
+	pid = PG_GETARG_INT32(0);
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	if (pid < 0)
+		proc = MyProc;
+	else
+	{
+		proc = find_pgproc(pid);
+		if (proc == NULL)
+		{
+			LWLockRelease(ProcArrayLock);
+			elog(ERROR, "Specified pid %d is not in backend.", pid);
+		}
+	}
+	pgprocno = proc->pgprocno;
+	lxid = proc->lxid;
+	LWLockRelease(ProcArrayLock);
+
+	for (ii = 0; ii < NCOLUMN; ii++)
+		values[ii] = &Values[ii][0];
+	tupd = CreateTemplateTupleDesc(NCOLUMN);
+	ii = 1;
+	TupleDescInitEntry(tupd, ii++, "pid", INT4OID, -1, 0);
+	TupleDescInitEntry(tupd, ii++, "pgprocno", INT4OID, -1, 0);
+	TupleDescInitEntry(tupd, ii++, "lxid", INT4OID, -1, 0);
+	ii = 0;
+	snprintf(values[ii++], CHARLEN, "%d", pid);
+	snprintf(values[ii++], CHARLEN, "%d", pgprocno);
+	snprintf(values[ii++], CHARLEN, "%d", lxid);
+	tuple =  BuildTupleFromCStrings(TupleDescGetAttInMetadata(tupd), values);
+	result = TupleGetDatum(TupleDescGetSlot(tupd), tuple);
+
+	PG_RETURN_DATUM(result);
+
+#undef NCOLUMN
+#undef CHARLEN
+}
+	
 static void
 hold_all_lockline(void)
 {
@@ -2713,3 +2779,20 @@ GetDeadLockInfo(int32 *nInfo)
 	return deadlockDetails;
 }
 
+/*
+ * Caller should acquire LWLock for ProcArrayLock.
+ */
+static PGPROC *
+find_pgproc(int pid)
+{
+    int ii;
+
+    for (ii = 0; ii < ProcGlobal->allProcCount; ii++)
+    {
+        if (ProcGlobal->allProcs[ii].pid == pid)
+        {
+            return &ProcGlobal->allProcs[ii];
+        }
+    }
+    return NULL;
+}
