@@ -46,6 +46,10 @@
  *  ExternalLockWaitProc(), ExternalLockSetProperties(),
  *  GetExternalLockProperties(), FreeExternalLockProperties()
  *
+ * K.Suzuki
+ *  LOCKTAG が lock テーブルにあるかどうか確認する部分は取り敢えずスキップする。
+ *  Caller が正しいシーケンスで呼んでくれることを期待。
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -244,7 +248,7 @@ static PROCLOCK *FastPathGetRelationLockEntry(LOCALLOCK *locallock);
 static bool checkExternalLockTag(const LOCKTAG *locktag, PGPROC *proc);
 static bool externalLockFileUnlink(LOCKTAG *locktag);
 static bool externalLockFileUnlinkProc(const LOCKTAG *locktag, PGPROC *proc);
-static LOCK *findLock(const LOCKTAG *locktag);
+static LOCK *findExternalLock(const LOCKTAG *locktag);
 static char *findExternalLockFileName(const LOCKTAG *locktag);
 ExternalLockInfo *GetExternalLockProperties(const LOCKTAG *locktag);
 static bool read_line(int f, StringInfo s);
@@ -1580,12 +1584,27 @@ UnGrantLock(LOCK *lock, LOCKMODE lockmode,
  *
  * The appropriate partition lock must be held at entry, and will be
  * held at exit.
+ *
+ * K.Suzuki: External Lock の場合、prpoerty ファイルがあればこれを削除すること。
  */
 static void
 CleanUpLock(LOCK *lock, PROCLOCK *proclock,
 			LockMethod lockMethodTable, uint32 hashcode,
 			bool wakeupNeeded)
 {
+	/*
+	 * Unlink External lock property file.
+	 */
+	if (lock->tag.locktag_type == LOCKTAG_EXTERNAL)
+	{
+		char	*pfname;
+
+		pfname = findExternalLockFileName(&(lock->tag));
+		if (pfname)
+			unlink(pfname);
+		pfree(pfname);
+	}
+
 	/*
 	 * If this was my last hold on this lock, delete my entry in the proclock
 	 * table.
@@ -4675,7 +4694,7 @@ checkExternalLockTag(const LOCKTAG *locktag, PGPROC *proc)
 		return false;
 	if (locktag->locktag_field4 > leader->external_lock_no)
 		return false;
-	if (findLock(locktag) == NULL)
+	if (findExternalLock(locktag) == NULL)
 		return false;
 	return true;
 }
@@ -4699,7 +4718,7 @@ ExternalLockWaitProc(const LOCKTAG *locktag, PGPROC *proc)
 		elog(ERROR, "Locktag type error.  Should be LOCKTAG_EXTERNAL\n");
 		return false;
 	}
-	lock = findLock(locktag);
+	lock = findExternalLock(locktag);
 	if (lock == NULL)
 		/* Specified lock does not exist */
 		return false;
@@ -4752,7 +4771,7 @@ ExternalLockSetProperties(LOCKTAG *locktag,
 		}
 	}
 	initStringInfo(&externalLockFileData);
-	appendStringInfo(&externalLockFileData, "%s\n%d\n%d\n%d", dsn, target_pgprocno, target_pid, target_xid);
+	appendStringInfo(&externalLockFileData, "%s\n%d\n%d\n%d\n", dsn, target_pgprocno, target_pid, target_xid);
 	lockF = open(lockFname, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
 	if (lockF < 0)
 		elog(ERROR, "Could not open external lock file, %s", lockFname);
@@ -4773,7 +4792,7 @@ GetExternalLockProperties(const LOCKTAG *locktag)
 	char			   *lockfname;
 	LOCK			   *lock;
 
-	lock = findLock(locktag);
+	lock = findExternalLock(locktag);
 	if (lock == NULL)
 		return NULL;
 	if (locktag->locktag_type != LOCKTAG_EXTERNAL)
@@ -4791,15 +4810,19 @@ GetExternalLockProperties(const LOCKTAG *locktag)
 
 	/* read dsn */
 	initStringInfo(&linebuf);
+	resetStringInfo(&linebuf);
 	read_line(lockF, &linebuf);
 	output->dsn = pstrdup(linebuf.data);
 	/* Read target pgprocno */
+	resetStringInfo(&linebuf);
 	read_line(lockF, &linebuf);
 	output->target_pgprocno = atoi(linebuf.data);
 	/* Read target pid */
+	resetStringInfo(&linebuf);
 	read_line(lockF, &linebuf);
 	output->target_pid = atoi(linebuf.data);
 	/* Read target xid */
+	resetStringInfo(&linebuf);
 	read_line(lockF, &linebuf);
 	output->target_txn = atoi(linebuf.data);
 	close(lockF);
@@ -4813,27 +4836,32 @@ findExternalLockFileName(const LOCKTAG *locktag)
 	StringInfoData	fname;
 
 	initStringInfo(&fname);
-	appendStringInfo(&fname, "%s/pg_external_locks/%016x%016x", DataDir, locktag->locktag_field2, locktag->locktag_field4);
+	appendStringInfo(&fname, "%s/pg_external_locks/%08x%08x%08x%08x",
+			DataDir, locktag->locktag_field1, locktag->locktag_field2,
+			locktag->locktag_field3, locktag->locktag_field4);
 	return fname.data;
 }
 
 static LOCK *
-findLock(const LOCKTAG *locktag)
+findExternalLock(const LOCKTAG *locktag)
 {
 	bool	found;
-	LOCK   *lock;
+	LOCALLOCKTAG localtag;
+	LOCALLOCK  *locallock;
 
-	lock = (LOCK *)hash_search_with_hash_value(LockMethodLockHash,
-											   (const void *) locktag,
-											   LockTagHashCode(locktag),
-											   HASH_FIND,
-											   &found);
+	localtag.lock = *locktag;
+	localtag.mode = AccessExclusiveLock;
+
+	locallock = (LOCALLOCK *) hash_search(LockMethodLocalHash,
+										  (void *) &localtag,
+										  HASH_FIND, &found);
 	if (!found)
 		elog(DEBUG3, "No lock found. %%1: %d, %%2: %d, %%3: %d, %%4: %d, %%5: %d, %%6: %d",
 				locktag->locktag_field1, locktag->locktag_field2,
 				locktag->locktag_field3, locktag->locktag_field4,
 				locktag->locktag_type, locktag->locktag_lockmethodid);
-	return found ? lock : NULL;
+
+	return found ? locallock->lock : NULL;
 }
 
 static bool
@@ -4842,7 +4870,6 @@ read_line(int f, StringInfo s)
 	char	inbuf;
 	int		ll;
 
-	resetStringInfo(s);
 	while(true)
 	{
 		ll = read(f, &inbuf, 1);
@@ -4856,7 +4883,7 @@ read_line(int f, StringInfo s)
 
 fmterr:
 	close(f);
-	elog(ERROR, "Exernal lock file format error.");
+	elog(ERROR, "External lock file format error.");
 	return false;
 }
 
