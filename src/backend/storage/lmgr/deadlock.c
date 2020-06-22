@@ -481,7 +481,7 @@ DeadLockCheckRecurse(PGPROC *proc)
  * Returns:
  *		0: the configuration is good (no deadlocks)
  *	   -1: the configuration has a hard deadlock or is not self-consistent
- *     -2: configuration に external lock が含まれている。
+ *     -2: external lock is included in the configuration
  *			the configuration has an external lock at the edge of the graph.
  *		>0: the configuration has one or more soft deadlocks
  *
@@ -490,10 +490,6 @@ DeadLockCheckRecurse(PGPROC *proc)
  * possibleConstraints+nPossibleConstraints.  The return value is the
  * number of soft edges.
  *--------------------
- */
-/*
- * K.Suzuki: WIP まだここのコード及びここから呼び出される関数のコードは見ていない。
- *			 external lock の検出及びこれに伴う返却値はこれから。
  */
 static int
 TestConfiguration(PGPROC *startProc)
@@ -511,8 +507,6 @@ TestConfiguration(PGPROC *startProc)
 		return -1;
 
 	/*
-	 * K.Suzuki: ExpandConstraints() も、見て見る必要がある。
-	 *
 	 * Expand current constraint set into wait orderings.  Fail if the
 	 * constraint set is not self-consistent.
 	 */
@@ -523,11 +517,6 @@ TestConfiguration(PGPROC *startProc)
 	 * Check for cycles involving startProc or any of the procs mentioned in
 	 * constraints.  We check startProc last because if it has a soft cycle
 	 * still to be dealt with, we want to deal with that first.
-	 */
-	/*
-	 * K.Suzuki: 以下でも、external lock の検出を追加する必要がある。
-	 *			 FindLockCycle() も見ておく必要がある。この戻り値も external lock
-	 *			 を反映しておく必要がある。
 	 */
 	for (i = 0; i < nCurConstraints; i++)
 	{
@@ -542,7 +531,7 @@ TestConfiguration(PGPROC *startProc)
 				else if (state == DS_EXTERNAL_LOCK)
 					return -2;
 				else
-					elog(ERROR, "Invalid internal state, deadlock check.");
+					elog(ERROR, "Inconsistent internal state in deadlock check.");
 			}
 			softFound = nSoftEdges;
 		}
@@ -556,7 +545,7 @@ TestConfiguration(PGPROC *startProc)
 				else if (state == DS_EXTERNAL_LOCK)
 					return -2;
 				else
-					elog(ERROR, "Invalid internal state, deadlock check.");
+					elog(ERROR, "Inconsistent internal state in deadlock check.");
 			}
 			softFound = nSoftEdges;
 		}
@@ -571,7 +560,7 @@ TestConfiguration(PGPROC *startProc)
 			else if (state == DS_EXTERNAL_LOCK)
 				return -2;
 			else
-				elog(ERROR, "Invalid internal state, deadlock check.");
+				elog(ERROR, "Inconsistent internal state in deadlock check.");
 		}
 		softFound = nSoftEdges;
 	}
