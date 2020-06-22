@@ -33,6 +33,20 @@
  *    These API are used by deadlock detection internals and modules
  *	  which issue remote transactions.
  *
+ *	  Because EXTERNAL LOCK represents dependency of the backend on
+ *    a remote transaction, LOCK is held by the backend and waited
+ *	  by the same backend.
+ *
+ *    For this reason, it is not recommended to handle EXTERNAL_LOCK
+ *    with existing low leven API.
+ *
+ *    This lock is used to find the backend is waiting for a remote
+ *	  transaction and hence to track global wait-for-graph.
+ *
+ *    Deadlock detection mechanism (DeadLockCheck() in deadlock.c)
+ *    is used to detect this.   For details, please take a look at
+ *	  comments of deadlock.c.
+ *
  *	Interface:
  *
  *	InitLocks(), GetLocksMethodTable(), GetLockTagsMethodTable(),

@@ -5,6 +5,8 @@
  * 実際使うのはこの起点の最初の pgproc のみ。global cycle のチェックはこれしか
  * 使わない。
  * FLAG に WfG_HAS_VISITED_PROC 0x00000002 を追加して serializable/deserializable のコードを変更する。
+ *
+ *			---> Done.
  */
 
 /*-------------------------------------------------------------------------
@@ -30,6 +32,23 @@
  *	RememberSimpleDeadLock()
  *	InitDeadLockChecking()
  *
+ *  DeadLockCheck() has additional return value.  See proc.c for the handling
+ *  of this value.
+ *
+ *  Additional interface for global deadlock detection:
+ *
+ *  get_database_system_id()
+ *  locktagTypeName()
+ *  GlobalDeadlockCheck()
+ *  GlobalDeadlockCheckRemote()
+ *  GetDeadLockInfo()
+ *
+ * SQL functions for global deadlock detection:
+ *
+ *  pg_global_deadlock_check_from_remote()
+ *  pg_global_deadlock_recheck_from_remote()
+ *  pg_global_deadlock_check_describe_backend()
+ *	
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -483,6 +502,7 @@ TestConfiguration(PGPROC *startProc)
 	EDGE	   *softEdges = possibleConstraints + nPossibleConstraints;
 	int			nSoftEdges;
 	int			i;
+	DeadLockState	state;
 
 	/*
 	 * Make sure we have room for FindLockCycle's output.
@@ -511,23 +531,48 @@ TestConfiguration(PGPROC *startProc)
 	 */
 	for (i = 0; i < nCurConstraints; i++)
 	{
-		if (FindLockCycle(curConstraints[i].waiter, softEdges, &nSoftEdges))
+
+		state = FindLockCycle(curConstraints[i].waiter, softEdges, &nSoftEdges);
+		if (state)
 		{
 			if (nSoftEdges == 0)
-				return -1;		/* hard deadlock detected */
+			{
+				if (state == DS_HARD_DEADLOCK)
+					return -1;		/* hard deadlock detected */
+				else if (state == DS_EXTERNAL_LOCK)
+					return -2;
+				else
+					elog(ERROR, "Invalid internal state, deadlock check.");
+			}
 			softFound = nSoftEdges;
 		}
-		if (FindLockCycle(curConstraints[i].blocker, softEdges, &nSoftEdges))
+		state = FindLockCycle(curConstraints[i].blocker, softEdges, &nSoftEdges);
+		if (state)
 		{
 			if (nSoftEdges == 0)
-				return -1;		/* hard deadlock detected */
+			{
+				if (state == DS_HARD_DEADLOCK)
+					return -1;		/* hard deadlock detected */
+				else if (state == DS_EXTERNAL_LOCK)
+					return -2;
+				else
+					elog(ERROR, "Invalid internal state, deadlock check.");
+			}
 			softFound = nSoftEdges;
 		}
 	}
-	if (FindLockCycle(startProc, softEdges, &nSoftEdges))
+	state = FindLockCycle(startProc, softEdges, &nSoftEdges);
+	if (state)
 	{
 		if (nSoftEdges == 0)
-			return -1;			/* hard deadlock detected */
+		{
+			if (state == DS_HARD_DEADLOCK)
+				return -1;		/* hard deadlock detected */
+			else if (state == DS_EXTERNAL_LOCK)
+				return -2;
+			else
+				elog(ERROR, "Invalid internal state, deadlock check.");
+		}
 		softFound = nSoftEdges;
 	}
 	return softFound;

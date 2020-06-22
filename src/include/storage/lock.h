@@ -479,6 +479,7 @@ typedef struct BlockedProcsData
 	int			maxpids;		/* Allocated length of waiter_pids[] array */
 } BlockedProcsData;
 
+
 typedef struct ExternalLockInfo
 {
 	int			pid;
