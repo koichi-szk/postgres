@@ -510,7 +510,10 @@ typedef enum
 	DS_HARD_DEADLOCK,			/* deadlock, no way out but ERROR */
 	DS_BLOCKED_BY_AUTOVACUUM,	/* no deadlock; queue blocked by autovacuum
 								 * worker */
-	DS_EXTERNAL_LOCK,			/* waiting for remote transaction, need global deadlock detection */
+	DS_EXTERNAL_LOCK,			/* waiting for remote transaction, need global
+								 * deadlock detection */
+	DS_DEADLOCK_INFO,			/* Set of deadlock/external_lock information is available.
+								 * Internal use */
 	DS_GLOBAL_ERROR				/* Used only to report internal error in global deadlock detection */
 } DeadLockState;
 
@@ -714,6 +717,5 @@ extern void FreeExternalLockProperties(ExternalLockInfo *ext_lockinfo);
 /* Functions for Global deadlock detection */
 
 extern DeadLockState GlobalDeadlockCheck(PGPROC *proc);
-extern DeadLockState GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, char **returning_wfg);
 
 #endif							/* LOCK_H */

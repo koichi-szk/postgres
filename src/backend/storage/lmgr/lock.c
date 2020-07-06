@@ -4804,11 +4804,7 @@ GetExternalLockProperties(const LOCKTAG *locktag)
 	ExternalLockInfo   *output;
 	StringInfoData		linebuf;
 	char			   *lockfname;
-	LOCK			   *lock;
 
-	lock = findExternalLock(locktag);
-	if (lock == NULL)
-		return NULL;
 	if (locktag->locktag_type != LOCKTAG_EXTERNAL)
 		return NULL;
 	lockfname = findExternalLockFileName(locktag);

@@ -10680,7 +10680,7 @@
 { oid => '6122', descr => 'global deadlock check for remote transaction',
   proname => 'pg_global_deadlock_check_from_remote', procost => '10',
   provolatile => 'v', prorettype => 'record', proargtypes => 'cstring',
-  proallargtypes => '{cstring,int4,text}', proargmodes => '{i,o,o}',
+  prorows => '1', proretset => 't', proallargtypes => '{cstring,int4,text}', proargmodes => '{i,o,o}',
   proargnames => '{wfg_in,deadlock_state,wfg_out}',
   prosrc => 'pg_global_deadlock_check_from_remote' },
 { oid => '6123', descr => 'global deadlock recheck for remote transaction',
