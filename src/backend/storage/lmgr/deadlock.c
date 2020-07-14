@@ -39,7 +39,12 @@
 *	
 *-------------------------------------------------------------------------
 */
+
+#define	GDD_DEBUG
+
 #include "postgres.h"
+
+#include <unistd.h>
 
 #include "../interfaces/libpq/libpq-fe.h"
 #include "catalog/pg_control.h"
@@ -260,7 +265,7 @@ static void PrintLockQueue(LOCK *lock, const char *info);
 static bool external_lock_is_same(ExternalLockInfo *one, ExternalLockInfo *two);
 #endif
 static DeadLockState DeadLockCheck_int(PGPROC *proc);
-static DeadLockState GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, RETURNED_WFG **returning_wfg);
+static int GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, RETURNED_WFG **returning_wfg);
 static DeadLockState GlobalDeadlockRecheckRemote(int	pos, char *global_wfg_text, ExternalLockInfo *downstream);
 static DeadLockState GlobalDeadlockCheck_int(PGPROC *proc, GLOBAL_WFG *global_wfg, RETURNED_WFG **rv);
 static DeadlockCheckMode globalDeadlockCheckMode(GLOBAL_WFG *global_wfg);
@@ -281,6 +286,11 @@ static void free_local_wfg(LOCAL_WFG *local_wfg);
 static void free_global_wfg(GLOBAL_WFG *global_wfg);
 static PGPROC *find_pgproc(int pid);
 static PGPROC *find_pgproc_pgprocno(int pgprocno);
+static char *build_worker_file_name(bool input_to_command);
+static RETURNED_WFG *read_returned_wfg(char *fname);
+static LOCAL_WFG *copy_local_wfg(LOCAL_WFG *l_wfg);
+static GLOBAL_WFG *copy_global_wfg(GLOBAL_WFG *g_wfg);
+char *normalize_str(char *src);
 
 /* WFG utility functions */
 static void  appendBinaryStringInfoInt64(StringInfo str, int64 value);
@@ -307,6 +317,8 @@ static char *extractInt8(char *buf, int8 *value);
 static char *extractUint8(char *buf, uint8 *value);
 static char *binary2text(char *input, int size);
 static char *hexa2bin(char *input, int insize, int *size);
+
+#define WORKER_NAME	"pg_gdd_check_worker"
 
 
 #define checklen(v, l, e) do{(v) -= (l); if ((v) < 0) goto e;}while(0)
@@ -379,6 +391,9 @@ static int	nDeadlockDetails;
 /* PGPROC pointer of any blocking autovacuum worker found */
 static PGPROC *blocking_autovacuum_proc = NULL;
 
+#ifdef GDD_DEBUG
+GLOBAL_WFG *global_wfg_test;
+#endif
 /*
  * InitDeadLockChecking -- initialize deadlock checker during backend startup
  *
@@ -1799,13 +1814,12 @@ SerializeLocalWfG(LOCAL_WFG *local_wfg)
 		appendBinaryStringInfoInt32(str, eLockInfo->pid);
 		appendBinaryStringInfoInt32(str, eLockInfo->pgprocno);
 		appendBinaryStringInfoInt32(str, eLockInfo->txnid);
-		appendBinaryStringInfoInt16(str, eLockInfo->serno);
+		appendBinaryStringInfoInt32(str, eLockInfo->serno);
 		appendBinaryStringInfoInt32(str, eLockInfo->target_pid);
 		appendBinaryStringInfoInt32(str, eLockInfo->target_pgprocno);
 		appendBinaryStringInfoInt32(str, eLockInfo->target_txn);
 		dsnlen = ((strlen(eLockInfo->dsn) + 4)/4) * 4;
-		dsn = (char *)palloc(dsnlen);
-		memset(dsn, 0, dsnlen);
+		dsn = (char *)palloc0(dsnlen);
 		strncpy(dsn, eLockInfo->dsn, dsnlen);
 		appendBinaryStringInfoInt32(str, dsnlen);
 		appendBinaryStringInfo(str, dsn, dsnlen);
@@ -1845,7 +1859,6 @@ DeserializeLocalWfG(char *buf)
 		goto err;
 	Extract64(buf, &wfg->database_system_identifier);
 	Extract32(buf, &wfg->local_wfg_flag);
-	Extract32(buf, &wfg->nDeadlockInfo);
 
 	/* visitedProc */
 	if (wfg->local_wfg_flag & WfG_HAS_VISITED_PROC)
@@ -1855,7 +1868,10 @@ DeserializeLocalWfG(char *buf)
 		Extract32(buf, &wfg->visitedProcLxid);
 	}
 
+	Extract32(buf, &wfg->nDeadlockInfo);
+
 	/* Allocate deadlock info */
+
 	wfg->deadlock_info = (DEADLOCK_INFO *)palloc(sizeof(DEADLOCK_INFO) * wfg->nDeadlockInfo);
 	checklen(remaining, 32 * wfg->nDeadlockInfo, err);
 	for (ii = 0; ii < wfg->nDeadlockInfo; ii++)
@@ -2139,7 +2155,7 @@ appendBinaryStringInfoInt64(StringInfo str, int64 value)
 {
 	char buf[8];
 
-	buf[0] = (value & 0xff00000000000000) >> 56;
+	buf[0] = ((value & 0xff00000000000000) >> 56) & 0x00000000000000ff;
 	buf[1] = (value & 0x00ff000000000000) >> 48;
 	buf[2] = (value & 0x0000ff0000000000) >> 40;
 	buf[3] = (value & 0x000000ff00000000) >> 32;
@@ -2156,7 +2172,7 @@ appendBinaryStringInfoInt32(StringInfo str, int32 value)
 {
 	char buf[4];
 
-	buf[0] = (value & 0xff000000) >> 24;
+	buf[0] = ((value & 0xff000000) >> 24) & 0x000000ff;
 	buf[1] = (value & 0x00ff0000) >> 16;
 	buf[2] = (value & 0x0000ff00) >> 8;
 	buf[3] =  value & 0x000000ff;
@@ -2169,7 +2185,7 @@ appendBinaryStringInfoInt16(StringInfo str, int16 value)
 {
 	char buf[2];
 
-	buf[0] = (value >> 8);
+	buf[0] = (value >> 8) & 0x000000ff;
 	buf[1] = value & 0x000000ff;
 
 	appendBinaryStringInfo(str, buf, 2);
@@ -2188,7 +2204,7 @@ appendBinaryStringInfoInt8(StringInfo str, int8 value)
 static void
 replaceStringInt32(char *s, int32 value)
 {
-	s[0] = (value >> 24);
+	s[0] = ((value & 0xff000000) >> 24) & 0x000000ff;
 	s[1] = (value & 0x00ff0000) >> 16;
 	s[2] = (value & 0x0000ff00) >> 8;
 	s[3] = value & 0x000000ff;
@@ -2207,14 +2223,14 @@ static char *
 extractInt64(char *buf, int64 *value)
 {
 
-	*value  = (int64)(*buf++) << 56;
-	*value |= (int64)(*buf++) << 48;
-	*value |= (int64)(*buf++) << 40;
-	*value |= (int64)(*buf++) << 32;
-	*value |= (int64)(*buf++) << 24;
-	*value |= (int64)(*buf++) << 16;
-	*value |= (int64)(*buf++) << 8;
-	*value |= (int64)(*buf++);
+	*value  = ((int64)(*buf++) << 56) & 0xff00000000000000;
+	*value |= ((int64)(*buf++) << 48) & 0x00ff000000000000;
+	*value |= ((int64)(*buf++) << 40) & 0x0000ff0000000000;
+	*value |= ((int64)(*buf++) << 32) & 0x000000ff00000000;
+	*value |= ((int64)(*buf++) << 24) & 0x00000000ff000000;
+	*value |= ((int64)(*buf++) << 16) & 0x0000000000ff0000;
+	*value |= ((int64)(*buf++) << 8)  & 0x000000000000ff00;
+	*value |= ((int64)(*buf++))       & 0x00000000000000ff;
 	return buf;
 }
 
@@ -2239,10 +2255,10 @@ static char *
 extractInt32(char *buf, int32 *value)
 {
 
-	*value = (int32)(*buf++) << 24;
-	*value |= (int32)(*buf++) << 16;
-	*value |= (int32)(*buf++) << 8;
-	*value |= (int32)(*buf++);
+	*value  = ((int32)(*buf++) << 24) & 0xff000000;
+	*value |= ((int32)(*buf++) << 16) & 0x00ff0000;
+	*value |= ((int32)(*buf++) << 8)  & 0x0000ff00;
+	*value |= (int32)(*buf++)         & 0x000000ff;
 	return buf;
 }
 
@@ -2250,10 +2266,10 @@ static char *
 extractUint32(char *buf, uint32 *value)
 {
 
-	*value = (uint32)(*buf++) << 24;
-	*value |= (uint32)(*buf++) << 16;
-	*value |= (uint32)(*buf++) << 8;
-	*value |= (uint32)(*buf++);
+	*value  = ((uint32)(*buf++) << 24) & 0xff000000;
+	*value |= ((uint32)(*buf++) << 16) & 0x00ff0000;
+	*value |= ((uint32)(*buf++) << 8)  & 0x0000ff00;
+	*value |= ((uint32)(*buf++))       & 0x000000ff;
 	return buf;
 }
 
@@ -2272,8 +2288,8 @@ static char *
 extractUint16(char *buf, uint16 *value)
 {
 
-	*value = (uint16)(*buf++) << 8;
-	*value |= (uint16)(*buf++);
+	*value  = ((uint16)(*buf++) << 8) & 0xff00;
+	*value |= ((uint16)(*buf++))      & 0x00ff;
 	return buf;
 }
 
@@ -2303,17 +2319,21 @@ binary2text(char *input, int size)
 {
 	const char 	*hexadata = "0123456789abcdef";
 	char		*output = (char *)palloc(size * 2 + 1);
+	char		*o;
+	char		*ic;
 	int		 	 ii;
 
+	o = output;
 	output[size*2] = '\0';
 
-	for (ii = 0; ii < size; ii++, input++)
+
+	for (ii = 0, ic = input; ii < size; ii++, ic++)
 	{
 		int	cc;
 
-		cc = *input;
-		*output++ = hexadata[ (cc & 0x000000f0) >> 4 ];
-		*output++ = hexadata[  cc & 0x0000000f ];
+		cc = *ic;
+		*o++ = hexadata[ (cc & 0x000000ff) >> 4 ];
+		*o++ = hexadata[  cc & 0x0000000f ];
 	}
 	return output;
 }
@@ -2334,7 +2354,7 @@ hexa2bin(char *input, int insize, int *size)
 	for (ll = *size; ll > 0; ll--)
 	{
 		if (*input >= '0' && *input <= '9')
-			cc = *input - '9';
+			cc = *input - '0';
 		else if (*input >= 'A' && *input <= 'F')
 			cc = *input - 'A' + 10;
 		else if (*input >= 'a' && *input <= 'f')
@@ -2344,13 +2364,14 @@ hexa2bin(char *input, int insize, int *size)
 		cc = cc << 4;
 		input++;
 		if (*input >= '0' && *input <= '9')
-			cc |= *input - '9';
+			cc |= *input - '0';
 		else if (*input >= 'A' && *input <= 'F')
 			cc |= *input - 'A' + 10;
 		else if (*input >= 'a' && *input <= 'f')
 			cc |= *input - 'a' + 10;
 		else
 			goto err;
+		input++;
 		*wk++ = cc;
 	}
 	return output;
@@ -2402,10 +2423,11 @@ GlobalDeadlockCheck(PGPROC *proc)
 static DeadLockState
 GlobalDeadlockCheck_int(PGPROC *proc, GLOBAL_WFG *global_wfg, RETURNED_WFG **rv)
 {
-	DeadLockState	 state = DS_NO_DEADLOCK;
+	DeadLockState	 state;
+	int				 nWfG;
 	LOCAL_WFG		*local_wfg;
 	DEADLOCK_INFO_BUP	*curBup;
-	RETURNED_WFG	*returned_wfg;
+	RETURNED_WFG	*returned_wfg = NULL;
 	RETURNED_WFG	*returning_wfg;
 	int				 ii;
 
@@ -2424,9 +2446,11 @@ GlobalDeadlockCheck_int(PGPROC *proc, GLOBAL_WFG *global_wfg, RETURNED_WFG **rv)
 		local_wfg = BuildLocalWfG(proc, curBup);
 		if (!local_wfg || !check_local_wfg_is_stable(local_wfg))
 			continue;
-		state = GlobalDeadlockCheckRemote(local_wfg, global_wfg, &returned_wfg);
-		if (state == DS_NO_DEADLOCK)
+		nWfG = GlobalDeadlockCheckRemote(local_wfg, global_wfg, &returned_wfg);
+		if (nWfG == 0)
 			continue;
+		if (nWfG < 0)
+			elog(ERROR, "Error in remote wait-for-graph check.\n");
 		if (deadlockCheckMode == DLCMODE_LOCAL)
 		{
 			/*
@@ -2518,109 +2542,73 @@ returning:
 int				 gdd_debug_remote_pid;		/* For debug only */
 #endif
 
-static DeadLockState
+static int
 GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, RETURNED_WFG **returning_wfg)
 {
-	PGconn			*conn = NULL;
-	PGresult		*res = NULL;
+	GLOBAL_WFG		*new_global_wfg;
 	StringInfo		 global_wfg_bin;
 	char			*global_wfg_text = NULL;
-	StringInfoData	 query;
-	DeadLockState	 state;
-	char			*state_s;
-	int				 nTuples;
-	int				 ii;
-	RETURNED_WFG	*rv;
+	StringInfoData	 cmd;
+	char			*wfg_in_fname;
+	char			*cmd_out_fname;
+	FILE			*wfg_in;
+#ifndef GDD_DEBUG
+	int				 cmd_ret;
+#endif
+	char			*dsn_downstream;
 
 	if (!(local_wfg->local_wfg_flag & WfG_HAS_EXTERNAL_LOCK))
 		return DS_NO_DEADLOCK;
 
-	initStringInfo(&query);
+	initStringInfo(&cmd);
 	*returning_wfg = NULL;
+
+	dsn_downstream = local_wfg->external_lock->dsn;
+	new_global_wfg = copy_global_wfg(global_wfg);
 
 	/*
 	 * Build global wait-for-graph and translate to string to send to the downstream database.
 	 */
-	global_wfg = AddToGlobalWfG(global_wfg, (void *)local_wfg);
-	global_wfg_bin = SerializeGlobalWfG(global_wfg);
+	new_global_wfg = AddToGlobalWfG(new_global_wfg, (void *)local_wfg);
+	global_wfg_bin = SerializeGlobalWfG(new_global_wfg);
 	global_wfg_text = binary2text(global_wfg_bin->data, global_wfg_bin->len);
+#ifdef GDD_DEBUG
+	{
+		char	   *global_wfg_bin_test;
+		int			size;
+
+		global_wfg_bin_test = hexa2bin(global_wfg_text, strlen(global_wfg_text), &size);
+		global_wfg_test = DeserializeGlobalWfG(global_wfg_bin_test);
+	}
+#endif
+	pfree(global_wfg_bin);
 	/*
 	 *-------------------------------------------------------------------------------------
 	 * Check WfG cycle involving remote transactions.
 	 *
-	 * Here, we have dedicated SQL function.   Appropriate credential information is to be
-	 * supplied from outside to run this.
+	 * Because we cannot use libpq-fe in the backend, we use small exernal worker.
 	 *--------------------------------------------------------------------------------------
 	 */
-
-	/* Build remote query */
-	appendStringInfo(&query, "SELECT * FROM pg_global_deadlock_check_from_remote('%s');", global_wfg_text);
-	pfree(global_wfg_text);
-	pfree(global_wfg_bin);
-
-	/* Connect to remote */
-	conn = PQconnectdb(local_wfg->external_lock->dsn);
-	if (conn == NULL || PQstatus(conn) == CONNECTION_BAD)
-	{
-		elog(WARNING,
-				"Could not connect to remote database '%s' not reacheable.",
-				local_wfg->external_lock->dsn);
-		state = DS_GLOBAL_ERROR;
-		goto returning;
-	}
-#if 1
-	/* For debug, obtain remote checker PID */
-	{
-		char	*pid_query = "SELECT pg_backend_pid() as pid;";
-		char	*pid_str;
-
-		res = PQexec(conn, pid_query);
-		if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
-		{
-			elog(WARNING, "Cannot obtain backend pid of the remote database");
-			state = DS_GLOBAL_ERROR;
-		}
-		else
-		{
-			pid_str = PQgetvalue(res, 0, 0);
-			gdd_debug_remote_pid = atoi(pid_str);
-		}
-		if (res)
-			PQclear(res);
-	}
+	wfg_in_fname = build_worker_file_name(true);
+	cmd_out_fname = build_worker_file_name(false);
+	appendStringInfo(&cmd, "%s c %s %s %s", WORKER_NAME,
+											  normalize_str(dsn_downstream),
+											  normalize_str(wfg_in_fname),
+											  normalize_str(cmd_out_fname));
+	wfg_in = AllocateFile(wfg_in_fname, "w");
+	fwrite(global_wfg_text, strlen(global_wfg_text), 1, wfg_in);
+	FreeFile(wfg_in);
+	/* Here, in the debug, the command should be invoked manually for debug */
+#ifndef GDD_DEBUG
+	cmd_ret = system(cmd.data);
+	if (!WIFEXITED(cmd_ret) || (WEXITSTATUS(cmd_ret) != 0))
+		elog(ERROR, "Global deadlock detection worker error.");
 #endif
-
-	res = PQexec(conn, query.data);
-	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		elog(WARNING,
-				"Cannot run remote query to check global deadlock. %s",
-				res ? PQresultErrorMessage(res) : "");
-		state = DS_GLOBAL_ERROR;
-		goto returning;
-	}
-	
-	nTuples = PQntuples(res);
-	rv = *returning_wfg = palloc0(sizeof(RETURNED_WFG) + sizeof(char *) * nTuples);
-
-	for (ii = 0; ii < nTuples; ii++)
-	{
-		state_s = PQgetvalue(res, ii, 0);
-		rv->state[ii] = atoi(state_s);
-		rv->global_wfg_in_text[ii] = PQgetvalue(res, ii, 1);
-	}
-returning:
-	if (res)
-		PQclear(res);
-	if (conn)
-		PQfinish(conn);
-	if (query.data)
-		pfree(query.data);
-	if (global_wfg)
-		pfree(global_wfg);
-	if (global_wfg_text)
-		pfree(global_wfg_text);
-	return state;
+	pfree(cmd.data);
+	unlink(wfg_in_fname);
+	*returning_wfg = read_returned_wfg(cmd_out_fname);
+	unlink(cmd_out_fname);
+	return (*returning_wfg)->nReturnedWfg;
 }
 
 /*
@@ -2808,43 +2796,66 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
 }
 
 static DeadLockState
+read_returned_state(char *fname)
+{
+	FILE	*cmd_out;
+	char	 cc;
+	int		 state = DS_GLOBAL_ERROR;
+
+	cmd_out = AllocateFile(fname, "r");
+	while((cc = fgetc(cmd_out)) < '0' || cc > '9');
+	if (cc < 0)
+		return state;
+	state = cc - '0';
+	while((cc = fgetc(cmd_out)) >= '0' && cc <= '9')
+		state = state * 10 + cc - '0';
+	return (DeadLockState)state;
+}
+static DeadLockState
 GlobalDeadlockRecheckRemote(int	pos, char *global_wfg_text, ExternalLockInfo *downstream)
 {
-	PGconn			*conn = NULL;
-	PGresult		*res = NULL;
-	StringInfoData	 query;
+	StringInfoData	 cmd;
 	DeadLockState	 state;
-	char			*state_s;
+	char			*wfg_in_fname;
+	FILE			*wfg_in;
+	char			*cmd_out_fname;
+#ifndef GDD_DEBUG
+	int				 cmd_ret;
+#endif
+	char			*dsn_downstream;
+	ExternalLockInfo	*external_lock_info;
+	GLOBAL_WFG		*g_wfg;
+	char			*g_wfg_stream;
+	int				 g_wfg_stream_size;
 
-	initStringInfo(&query);
+	g_wfg_stream = hexa2bin(global_wfg_text, strlen(global_wfg_text), &g_wfg_stream_size);
+	g_wfg = DeserializeGlobalWfG(g_wfg_stream);
+	pfree(g_wfg_stream);
 
-	appendStringInfo(&query, "SELECT * FROM pg_global_deadlock_recheck_from_ermote('%d', '%s');", pos, global_wfg_text);
-	conn = PQconnectdb(downstream->dsn);
-	if (conn == NULL || PQstatus(conn) == CONNECTION_BAD)
-	{
-		elog(WARNING,
-				"Could not connect to remote database '%s' not reacheable.",
-				downstream->dsn);
-		state = DS_GLOBAL_ERROR;
-		goto returning;
-	}
-	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		elog(WARNING,
-				"Cannot run remote query to recheck global deadlock. %s",
-				res ? PQresultErrorMessage(res) : "");
-		state = DS_GLOBAL_ERROR;
-		goto returning;
-	}
-	state_s = PQgetvalue(res, 0, 0);
-	state = atoi(state_s);
-returning:
-	if (res)
-		PQclear(res);
-	if (conn)
-		PQfinish(conn);
-	if (query.data)
-		pfree(query.data);
+	external_lock_info = ((LOCAL_WFG *)g_wfg->local_wfg[pos])->external_lock;
+	dsn_downstream = external_lock_info->dsn;
+
+	wfg_in_fname = build_worker_file_name(true);
+	cmd_out_fname = build_worker_file_name(false);
+
+	initStringInfo(&cmd);
+	appendStringInfo(&cmd, "%s r %d %s %s %s", WORKER_NAME, pos,
+											   normalize_str(dsn_downstream),
+											   normalize_str(wfg_in_fname),
+											   normalize_str(cmd_out_fname));
+
+	wfg_in = AllocateFile(wfg_in_fname, "w");
+	fwrite(global_wfg_text, strlen(global_wfg_text), 1, wfg_in);
+	FreeFile(wfg_in);
+	/* Here, in the debug, the command should be invoked manually for debug */
+#ifndef GDD_DEBUG
+	cmd_ret = system(cmd.data);
+	if (!WIFEXITED(cmd_ret) || (WEXITSTATUS(cmd_ret) != 0))
+		elog(ERROR, "Global deadlock detection worker error.");
+#endif
+	unlink(wfg_in_fname);
+	state = read_returned_state(cmd_out_fname);
+	unlink(cmd_out_fname);
 	return state;
 }
 
@@ -3354,3 +3365,146 @@ free_global_wfg(GLOBAL_WFG *global_wfg)
 	pfree(global_wfg);
 }
 
+static char *
+build_worker_file_name(bool input_to_command)
+{
+	StringInfoData	fname;
+
+	initStringInfo(&fname);
+	appendStringInfo(&fname, "%s/pg_external_locks/wfg_%d.%s",
+							 DataDir, MyProc->pid,
+							 input_to_command ? "in" : "out");
+	return fname.data;
+}
+
+static RETURNED_WFG *
+read_returned_wfg(char *fname)
+{
+	FILE	*wfg_out;
+	char	 c;
+	int		 ii;
+	RETURNED_WFG *returning_wfg;
+
+	wfg_out = AllocateFile(fname, "r");
+	while ((c = fgetc(wfg_out)) < '0' && c > '9')
+	{
+		if (c < 0)
+			return NULL;
+	}
+	returning_wfg = (RETURNED_WFG *)palloc(sizeof(RETURNED_WFG));
+	returning_wfg->nReturnedWfg = c - '0';
+	while ((c = fgetc(wfg_out)) >= '0' && c <= '9')
+		returning_wfg->nReturnedWfg = returning_wfg->nReturnedWfg * 10 + c - '0';
+	if (c < 0)
+	{
+		pfree(returning_wfg);
+		return NULL;
+	}
+	while (c != '\n')
+	{
+		c = fgetc(wfg_out);
+		if (c < 0)
+		{
+			pfree(returning_wfg);
+			return NULL;
+		}
+	}
+	returning_wfg->state = (DeadLockState *)palloc0(sizeof(DeadLockState) * returning_wfg->nReturnedWfg);
+	returning_wfg->global_wfg_in_text = (char **)palloc0(sizeof(char *) * returning_wfg->nReturnedWfg);
+	for (ii = 0; ii < returning_wfg->nReturnedWfg; ii++)
+	{
+		int				state_i;
+		int				sign = 1;
+		StringInfoData	wfg_text;
+
+		while(((c = fgetc(wfg_out)) != '-') || (c < '0' || c > '9'))
+		{
+			if (c < 0)
+			{
+				free_returned_wfg(returning_wfg);
+				return NULL;
+			}
+		}
+		if (c == '-')
+		{
+			sign = -1;
+			state_i = 0;
+		}
+		else
+			state_i = c - '0';
+		while ((c = fgetc(wfg_out)) >= '0' && c <= '9')
+			state_i = state_i * 10 + c - '0';
+		state_i *= sign;
+		while (c != ',')
+			c = fgetc(wfg_out);
+		while ((c = fgetc(wfg_out)) == ' ' || c == '\t');
+		initStringInfo(&wfg_text);
+		appendStringInfoChar(&wfg_text, c);
+		while((c = fgetc(wfg_out)) != '\n')
+			appendStringInfoChar(&wfg_text, c);
+		returning_wfg->state[ii] = (DeadLockState)state_i;
+		returning_wfg->global_wfg_in_text[ii] = wfg_text.data;
+	}
+	FreeFile(wfg_out);
+	return returning_wfg;
+}
+
+static LOCAL_WFG *
+copy_local_wfg(LOCAL_WFG *l_wfg)
+{
+	LOCAL_WFG	*copied;
+
+	copied = (LOCAL_WFG *)palloc(sizeof(LOCAL_WFG));
+	memcpy(copied, l_wfg, sizeof(LOCAL_WFG));
+	copied->deadlock_info = (DEADLOCK_INFO *)palloc(sizeof(DEADLOCK_INFO) * l_wfg->nDeadlockInfo);
+	memcpy(copied->deadlock_info, l_wfg->deadlock_info, sizeof(DEADLOCK_INFO) * l_wfg->nDeadlockInfo);
+	copied->external_lock = (ExternalLockInfo *)palloc(sizeof(ExternalLockInfo));
+	memcpy(copied->external_lock, l_wfg->external_lock, sizeof(ExternalLockInfo));
+	copied->external_lock->dsn = pstrdup(l_wfg->external_lock->dsn);
+	return copied;
+}
+
+static GLOBAL_WFG *
+copy_global_wfg(GLOBAL_WFG *g_wfg)
+{
+	GLOBAL_WFG	*copied;
+	int			 ii;
+
+	if (g_wfg == NULL)
+		return NULL;
+
+	copied = (GLOBAL_WFG *)palloc(sizeof(GLOBAL_WFG));
+
+	copied->global_wfg_magic = g_wfg->global_wfg_magic;
+	copied->nLocalWfg = g_wfg->nLocalWfg;
+	copied->is_text = (bool *)palloc(sizeof(bool) * g_wfg->nLocalWfg);
+	memcpy(copied->is_text, g_wfg->is_text, sizeof(bool) * g_wfg->nLocalWfg);
+	for (ii = 0; ii < g_wfg->nLocalWfg; ii++)
+	{
+		if (copied->is_text[ii] == true)
+		{
+			copied->local_wfg[ii] = pstrdup((char *)(g_wfg->local_wfg[ii]));
+			copied->txtsize[ii] = strlen((char *)(g_wfg->local_wfg[ii]));
+		}
+		else
+			copied->local_wfg[ii] = copy_local_wfg((LOCAL_WFG *)(g_wfg->local_wfg[ii]));
+	}
+	return copied;
+}
+
+char *
+normalize_str(char *src)
+{
+	StringInfoData	data;
+
+	initStringInfo(&data);
+	appendStringInfoChar(&data, '\'');
+	while(*src)
+	{
+		if ((*src) == '\'')
+			appendStringInfoChar(&data, '\\');
+		appendStringInfoChar(&data, *src++);
+	}
+	appendStringInfoChar(&data, '\'');
+	return data.data;
+}
