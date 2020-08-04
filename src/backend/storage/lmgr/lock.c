@@ -265,7 +265,7 @@ static bool externalLockFileUnlinkProc(const LOCKTAG *locktag, PGPROC *proc);
 static LOCK *findExternalLock(const LOCKTAG *locktag);
 static char *findExternalLockFileName(const LOCKTAG *locktag);
 ExternalLockInfo *GetExternalLockProperties(const LOCKTAG *locktag);
-static bool read_line(int f, StringInfo s);
+static bool read_line(FILE *f, StringInfo s);
 
 /*
  * To make the fast-path lock mechanism work, we must have some way of
@@ -4755,10 +4755,10 @@ ExternalLockSetProperties(LOCKTAG *locktag,
 						  TransactionId target_xid,
 						  bool update_flag)
 {
-	char		   *lockFname;
-	StringInfoData	externalLockFileData;
-	struct stat		statbuf;
-	int				lockF;
+	char			*lockFname;
+	StringInfoData	 externalLockFileData;
+	struct stat		 statbuf;
+	FILE			*lockF;
 
 	/*
 	 * Check if locktag and proc satisfy the eligibility.
@@ -4786,12 +4786,12 @@ ExternalLockSetProperties(LOCKTAG *locktag,
 	}
 	initStringInfo(&externalLockFileData);
 	appendStringInfo(&externalLockFileData, "%s\n%d\n%d\n%d\n", dsn, target_pgprocno, target_pid, target_xid);
-	lockF = open(lockFname, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
-	if (lockF < 0)
+	lockF = AllocateFile(lockFname, "w");
+	if (lockF == 0)
 		elog(ERROR, "Could not open external lock file, %s", lockFname);
-	if (write(lockF, externalLockFileData.data, externalLockFileData.len) != externalLockFileData.len)
+	if (fwrite(externalLockFileData.data, externalLockFileData.len, 1, lockF) != 1)
 		elog(ERROR, "Could not write to external lock file, %s", lockFname);
-	close(lockF);
+	FreeFile(lockF);
 	pfree(lockFname);
 	pfree(externalLockFileData.data);
 	return true;
@@ -4800,16 +4800,16 @@ ExternalLockSetProperties(LOCKTAG *locktag,
 ExternalLockInfo *
 GetExternalLockProperties(const LOCKTAG *locktag)
 {
-	int					lockF;
-	ExternalLockInfo   *output;
-	StringInfoData		linebuf;
-	char			   *lockfname;
+	FILE				*lockF;
+	ExternalLockInfo	*output;
+	StringInfoData		 linebuf;
+	char				*lockfname;
 
 	if (locktag->locktag_type != LOCKTAG_EXTERNAL)
 		return NULL;
 	lockfname = findExternalLockFileName(locktag);
-	lockF = open(lockfname, O_RDONLY);
-	if (lockF < 0)
+	lockF = AllocateFile(lockfname, "r");
+	if (lockF == NULL)
 		elog(ERROR, "Could not open external lock file, %s", lockfname);
 	pfree(lockfname);
 	output = (ExternalLockInfo *)palloc(sizeof(ExternalLockInfo));
@@ -4835,7 +4835,7 @@ GetExternalLockProperties(const LOCKTAG *locktag)
 	resetStringInfo(&linebuf);
 	read_line(lockF, &linebuf);
 	output->target_txn = atoi(linebuf.data);
-	close(lockF);
+	FreeFile(lockF);
 	pfree(linebuf.data);
 	return output;
 }
@@ -4875,15 +4875,14 @@ findExternalLock(const LOCKTAG *locktag)
 }
 
 static bool
-read_line(int f, StringInfo s)
+read_line(FILE *f, StringInfo s)
 {
 	char	inbuf;
-	int		ll;
 
 	while(true)
 	{
-		ll = read(f, &inbuf, 1);
-		if (ll == 0)
+		inbuf = getc(f);
+		if (inbuf < 0)
 			goto fmterr;
 		if (inbuf == '\n')
 			break;
@@ -4892,7 +4891,7 @@ read_line(int f, StringInfo s)
 	return true;
 
 fmterr:
-	close(f);
+	FreeFile(f);
 	elog(ERROR, "External lock file format error.");
 	return false;
 }

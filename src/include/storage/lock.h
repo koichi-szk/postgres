@@ -577,9 +577,12 @@ typedef struct GLOBAL_WFG
 {
 	int32	  global_wfg_magic;
 	int32	  nLocalWfg;
-	bool	 *is_text;
-	int32	 *txtsize;
-	void	**local_wfg;		/* if (is_tex) then this is char *, otherwise LOCAL_WFG */
+	bool	 *is_text;			/* For future extension.  At present, always false */
+	int32	 *txtsize;			/* For future extension.  At present, fixed to zero */
+	void	**local_wfg;		/* if (is_tex) then this is char *, otherwise LOCAL_WFG
+								 * For furuture extension to support different archtiecture
+								 * target
+								 */
 	int32	  global_wfg_trailor;
 } GLOBAL_WFG;
 

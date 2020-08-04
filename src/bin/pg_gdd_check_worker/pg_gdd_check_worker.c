@@ -56,7 +56,7 @@
 #include <unistd.h>
 #include "libpq-fe.h"
 
-#define GDD_DEBUG_AID
+#define GDD_DEBUG
 
 /*
  * Run mode
@@ -160,9 +160,9 @@ main(int argc, char *argv[])
 	}
 }
 
-#ifdef GDD_DEBUG_AID
+#ifdef GDD_DEBUG
 int gdd_debug_remote_pid;
-#endif
+#endif /* GDD_DEBUG */
 
 static FILE *
 file_open(char *fname, char mode)
@@ -203,7 +203,7 @@ gdd_check(char *connstr)
 	query = malloc(QUERY_LEN + wfg_len);
 	if (query == NULL)
 		oom_err();
-	snprintf(query, QUERY_LEN + wfg_len, "SELECT * FROM pg_global_deadlock_check_from_remote('%s');", wfg);
+	snprintf(query, QUERY_LEN + wfg_len, "SELECT * FROM pg_global_deadlock_check_from_remote($GDD$%s$GDD$);", wfg);
 	free(wfg);
 	conn = connect(connstr);
 	if (conn == NULL)
@@ -211,7 +211,7 @@ gdd_check(char *connstr)
 		printf("-1");
 		return 1;
 	}
-#ifdef GDD_DEBUG_AID
+#ifdef GDD_DEBUG
 	/* For debug, obtain remote checker PID */
 	{
 		char	*pid_query = "SELECT pg_backend_pid() as pid;";
@@ -232,7 +232,7 @@ gdd_check(char *connstr)
 		if (res)
 			PQclear(res);
 	}
-#endif
+#endif /* GDD_DEBUG */
 	res = PQexec(conn, query);
 	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
@@ -279,7 +279,7 @@ gdd_recheck(int pos, char *connstr)
 	query = malloc(QUERY_LEN + wfg_len);
 	if (query == NULL)
 		oom_err();
-	snprintf(query, QUERY_LEN + wfg_len, "SELECT * FROM pg_global_deadlock_recheck_from_remote(%d, '%s');",
+	snprintf(query, QUERY_LEN + wfg_len, "SELECT * FROM pg_global_deadlock_recheck_from_remote(%d, $GDD$%s$GDD$);",
 										 pos, wfg);
 	free(wfg);
 	conn = connect(connstr);
@@ -287,7 +287,7 @@ gdd_recheck(int pos, char *connstr)
 	{
 		return 1;
 	}
-#ifdef GDD_DEBUG_AID
+#ifdef GDD_DEBUG
 	/* For debug, obtain remote checker PID */
 	{
 		char	*pid_query = "SELECT pg_backend_pid() as pid;";
@@ -308,7 +308,7 @@ gdd_recheck(int pos, char *connstr)
 		if (res)
 			PQclear(res);
 	}
-#endif
+#endif /* GDD_DEBUG */
 	res = PQexec(conn, query);
 	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
