@@ -1913,6 +1913,12 @@ GlobalDeadlockCheck_int(PGPROC *proc, GLOBAL_WFG *global_wfg, RETURNED_WFG **rv)
 	 */
 	for (curBup = deadlock_info_bup_head; curBup; curBup = curBup->next)
 	{
+		if (curBup->state == DS_HARD_DEADLOCK)
+			/*
+			 * This status should appear only in downstream databae, where this state has already
+			 * been handled in globalDeadlockCheckFromRemote().
+			 */
+			continue;
 		local_wfg = BuildLocalWfG(proc, curBup);
 #ifdef GDD_DEBUG
 		fprintf(gdd_out, "\n\n=== %s, line: %d ================================================\n", __func__, __LINE__);
@@ -2093,6 +2099,7 @@ globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLockState *state)
 	ExternalLockInfo	*passed_external_lock;		/* External lock passed from upstream */
 	RETURNED_WFG	 	*returning_global_wfg = NULL;
 	RETURNED_WFG		*returned_wfg = NULL;
+	DEADLOCK_INFO_BUP	*curr_bup;
 
 	/*
 	 * Deserialize received Global WFG from upstream
@@ -2159,8 +2166,12 @@ globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLockState *state)
 		goto returning;
 
 	/* Okay some deadlock candidate information was found */
-	/* K.Suzuki: ここおかしい。GlobalDeadlockCheck_int() で、deadlock_info_bup_head のサーチは行われている */
-#if 1
+	/* K.Suzuki: ここおかしい。GlobalDeadlockCheck_int() で、deadlock_info_bup_head のサーチは行われている
+	 *			 改修方法はいろいろあるが、ここではまず DS_HARD_DEADLOCK のみの処理を行って、GlobalDeadLockCheck_int()
+	 *			 では DS_HARD_DEADLOCK をスキップするようにすればいい。２箇所でループするのはあまりきれいではないが、
+	 *			 ローカルとグローバルを分ける意味では「アリ」と思う。
+	 */
+#if 0
 	/* 更にこの先をチェックして returning wfg に追加する */
 	*state = GlobalDeadlockCheck_int(pgproc_in_passed_external_lock, global_wfg, &returned_wfg);
 	if (*state != DS_DEADLOCK_INFO)
@@ -2185,17 +2196,11 @@ globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLockState *state)
 			global_wfg_here = AddToGlobalWfG(global_wfg, local_wfg);
 			returning_global_wfg = addGlobalWfgToReturnedWfg(returning_global_wfg, curr_bup->state, global_wfg_here);
 		}
-		else if (curr_bup->state == DS_DEADLOCK_INFO || curr_bup->state == DS_EXTERNAL_LOCK)
-		{
-			RETURNED_WFG	*returned_wfg = 0;
-
-			/* 更にこの先をチェックして returning wfg に追加する */
-			*state = GlobalDeadlockCheck_int(pgproc_in_passed_external_lock, global_wfg, &returned_wfg);
-			if (*state != DS_DEADLOCK_INFO)
-				continue;
-			returning_global_wfg = add_returned_wfg(returning_global_wfg, returned_wfg, true);
-		}
 	}
+	*state = GlobalDeadlockCheck_int(pgproc_in_passed_external_lock, global_wfg, &returned_wfg);
+	if (*state != DS_DEADLOCK_INFO)
+		goto returning;
+	returning_global_wfg = add_returned_wfg(returning_global_wfg, returned_wfg, true);
 #endif
 returning:
 	if (returning_global_wfg)
