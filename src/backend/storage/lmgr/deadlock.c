@@ -2956,6 +2956,8 @@ copy_global_wfg(GLOBAL_WFG *g_wfg)
 	copied->nLocalWfg = g_wfg->nLocalWfg;
 	copied->is_text = (bool *)palloc(sizeof(bool) * g_wfg->nLocalWfg);
 	memcpy(copied->is_text, g_wfg->is_text, sizeof(bool) * g_wfg->nLocalWfg);
+	copied->local_wfg = (void **)palloc(sizeof(void *) * g_wfg->nLocalWfg);
+	copied->txtsize = (int32 *)palloc(sizeof(int32) * g_wfg->nLocalWfg);
 	for (ii = 0; ii < g_wfg->nLocalWfg; ii++)
 	{
 		if (copied->is_text[ii] == true)
@@ -3062,7 +3064,7 @@ print_local_wfg(LOCAL_WFG *l_wfg, int idx, int total, FILE *f)
 			   (uint64)l_wfg, idx, total);
 	fprintf(f, "magic: 0x%08x, flag: 0x%08x, database_syste_identifier: 0x%016lx\n",
 			   l_wfg->local_wfg_magic, l_wfg->local_wfg_flag, l_wfg->database_system_identifier);
-	fprintf(f, "visitedProcPid: %d, visitedProcPgorocni: %d, visitedProcLxid: %ud\n",
+	fprintf(f, "visitedProcPid: %d, visitedProcPgorocni: %d, visitedProcLxid: %u\n",
 			   l_wfg->visitedProcPid, l_wfg->visitedProcPgprocno, l_wfg->visitedProcLxid);
 	fprintf(f, "nDeadlockInfo: %d\n", l_wfg->nDeadlockInfo);
 	if (l_wfg->nDeadlockInfo > GDD_ARRAY_MAX)
@@ -3093,9 +3095,9 @@ print_external_lock_info(ExternalLockInfo *e, FILE *f)
 		f = gdd_out;
 	}
 	fprintf(f, "====== EXTERNAL_LOCK: %016ld: Not set ========\n", (uint64)e);
-	fprintf(f, "pid: %d, pgprocno: %d, txnid: %ud, serno: %d,\n", e->pid, e->pgprocno, e->txnid, e->serno);
+	fprintf(f, "pid: %d, pgprocno: %d, txnid: %u, serno: %d,\n", e->pid, e->pgprocno, e->txnid, e->serno);
 	fprintf(f, "dsn: '%s'\n", e->dsn);
-	fprintf(f, "target_pid: %d, target_pgprocno: %d, target_txn: %ud\n", e->target_pid, e->target_pgprocno, e->target_txn);
+	fprintf(f, "target_pid: %d, target_pgprocno: %d, target_txn: %u\n", e->target_pid, e->target_pgprocno, e->target_txn);
 	fflush(f);
 }
 

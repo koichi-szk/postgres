@@ -117,6 +117,7 @@ main(int argc, char *argv[])
 	MODE			 my_mode;
 	char			*conn_str;
 	int				 pos;
+	int				 rv;
 
 	inf = stdin;
 	outf = stdout;
@@ -141,7 +142,8 @@ main(int argc, char *argv[])
 			inf = file_open(argv[3], 'r');
 		if (argc >= 5)
 			outf = file_open(argv[4], 'w');
-		exit(gdd_check(conn_str));
+		rv = gdd_check(conn_str);
+		exit(rv);
 	}
 	else
 	{
@@ -156,7 +158,8 @@ main(int argc, char *argv[])
 			inf = file_open(argv[4], 'r');
 		if (argc >= 6)
 			outf = file_open(argv[5], 'w');
-		exit(gdd_recheck(pos, conn_str));
+		rv = gdd_recheck(pos, conn_str);
+		exit(rv);
 	}
 }
 
