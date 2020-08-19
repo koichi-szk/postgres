@@ -287,6 +287,7 @@ static char *build_worker_file_name(bool input_to_command);
 static RETURNED_WFG *read_returned_wfg(char *fname);
 static LOCAL_WFG *copy_local_wfg(LOCAL_WFG *l_wfg);
 static GLOBAL_WFG *copy_global_wfg(GLOBAL_WFG *g_wfg);
+static bool external_lock_already_in_gwfg(GLOBAL_WFG *g_wfg, DEADLOCK_INFO_BUP *dl_info_bup);
 #ifdef GDD_DEBUG
 static void prepare_debug_file(void);
 static void print_global_wfg(GLOBAL_WFG *g_wfg, FILE *f);
@@ -1746,7 +1747,7 @@ BuildLocalWfG(PGPROC *origin, DEADLOCK_INFO_BUP *info)
 
 
 /*
- * We use database system id to identify database instance.   This is created by initdb and does not change throughout
+ * We use database system id to identify a database instance.   This is created by initdb and does not change throughout
  * the database lifetime.   This is essentially the timestan when initdb created the database materials plus process id
  * of initdb.   We can assume this is unique enough throughout correction of databases in the scope.
  */
@@ -1866,6 +1867,53 @@ GlobalDeadlockCheck(PGPROC *proc)
 	return GlobalDeadlockCheck_int(proc, NULL, NULL);
 }
 
+static bool
+external_lock_already_in_gwfg(GLOBAL_WFG *g_wfg, DEADLOCK_INFO_BUP *dl_info_bup)
+{
+	int			ii;
+	uint64		my_system_identifier;
+
+	if (g_wfg == NULL)
+		return false;
+
+	my_system_identifier = get_database_system_id();
+
+	if (dl_info_bup->state != DS_EXTERNAL_LOCK)
+		return false;
+	for (ii = 0; ii < g_wfg->nLocalWfg; ii++)
+	{
+		LOCAL_WFG			*l_wfg;
+		ExternalLockInfo	*e_lock;
+		DEADLOCK_INFO		*dl_info;
+		LOCKTAG				*dl_locktag;
+
+		l_wfg = (LOCAL_WFG *)(g_wfg->local_wfg[ii]);
+		if (l_wfg->database_system_identifier != my_system_identifier)
+			continue;
+		if (g_wfg->is_text[ii] == true)
+			continue;
+		if (!(((LOCAL_WFG *)(g_wfg->local_wfg[ii]))->local_wfg_flag & WfG_HAS_EXTERNAL_LOCK))
+			continue;
+		e_lock = l_wfg->external_lock;
+		dl_info = &dl_info_bup->deadlock_info[dl_info_bup->nDeadlock_info - 1];
+		dl_locktag = &dl_info->locktag;
+		/* Check locktag against external lock in local wfg */
+		if (dl_locktag->locktag_field1 != e_lock->pgprocno)
+			continue;
+		if (dl_locktag->locktag_field2 != e_lock->pid)
+			continue;
+		if (dl_locktag->locktag_field3 != e_lock->txnid)
+			continue;
+		if (dl_locktag->locktag_field4 != e_lock->serno)
+			continue;
+		if (dl_locktag->locktag_type != LOCKTAG_EXTERNAL)
+			continue;
+		if (dl_locktag->locktag_lockmethodid != DEFAULT_LOCKMETHOD)
+			continue;
+		return true;
+	}
+	return false;
+}
 /*
  * This is the latter part of global deadlock check.
  *
@@ -1918,6 +1966,11 @@ GlobalDeadlockCheck_int(PGPROC *proc, GLOBAL_WFG *global_wfg, RETURNED_WFG **rv)
 			 * This status should appear only in downstream databae, where this state has already
 			 * been handled in globalDeadlockCheckFromRemote().
 			 */
+			continue;
+		/*
+		 * Check if EXTERANL lock of current deadlock info is not in the global wfg
+		 */
+		if (external_lock_already_in_gwfg(global_wfg, curBup))
 			continue;
 		local_wfg = BuildLocalWfG(proc, curBup);
 #ifdef GDD_DEBUG
@@ -2257,7 +2310,7 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
         funcctx->attinmeta = attinmeta;
 		global_wfg_text = PG_GETARG_CSTRING(0);
 
-		returning_global_wfg = globalDeadlockCheckFromRemote(global_wfg_text, &state);
+		returning_global_wfg = globalDeadlockCheckFromRemote(global_wfg_text, &state);	/* K.Suzuki この関数を GDB でトレースすること */
 
 		funcctx->user_fctx = returning_global_wfg;
 		funcctx->max_calls = returning_global_wfg ? returning_global_wfg->nReturnedWfg : 0;
@@ -2748,10 +2801,10 @@ globalDeadlockCheckMode(GLOBAL_WFG *global_wfg)
 
 		if (global_wfg->is_text[ii] == true)
 			continue;
-		local_wfg = global_wfg->local_wfg[ii];
+		local_wfg = (LOCAL_WFG *)global_wfg->local_wfg[ii];
 		if (local_wfg->database_system_identifier != my_database_system_id)
 			continue;
-		if (!local_wfg->local_wfg_flag & WfG_HAS_EXTERNAL_LOCK)
+		if (!(local_wfg->local_wfg_flag & WfG_HAS_EXTERNAL_LOCK))
 		{
 			nGlobalVisitedProcs = 0;
 			if (globalVisitedProcs)
@@ -2768,7 +2821,7 @@ globalDeadlockCheckMode(GLOBAL_WFG *global_wfg)
 			PGPROC	*proc_wk;
 
 			info = &local_wfg->deadlock_info[0];
-			proc_wk = find_pgproc(info->pgprocno);
+			proc_wk = find_pgproc_pgprocno(info->pgprocno);	/* K.Suzuki どうもここでおかしくなっている。ここ調べる必要がある */
 			if (proc_wk == NULL || proc_wk->pid != info->pid || proc_wk->lxid != info->txid)
 				continue;
 
@@ -2966,7 +3019,10 @@ copy_global_wfg(GLOBAL_WFG *g_wfg)
 			copied->txtsize[ii] = strlen((char *)(g_wfg->local_wfg[ii]));
 		}
 		else
+		{
 			copied->local_wfg[ii] = copy_local_wfg((LOCAL_WFG *)(g_wfg->local_wfg[ii]));
+			copied->txtsize[ii] = -1;
+		}
 	}
 	return copied;
 }
