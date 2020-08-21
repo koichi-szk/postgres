@@ -288,6 +288,7 @@ static RETURNED_WFG *read_returned_wfg(char *fname);
 static LOCAL_WFG *copy_local_wfg(LOCAL_WFG *l_wfg);
 static GLOBAL_WFG *copy_global_wfg(GLOBAL_WFG *g_wfg);
 static bool external_lock_already_in_gwfg(GLOBAL_WFG *g_wfg, DEADLOCK_INFO_BUP *dl_info_bup);
+static void *gdd_repalloc(void *pointer, Size size);
 #ifdef GDD_DEBUG
 static void prepare_debug_file(void);
 static void print_global_wfg(GLOBAL_WFG *g_wfg, FILE *f);
@@ -1819,11 +1820,11 @@ addToGlobalWfg_int(GLOBAL_WFG *g_wfg, void *data, bool is_text, int size)
 	else
 	{
 		g_wfg->nLocalWfg++;
-		g_wfg->local_wfg = (void **)repalloc(g_wfg->local_wfg, sizeof(void *) * g_wfg->nLocalWfg);
+		g_wfg->local_wfg = (void **)gdd_repalloc(g_wfg->local_wfg, sizeof(void *) * g_wfg->nLocalWfg);
 		g_wfg->local_wfg[g_wfg->nLocalWfg - 1] = data;
-		g_wfg->is_text = (bool *)repalloc(g_wfg->is_text, sizeof(bool) * g_wfg->nLocalWfg);
+		g_wfg->is_text = (bool *)gdd_repalloc(g_wfg->is_text, sizeof(bool) * g_wfg->nLocalWfg);
 		g_wfg->is_text[g_wfg->nLocalWfg - 1] = is_text;
-		g_wfg->txtsize = (int32 *)repalloc(g_wfg->txtsize, sizeof(int32) * g_wfg->nLocalWfg);
+		g_wfg->txtsize = (int32 *)gdd_repalloc(g_wfg->txtsize, sizeof(int32) * g_wfg->nLocalWfg);
 		g_wfg->txtsize[g_wfg->nLocalWfg - 1] = size;
 	}
 	return g_wfg;
@@ -2734,7 +2735,7 @@ add_returned_wfg(RETURNED_WFG *dest, RETURNED_WFG *src, bool clean_opt)
 	int			  ii;
 
 	rv = (dest == NULL) ? palloc0(sizeof(RETURNED_WFG)) : dest;
-	rv->global_wfg_in_text = repalloc(rv->global_wfg_in_text, sizeof(char *) * (rv->nReturnedWfg + src->nReturnedWfg));
+	rv->global_wfg_in_text = gdd_repalloc(rv->global_wfg_in_text, sizeof(char *) * (rv->nReturnedWfg + src->nReturnedWfg));
 	for (ii = 0; ii < src->nReturnedWfg; ii++)
 		rv->global_wfg_in_text[dest->nReturnedWfg + ii] = src->global_wfg_in_text[ii];
 	rv->nReturnedWfg += src->nReturnedWfg;
@@ -2753,9 +2754,9 @@ addGlobalWfgToReturnedWfg(RETURNED_WFG *returned_wfg, DeadLockState state, GLOBA
 		returned_wfg = palloc0(sizeof(RETURNED_WFG));
 	global_wfg_txt = SerializeGlobalWfG(global_wfg);
 	returned_wfg->nReturnedWfg++;
-	returned_wfg->state = repalloc(returned_wfg->state, sizeof(DeadLockState) * returned_wfg->nReturnedWfg);
+	returned_wfg->state = gdd_repalloc(returned_wfg->state, sizeof(DeadLockState) * returned_wfg->nReturnedWfg);
 	returned_wfg->state[returned_wfg->nReturnedWfg - 1] = state;
-	returned_wfg->global_wfg_in_text = repalloc(returned_wfg->global_wfg_in_text, sizeof(char *) * returned_wfg->nReturnedWfg);
+	returned_wfg->global_wfg_in_text = gdd_repalloc(returned_wfg->global_wfg_in_text, sizeof(char *) * returned_wfg->nReturnedWfg);
 	returned_wfg->global_wfg_in_text[returned_wfg->nReturnedWfg - 1] = global_wfg_txt;
 	return returned_wfg;
 }
@@ -2826,7 +2827,7 @@ globalDeadlockCheckMode(GLOBAL_WFG *global_wfg)
 				continue;
 
 			nGlobalVisitedProcs++;
-			globalVisitedProcs = (PGPROC **)repalloc(globalVisitedProcs, sizeof(PGPROC *) * nGlobalVisitedProcs);
+			globalVisitedProcs = (PGPROC **)gdd_repalloc(globalVisitedProcs, sizeof(PGPROC *) * nGlobalVisitedProcs);
 			globalVisitedProcs[nGlobalVisitedProcs - 1] = proc_wk;
 
 			visitedOriginPid = local_wfg->visitedProcPid;
@@ -2839,8 +2840,8 @@ globalDeadlockCheckMode(GLOBAL_WFG *global_wfg)
 			rv = DLCMODE_GLOBAL_AGAIN;
 		/* Setup EXTERNAL LOCK going out from this node in the global wfg */
 		nGlobalVisitedExternalLock++;
-		globalVisitedExternalLock[nGlobalVisitedExternalLock - 1]
-			= (ExternalLockInfo *)repalloc(globalVisitedExternalLock,
+		globalVisitedExternalLock
+			= (ExternalLockInfo **)gdd_repalloc(globalVisitedExternalLock,
 										   sizeof(ExternalLockInfo *) * nGlobalVisitedExternalLock);
 		globalVisitedExternalLock[nGlobalVisitedExternalLock -1] = local_wfg->external_lock;
 	}
@@ -3677,4 +3678,13 @@ DeserializeGlobalWfG(char *buf)
 	if (!CloseScan(buf))
 		return NULL;
 	return g_wfg;
+}
+
+static void *
+gdd_repalloc(void *pointer, Size size)
+{
+	if (pointer == NULL)
+		return palloc(size);
+	else
+		return repalloc(pointer, size);
 }
