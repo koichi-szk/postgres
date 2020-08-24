@@ -163,14 +163,14 @@
  */
 typedef enum DeadlockCheckMode
 {
-	DLCMODE_LOCAL,				/* Invoked locally											*/
-	DLCMODE_GLOBAL_NEW,			/* Part of global deadlock detection. 						*/
-								/* 		First visit to the database in External Lock path	*/
-	DLCMODE_GLOBAL_AGAIN,		/* Part of global deadlock detection.						*/
-								/* 		Visited this database in the past but it is			*/
-								/* 		not the origin.										*/
-	DLCMODE_GLOBAL_ORIGIN,		/* Part of global deadlock detection.						*/
-								/*		Invoked in the origin database						*/
+	DLCMODE_LOCAL,				/* Invoked locally                                          */
+	DLCMODE_GLOBAL_NEW,			/* Part of global deadlock detection.                       */
+								/* 		First visit to the database in External Lock path   */
+	DLCMODE_GLOBAL_AGAIN,		/* Part of global deadlock detection.                       */
+								/* 		Visited this database in the past but it is         */
+								/* 		not the origin.                                     */
+	DLCMODE_GLOBAL_ORIGIN,		/* Part of global deadlock detection.                       */
+								/*		Invoked in the origin database                      */
 	DLCMODE_ERROR
 } DeadlockCheckMode;
 
@@ -225,6 +225,9 @@ DEADLOCK_INFO_BUP	*deadlock_info_bup_tail;	/* Tail of the queue */
 /*
  * The following represents discovered candidate of wait-for-graph segment.
  * This was used in several global deadlock detection functions.
+ *
+ * By checking Wfg stability locally at downstream database, number of global_wfg_in_text
+ * is practically one.
  */
 typedef struct RETURNED_WFG
 {
@@ -267,10 +270,9 @@ static void PrintLockQueue(LOCK *lock, const char *info);
 
 static DeadLockState DeadLockCheck_int(PGPROC *proc);
 static int GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, RETURNED_WFG **returning_wfg);
-static DeadLockState GlobalDeadlockRecheckRemote(int	pos, char *global_wfg_text, ExternalLockInfo *downstream);
 static DeadLockState GlobalDeadlockCheck_int(PGPROC *proc, GLOBAL_WFG *global_wfg, RETURNED_WFG **rv);
 static DeadlockCheckMode globalDeadlockCheckMode(GLOBAL_WFG *global_wfg);
-static GLOBAL_WFG *AddToGlobalWfG(GLOBAL_WFG *g_wfg, LOCAL_WFG *local_wfg);
+static GLOBAL_WFG *addToGlobalWfG(GLOBAL_WFG *g_wfg, LOCAL_WFG *local_wfg);
 static void clean_deadlock_info_bup_recursive(DEADLOCK_INFO_BUP *info);
 static void clean_deadlock_info_bup(void);
 static bool check_local_wfg_is_stable(LOCAL_WFG *localWfG);
@@ -287,13 +289,13 @@ static char *build_worker_file_name(bool input_to_command);
 static RETURNED_WFG *read_returned_wfg(char *fname);
 static LOCAL_WFG *copy_local_wfg(LOCAL_WFG *l_wfg);
 static GLOBAL_WFG *copy_global_wfg(GLOBAL_WFG *g_wfg);
-static bool external_lock_already_in_gwfg(GLOBAL_WFG *g_wfg, DEADLOCK_INFO_BUP *dl_info_bup);
+static bool external_lock_already_in_gwfg(GLOBAL_WFG *global_wfg, DEADLOCK_INFO_BUP *dl_info_bup);
 static void *gdd_repalloc(void *pointer, Size size);
 #ifdef GDD_DEBUG
-static void prepare_debug_file(void);
-static void print_global_wfg(GLOBAL_WFG *g_wfg, FILE *f);
-static void print_local_wfg(LOCAL_WFG *l_wfg, int idx, int total, FILE *f);
-static void print_deadlock_info(DEADLOCK_INFO *info, int idx, int total, FILE *f);
+static void print_global_wfg(StringInfo out, GLOBAL_WFG *g_wfg);
+static void print_local_wfg(StringInfo out, LOCAL_WFG *l_wfg, int idx, int total);
+static void print_deadlock_info(StringInfo out, DEADLOCK_INFO *info, int idx, int total);
+static void print_external_lock_info(StringInfo out, ExternalLockInfo *e);
 #endif /* GDD_DEBUG */
 static char *getAtoInt64(char *buf, int64 *value);
 static char *getAtoInt32(char *buf, int32 *value);
@@ -311,7 +313,6 @@ static char *SerializeLocalWfG(LOCAL_WFG *local_wfg);
 static char *DeserializeLocalWfG(char *buf, LOCAL_WFG **local_wfg);
 static char *SerializeGlobalWfG(GLOBAL_WFG *g_wfg);
 static GLOBAL_WFG * DeserializeGlobalWfG(char *buf);
-static void print_external_lock_info(ExternalLockInfo *e, FILE *f);
 
 #define Lock_PgprocArray() LWLockAcquire(ProcArrayLock, LW_SHARED)
 #define Unlock_PgprocArray() LWLockRelease(ProcArrayLock)
@@ -367,10 +368,10 @@ static int	nDeadlockDetails;
 /* PGPROC pointer of any blocking autovacuum worker found */
 static PGPROC *blocking_autovacuum_proc = NULL;
 
+/* Database System Identifier of the current database */
+static uint64 my_database_system_identifier = 0;
+
 #ifdef GDD_DEBUG
-GLOBAL_WFG *global_wfg_test;
-FILE	*gdd_out = NULL;
-int		 gdd_debug_sno = 0;
 #define	GDD_ARRAY_MAX 128
 #endif /* GDD_DEBUG */
 
@@ -1682,8 +1683,6 @@ DeadLockReport(void)
  * RememberSimpleDeadLock: set up info for DeadLockReport when ProcSleep
  * detects a trivial (two-way) deadlock.  proc1 wants to block for lockmode
  * on lock, but proc2 is already waiting and would be blocked by proc1.
- *
- * K.Suzuki: この関数は EXTERNAL LOCK 対応不要なように思われる ... また後でチェックしてみる。
  */
 void
 RememberSimpleDeadLock(PGPROC *proc1,
@@ -1717,7 +1716,6 @@ BuildLocalWfG(PGPROC *origin, DEADLOCK_INFO_BUP *info)
 	LOCAL_WFG	*local_wfg;
 
 	local_wfg = (LOCAL_WFG *)palloc0(sizeof(LOCAL_WFG));
-	local_wfg->local_wfg_magic = WfG_LOCAL_MAGIC;
 	if (deadlockDetails[nDeadlockDetails - 1].locktag.locktag_type == LOCKTAG_EXTERNAL)
 		local_wfg->local_wfg_flag |= WfG_HAS_EXTERNAL_LOCK;
 	local_wfg->database_system_identifier = get_database_system_id();
@@ -1740,7 +1738,6 @@ BuildLocalWfG(PGPROC *origin, DEADLOCK_INFO_BUP *info)
 		local_wfg->external_lock = GetExternalLockProperties(&deadlockDetails[info->nDeadlock_info -1].locktag);
 	else
 		local_wfg->external_lock = NULL;
-	local_wfg->local_wfg_trailor = WfG_LOCAL_MAGIC;
 
 	return local_wfg;
 }
@@ -1748,21 +1745,29 @@ BuildLocalWfG(PGPROC *origin, DEADLOCK_INFO_BUP *info)
 
 
 /*
- * We use database system id to identify a database instance.   This is created by initdb and does not change throughout
- * the database lifetime.   This is essentially the timestan when initdb created the database materials plus process id
- * of initdb.   We can assume this is unique enough throughout correction of databases in the scope.
+ * We use database system id to identify a database instance.   This is created by initdb and does not change
+ * throughout the database lifetime.   This is essentially the timestan when initdb created the database
+ * materials plus process id of initdb.   We can assume this is unique enough throughout correction of
+ * databases in the scope.
+ *
+ * K.Suzuki: When database is cloned with pg_basebackup, cold copy or any similar way, database data directory
+ *           will be simply copied and we have a risk different database has the same database system id.
+ *           To avoid this, we will provide two ways to specify different identification method:
+ *           Offline utility to update database system identifier (pg_database_system_identifier), which
+ *           must run while the daabase is not active.
  */
 uint64
 get_database_system_id(void)
 {
 	ControlFileData *controlfiledata;
-	uint64			 system_identifier;
 	bool			 crc_ok;
 
+	if (my_database_system_identifier)
+		return my_database_system_identifier;
 	controlfiledata = get_controlfile(DataDir, &crc_ok);
-	system_identifier = controlfiledata->system_identifier;
+	my_database_system_identifier = controlfiledata->system_identifier;
 	pfree(controlfiledata);
-	return system_identifier;
+	return my_database_system_identifier;
 }
 
 /*
@@ -1800,67 +1805,34 @@ locktagTypeName(LockTagType type)
 }
 
 static GLOBAL_WFG *
-addToGlobalWfg_int(GLOBAL_WFG *g_wfg, void *data, bool is_text, int size)
+addToGlobalWfG(GLOBAL_WFG *global_wfg, LOCAL_WFG *local_wfg)
 {
 	Assert(data);
 
-	if (g_wfg == NULL)
+	if (global_wfg == NULL)
 	{
-		g_wfg = (GLOBAL_WFG *)palloc(sizeof(GLOBAL_WFG));
-		g_wfg->global_wfg_magic = WfG_GLOBAL_MAGIC;
-		g_wfg->nLocalWfg = 1;
-		g_wfg->local_wfg = (void **)palloc(sizeof(void *));
-		g_wfg->local_wfg[0] = data;
-		g_wfg->is_text = (bool *)palloc(sizeof(bool));
-		g_wfg->is_text[0] = is_text;
-		g_wfg->txtsize = (int32 *)palloc(sizeof(int32));
-		g_wfg->txtsize[0] = size;
-		g_wfg->global_wfg_trailor = WfG_GLOBAL_MAGIC;
+		global_wfg = (GLOBAL_WFG *)palloc(sizeof(GLOBAL_WFG));
+		global_wfg->nLocalWfg = 1;
+		global_wfg->local_wfg = (LOCAL_WFG **)palloc(sizeof(void *));
+		global_wfg->local_wfg[0] = local_wfg;
 	}
 	else
 	{
-		g_wfg->nLocalWfg++;
-		g_wfg->local_wfg = (void **)gdd_repalloc(g_wfg->local_wfg, sizeof(void *) * g_wfg->nLocalWfg);
-		g_wfg->local_wfg[g_wfg->nLocalWfg - 1] = data;
-		g_wfg->is_text = (bool *)gdd_repalloc(g_wfg->is_text, sizeof(bool) * g_wfg->nLocalWfg);
-		g_wfg->is_text[g_wfg->nLocalWfg - 1] = is_text;
-		g_wfg->txtsize = (int32 *)gdd_repalloc(g_wfg->txtsize, sizeof(int32) * g_wfg->nLocalWfg);
-		g_wfg->txtsize[g_wfg->nLocalWfg - 1] = size;
+		global_wfg->nLocalWfg++;
+		global_wfg->local_wfg = (LOCAL_WFG **)gdd_repalloc(global_wfg->local_wfg, sizeof(void *) * global_wfg->nLocalWfg);
+		global_wfg->local_wfg[global_wfg->nLocalWfg - 1] = local_wfg;
 	}
-	return g_wfg;
+	return global_wfg;
 }
 
 /*
- * Shoftcut when local_wfg is not in the text format.
- */
-static GLOBAL_WFG *
-AddToGlobalWfG(GLOBAL_WFG *g_wfg, LOCAL_WFG *local_wfg)
-{
-	return addToGlobalWfg_int(g_wfg, (void *)local_wfg, false, -1);
-}
-
-#if 0
-GLOBAL_WFG *
-AddToGlobalWfG_Stream(GLOBAL_WFG *g_wfg, char *local_wfg_s, int32 size)
-{
-	return addToGlobalWfg_int(g_wfg, (void *)local_wfg_s, true, size);
-}
-#endif
-
-
-/*
- * K.Suzuki:
- *
  * Entry point of global deadlock check.
+ *
  * Called just after DeadLockCheck() from proc.c.
  *
  * Be aware that this function does not assume the caller has acquired lock line
- * locks.
+ * locks.   It is highly recommended to release all the lockline of LWLocks.
  *
- */
-/*
- * Entry point from local proc.c.   We don't have global_wfg or returning_wfg entry
- * yet.
  */
 DeadLockState
 GlobalDeadlockCheck(PGPROC *proc)
@@ -1868,53 +1840,6 @@ GlobalDeadlockCheck(PGPROC *proc)
 	return GlobalDeadlockCheck_int(proc, NULL, NULL);
 }
 
-static bool
-external_lock_already_in_gwfg(GLOBAL_WFG *g_wfg, DEADLOCK_INFO_BUP *dl_info_bup)
-{
-	int			ii;
-	uint64		my_system_identifier;
-
-	if (g_wfg == NULL)
-		return false;
-
-	my_system_identifier = get_database_system_id();
-
-	if (dl_info_bup->state != DS_EXTERNAL_LOCK)
-		return false;
-	for (ii = 0; ii < g_wfg->nLocalWfg; ii++)
-	{
-		LOCAL_WFG			*l_wfg;
-		ExternalLockInfo	*e_lock;
-		DEADLOCK_INFO		*dl_info;
-		LOCKTAG				*dl_locktag;
-
-		l_wfg = (LOCAL_WFG *)(g_wfg->local_wfg[ii]);
-		if (l_wfg->database_system_identifier != my_system_identifier)
-			continue;
-		if (g_wfg->is_text[ii] == true)
-			continue;
-		if (!(((LOCAL_WFG *)(g_wfg->local_wfg[ii]))->local_wfg_flag & WfG_HAS_EXTERNAL_LOCK))
-			continue;
-		e_lock = l_wfg->external_lock;
-		dl_info = &dl_info_bup->deadlock_info[dl_info_bup->nDeadlock_info - 1];
-		dl_locktag = &dl_info->locktag;
-		/* Check locktag against external lock in local wfg */
-		if (dl_locktag->locktag_field1 != e_lock->pgprocno)
-			continue;
-		if (dl_locktag->locktag_field2 != e_lock->pid)
-			continue;
-		if (dl_locktag->locktag_field3 != e_lock->txnid)
-			continue;
-		if (dl_locktag->locktag_field4 != e_lock->serno)
-			continue;
-		if (dl_locktag->locktag_type != LOCKTAG_EXTERNAL)
-			continue;
-		if (dl_locktag->locktag_lockmethodid != DEFAULT_LOCKMETHOD)
-			continue;
-		return true;
-	}
-	return false;
-}
 /*
  * This is the latter part of global deadlock check.
  *
@@ -1943,16 +1868,20 @@ GlobalDeadlockCheck_int(PGPROC *proc, GLOBAL_WFG *global_wfg, RETURNED_WFG **rv)
 	RETURNED_WFG	*returned_wfg = NULL;
 	RETURNED_WFG	*returning_wfg;
 	int				 ii;
+#ifdef GDD_DEBUG
+	StringInfoData	out;
+#endif /* GDD_DEBUG */
 
 	globalVisitedProcs = NULL;
 	nGlobalVisitedProcs = 0;
 	returning_wfg = NULL;
 
 #ifdef GDD_DEBUG
-	prepare_debug_file();
-	fprintf(gdd_out, "\n\n=== %s, line: %d ================================================\n", __func__, __LINE__);
-	fflush(gdd_out);
-	print_global_wfg(global_wfg, NULL);
+	initStringInfo(&out);
+	appendStringInfo(&out, "\n=== %s, line: %d ================================================", __func__, __LINE__);
+	print_global_wfg(&out, global_wfg);
+	elog(DEBUG1, "%s", out.data);
+	resetStringInfo(&out);
 #endif /* GDD_DEBUG */
 	/*
 	 * Previous DeadLockCheck() may have found more than one possible piece of wait-for-graph
@@ -1975,9 +1904,10 @@ GlobalDeadlockCheck_int(PGPROC *proc, GLOBAL_WFG *global_wfg, RETURNED_WFG **rv)
 			continue;
 		local_wfg = BuildLocalWfG(proc, curBup);
 #ifdef GDD_DEBUG
-		fprintf(gdd_out, "\n\n=== %s, line: %d ================================================\n", __func__, __LINE__);
-		fflush(gdd_out);
-		print_local_wfg(local_wfg, 0, 1, NULL);
+		appendStringInfo(&out, "\n=== %s, line: %d ================================================", __func__, __LINE__);
+		print_local_wfg(&out, local_wfg, 0, 1);
+		elog(DEBUG1, "%s", out.data);
+		resetStringInfo(&out);
 #endif /* GDD_DEBUG */
 		if (!local_wfg || !check_local_wfg_is_stable(local_wfg))
 			continue;
@@ -1986,33 +1916,29 @@ GlobalDeadlockCheck_int(PGPROC *proc, GLOBAL_WFG *global_wfg, RETURNED_WFG **rv)
 			continue;
 		if (nWfG < 0)
 			elog(ERROR, "Error in remote wait-for-graph check.\n");
+		/*
+		 * Check of local wait-for-graph is stable
+		 */
+		if (!check_local_wfg_is_stable(local_wfg))
+		{
+			/* Checked WFG is not deadlock candidate. */
+			free_local_wfg(local_wfg);
+			continue;
+		}
 		if (deadlockCheckMode == DLCMODE_LOCAL)
 		{
 			/*
 			 * If we are at the beginning database (ORIGIN), we need to recheck if the observerd
 			 * wait-for-graph is static.   If not, it's not a part of a deadlock.
+			 *
+			 * Now nReturnedWfg is at most one.
 			 */
 			for (ii = 0; ii < returned_wfg->nReturnedWfg; ii++)
 			{
-				ExternalLockInfo	*external_lock_info;
-				LOCKTAG				*external_locktag;
-				DeadLockState	 	 state2;
-
-				external_locktag = &(curBup->deadlock_info[curBup->nDeadlock_info - 1].locktag);
-				external_lock_info = GetExternalLockProperties(external_locktag);
-				if (external_lock_info == NULL)
-					elog(ERROR, "Inconsisitent internal status in global lock detection.");
-				state2 = GlobalDeadlockRecheckRemote(0, returned_wfg->global_wfg_in_text[ii], external_lock_info);
-				if (state2 == DS_HARD_DEADLOCK || state2 == DS_GLOBAL_ERROR)
+				if (returned_wfg->state[ii] == DS_HARD_DEADLOCK || returned_wfg->state[ii] == DS_GLOBAL_ERROR)
 				{
-					/*
-					 * K.Suzuki:
-					 *
-					 * Should we exit the loop when an error occurred?   We may be able to continue
-					 * rechecking remaining condidates.
-					 */
 					free_returned_wfg(returned_wfg);
-					state = state2;
+					state = returned_wfg->state[ii];
 					goto returning;
 				}
 			}
@@ -2030,7 +1956,13 @@ GlobalDeadlockCheck_int(PGPROC *proc, GLOBAL_WFG *global_wfg, RETURNED_WFG **rv)
 		state = returning_wfg ? DS_DEADLOCK_INFO : DS_NO_DEADLOCK;
 
 returning:
-	/* Cleanup global deadlock check object local to this database */
+
+	/*
+	 * Cleanup global deadlock check object local to this database
+	 */
+#ifdef GDD_DEBUG
+	pfree(out.data);
+#endif /* GDD_DEBUG */
 	if (globalVisitedProcs)
 		pfree(globalVisitedProcs);
 	nGlobalVisitedProcs = 0;
@@ -2078,6 +2010,7 @@ GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, RETURNED
 	char			*wfg_in_fname;
 	char			*cmd_out_fname;
 	FILE			*wfg_in;
+	FILE			*cmd_out;
 #ifdef GDD_DEBUG
 #else
 	int				 cmd_ret;
@@ -2096,20 +2029,24 @@ GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, RETURNED
 	/*
 	 * Build global wait-for-graph and translate to string to send to the downstream database.
 	 */
-	new_global_wfg = AddToGlobalWfG(new_global_wfg, (void *)local_wfg);
+	new_global_wfg = addToGlobalWfG(new_global_wfg, (void *)local_wfg);
 	global_wfg_text = SerializeGlobalWfG(new_global_wfg);
 #ifdef GDD_DEBUG
-	/* 再び deserialize して内容確認するコードを追加 */
+	/* Here, print global wait-for-graph again for the test. */
 	{
 		GLOBAL_WFG *wk_g_wfg;
+		StringInfoData	out;
 
-		prepare_debug_file();
-		fprintf(gdd_out, "\n\n=== %s, line: %d Serialized WFG =================================\n", __func__, __LINE__);
-		fprintf(gdd_out, "%s\n===============================================\n", global_wfg_text);
-		print_global_wfg(new_global_wfg, NULL);
+		initStringInfo(&out);
+
+		appendStringInfo(&out, "\n=== %s, line: %d Serialized WFG =================================", __func__, __LINE__);
+		appendStringInfo(&out, "\n%s\n===============================================", global_wfg_text);
+		print_global_wfg(&out, new_global_wfg);
 		wk_g_wfg = DeserializeGlobalWfG(global_wfg_text);
-		print_global_wfg(wk_g_wfg, NULL);
+		print_global_wfg(&out, wk_g_wfg);
 		free_global_wfg(wk_g_wfg);
+		elog(DEBUG1, "%s", out.data);
+		pfree(out.data);
 	}
 #endif /* GDD_DEBUG */
 	/*
@@ -2126,14 +2063,17 @@ GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, RETURNED
 											normalizeString(wfg_in_fname),
 											normalizeString(cmd_out_fname));
 	wfg_in = AllocateFile(wfg_in_fname, "w");
+	cmd_out = AllocateFile(cmd_out_fname, "w");
 	fwrite(global_wfg_text, strlen(global_wfg_text), 1, wfg_in);
 	FreeFile(wfg_in);
+	FreeFile(cmd_out);
 	/* Here, in the debug, the command should be invoked manually for debug */
 #ifdef GDD_DEBUG
 #else
 	cmd_ret = system(cmd.data);
 	if (!WIFEXITED(cmd_ret) || (WEXITSTATUS(cmd_ret) != 0))
-		elog(ERROR, "Global deadlock detection worker error.");
+		elog(ERROR, "Global deadlock detection worker error. Remove files %s, %s from %s/%s directly manually if needed.",
+				wfg_in_fname, cmd_out_fname, DataDir, "pg_external_locks");
 #endif	/* GDD_DEBUG */
 	pfree(cmd.data);
 	unlink(wfg_in_fname);
@@ -2150,16 +2090,16 @@ globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLockState *state)
 {
 	GLOBAL_WFG 			*global_wfg;
 	PGPROC				*pgproc_in_passed_external_lock;
-	ExternalLockInfo	*passed_external_lock;		/* External lock passed from upstream */
-	RETURNED_WFG	 	*returning_global_wfg = NULL;
-	RETURNED_WFG		*returned_wfg = NULL;
+	ExternalLockInfo	*passed_external_lock;			/* External lock passed from upstream */
+	RETURNED_WFG	 	*returning_global_wfg = NULL;	/* To be returned to the upstream */
+	RETURNED_WFG		*returned_wfg = NULL;			/* Returned from the downstream */
 	DEADLOCK_INFO_BUP	*curr_bup;
+
+	*state = DS_NO_DEADLOCK;
 
 	/*
 	 * Deserialize received Global WFG from upstream
 	 */
-	*state = DS_NO_DEADLOCK;
-
 	global_wfg = DeserializeGlobalWfG(global_wfg_text);
 	if (global_wfg == NULL)
 	{
@@ -2168,7 +2108,9 @@ globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLockState *state)
 		goto returning;
 	}
 
-	/* Determine deadlock check mode */
+	/*
+	 * Determine deadlock check mode
+	 */
 	deadlockCheckMode = globalDeadlockCheckMode(global_wfg);
 	if (deadlockCheckMode == DLCMODE_ERROR)
 	{
@@ -2179,10 +2121,9 @@ globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLockState *state)
 
 	/*
 	 * Passed_exernal_lock indicates EXTERNAL LOCK of direct upstream database, connecting to the current database.
+	 * This is used to check if the external lock is stable, the target PGPROC, pid and txn did not change.
 	 */
-	/* K.Suzuki: WFG の情報は正しいが、external_lock がうまく取り出せていない。*/
-	/* TBD: 20200727 */
-	passed_external_lock = ((LOCAL_WFG *)global_wfg->local_wfg[global_wfg->nLocalWfg - 1])->external_lock;
+	passed_external_lock = global_wfg->local_wfg[global_wfg->nLocalWfg - 1]->external_lock;
 
 	/*
 	 * Check if the direct upstream's external lock is stable
@@ -2212,6 +2153,11 @@ globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLockState *state)
 	 * Check local deadlock.
 	 */
 	hold_all_lockline();
+	/*
+	 * Check of local wait-for-graph begging at the proc in the external lock.
+	 * Here, all the candidate wait-for-graph is stored in deadlock info backup
+	 * chain.
+	 */
 	*state = DeadLockCheck_int(pgproc_in_passed_external_lock);
 	release_all_lockline();
 
@@ -2219,19 +2165,9 @@ globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLockState *state)
 		/* Local state from this proc is "no deadlock" or "local deadlock". Nothing to do here. */
 		goto returning;
 
-	/* Okay some deadlock candidate information was found */
-	/* K.Suzuki: ここおかしい。GlobalDeadlockCheck_int() で、deadlock_info_bup_head のサーチは行われている
-	 *			 改修方法はいろいろあるが、ここではまず DS_HARD_DEADLOCK のみの処理を行って、GlobalDeadLockCheck_int()
-	 *			 では DS_HARD_DEADLOCK をスキップするようにすればいい。２箇所でループするのはあまりきれいではないが、
-	 *			 ローカルとグローバルを分ける意味では「アリ」と思う。
+	/*
+	 * Find if global deadlock is found in this database
 	 */
-#if 0
-	/* 更にこの先をチェックして returning wfg に追加する */
-	*state = GlobalDeadlockCheck_int(pgproc_in_passed_external_lock, global_wfg, &returned_wfg);
-	if (*state != DS_DEADLOCK_INFO)
-		goto returning;
-	returning_global_wfg = add_returned_wfg(returning_global_wfg, returned_wfg, true);
-#else
 	for (curr_bup = deadlock_info_bup_head; curr_bup; curr_bup = curr_bup->next)
 	{
 		LOCAL_WFG	*local_wfg;
@@ -2244,18 +2180,35 @@ globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLockState *state)
 		 */
 		if (curr_bup->state == DS_HARD_DEADLOCK)
 		{
-			/* 今のコンテクストを WfG に直して returning wfg に追加する */
 			*state = DS_DEADLOCK_INFO;
 			local_wfg = BuildLocalWfG(NULL, curr_bup);
-			global_wfg_here = AddToGlobalWfG(global_wfg, local_wfg);
-			returning_global_wfg = addGlobalWfgToReturnedWfg(returning_global_wfg, curr_bup->state, global_wfg_here);
+
+			if (check_local_wfg_is_stable(local_wfg))
+			{
+				/*
+				 * Add local wait-for-graph in this database to the global wait-for-graph to be returned to
+				 * upstream database.
+				 */
+				global_wfg_here = addToGlobalWfG(global_wfg, local_wfg);
+				returning_global_wfg = addGlobalWfgToReturnedWfg(returning_global_wfg, curr_bup->state, global_wfg_here);
+				goto returning;
+			}
+			else
+			{
+				pfree(local_wfg);
+				continue;
+			}
 		}
 	}
+	/*
+	 * No global deadlock is found in this database.
+	 *
+	 * Then continue further global wait-for-graph search to other downstream databae.
+	 */
 	*state = GlobalDeadlockCheck_int(pgproc_in_passed_external_lock, global_wfg, &returned_wfg);
 	if (*state != DS_DEADLOCK_INFO)
 		goto returning;
 	returning_global_wfg = add_returned_wfg(returning_global_wfg, returned_wfg, true);
-#endif
 returning:
 	if (returning_global_wfg)
 		*state = DS_DEADLOCK_INFO;
@@ -2263,22 +2216,22 @@ returning:
 }
 
 /*
- * K.Suzuki: 20200625
- *
- * 複数の WfG パスが返る可能性がある。これをサポートするように書き換える必要がある
- */
-/*
  * Function name
  *
  *	SQL function name: pg_global_deadlock_check_from_remote(IN wfg text, OUT record)
  *
+ *  This is called from global deadlock check worker function through libpq.
+ *
  *  Return value is set of tuple: (dead_lock_state int, wfg text)
+ *  It started to return more than one tuple but at present, this returns just one
+ *  tuple.
  */
 
 Datum
 pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
 {
 #define CHARLEN 16
+#define COLNUM	2
 	RETURNED_WFG	 	*returning_global_wfg;
 	DeadLockState		 state;
 
@@ -2289,7 +2242,7 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
 	AttInMetadata	*attinmeta;
 	HeapTupleData	 tupleData;
 	HeapTuple		 tuple = &tupleData;
-	char			*values[2];
+	char			*values[COLNUM];
 	char			 state_for_tuple[CHARLEN];
 	int				 ii;
 
@@ -2311,7 +2264,7 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
         funcctx->attinmeta = attinmeta;
 		global_wfg_text = PG_GETARG_CSTRING(0);
 
-		returning_global_wfg = globalDeadlockCheckFromRemote(global_wfg_text, &state);	/* K.Suzuki この関数を GDB でトレースすること */
+		returning_global_wfg = globalDeadlockCheckFromRemote(global_wfg_text, &state);	/* K.Suzuki Trace this function with GDB!! */
 
 		funcctx->user_fctx = returning_global_wfg;
 		funcctx->max_calls = returning_global_wfg ? returning_global_wfg->nReturnedWfg : 0;
@@ -2335,159 +2288,7 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
 	}
 	SRF_RETURN_DONE(funcctx);
 #undef CHARLEN
-}
-
-static DeadLockState
-read_returned_state(char *fname)
-{
-	FILE	*cmd_out;
-	char	 cc;
-	int		 state = DS_GLOBAL_ERROR;
-
-	cmd_out = AllocateFile(fname, "r");
-	while((cc = fgetc(cmd_out)) < '0' || cc > '9');
-	if (cc < 0)
-		return state;
-	state = cc - '0';
-	while((cc = fgetc(cmd_out)) >= '0' && cc <= '9')
-		state = state * 10 + cc - '0';
-	return (DeadLockState)state;
-}
-static DeadLockState
-GlobalDeadlockRecheckRemote(int	pos, char *global_wfg_text, ExternalLockInfo *downstream)
-{
-	StringInfoData	 cmd;
-	DeadLockState	 state;
-	char			*wfg_in_fname;
-	FILE			*wfg_in;
-	char			*cmd_out_fname;
-#ifdef GDD_DEBUG
-#else
-	int				 cmd_ret;
-#endif /* GDD_DEBUG */
-	char			*dsn_downstream;
-	ExternalLockInfo	*external_lock_info;
-	GLOBAL_WFG		*g_wfg;
-
-	g_wfg = DeserializeGlobalWfG(global_wfg_text);
-
-	external_lock_info = ((LOCAL_WFG *)g_wfg->local_wfg[pos])->external_lock;
-	dsn_downstream = external_lock_info->dsn;
-
-	wfg_in_fname = build_worker_file_name(true);
-	cmd_out_fname = build_worker_file_name(false);
-
-	initStringInfo(&cmd);
-	appendStringInfo(&cmd, "%s r %d %s %s %s", WORKER_NAME, pos,
-											   normalizeString(dsn_downstream),
-											   normalizeString(wfg_in_fname),
-											   normalizeString(cmd_out_fname));
-
-	wfg_in = AllocateFile(wfg_in_fname, "w");
-	fwrite(global_wfg_text, strlen(global_wfg_text), 1, wfg_in);
-	FreeFile(wfg_in);
-	/* Here, in the debug, the command should be invoked manually for debug */
-#ifdef GDD_DEBUG
-#else
-	cmd_ret = system(cmd.data);
-	if (!WIFEXITED(cmd_ret) || (WEXITSTATUS(cmd_ret) != 0))
-		elog(ERROR, "Global deadlock detection worker error.");
-#endif /* GDD_DEBUG */
-	unlink(wfg_in_fname);
-	state = read_returned_state(cmd_out_fname);
-	unlink(cmd_out_fname);
-	return state;
-}
-
-/*
- * Function
- *
- * SQL function name: pg_global_deadlock_recheck(IN text, OUT int)
- *
- * Return value is one integer: DeadlockState
- */
-
-
-Datum
-pg_global_deadlock_recheck_from_remote(PG_FUNCTION_ARGS)
-{
-	int64		 database_system_id;
-	char		*global_wfg_text;
-	int			 my_pos;
-	GLOBAL_WFG	*global_wfg;
-	LOCAL_WFG	*local_wfg_caller;
-	LOCAL_WFG	*local_wfg_here;
-	ExternalLockInfo	*caller_external_lock;
-	DeadLockState	state;
-	PGPROC		*target_proc_here;
-
-	
-	/*
-	 * Deserialize recived global Wfg.  The first local WfG contains WfG of the caller, including
-	 * external lock pointint this.   The second local WfG is for this.   If it contains external
-	 * lock, we need to check further nodes.   If not, this must be the final point of the deadlock
-	 * so we must have the same deadlock information.
-	 */
-
-	my_pos = PG_GETARG_INT32(0);
-	global_wfg_text = PG_GETARG_CSTRING(1);
-	global_wfg = DeserializeGlobalWfG(global_wfg_text);
-	if (global_wfg == NULL)
-	{
-		state = DS_GLOBAL_ERROR;
-		elog(WARNING, "The input parameter does not contain valid wait-for-graph data.");
-		goto returning;
-	}
-	database_system_id = get_database_system_id();
-
-	/*
-	 * Setup local_wfg for upstream and current database.
-	 * Also setup if this is the final node to recheck.
-	 *
-	 * Please note that nLocalWfg == 2 happens only when two databases are involved in
-	 * candidate global WfG.   In this case, caller is the origin.
-	 */
-	Assert(global_wfg->nLocalWfg >= 2);
-	Assert(my_pos <= global_wfg->nLocalWfg);
-
-	local_wfg_caller = global_wfg->local_wfg[my_pos - 1];
-	local_wfg_here = global_wfg->local_wfg[my_pos];
-
-	caller_external_lock = local_wfg_caller->external_lock;
-
-	/* Check if caller links here and it's stable */
-	Lock_PgprocArray();
-	target_proc_here = find_pgproc_pgprocno(caller_external_lock->target_pgprocno);
-	Unlock_PgprocArray();
-	state = DS_NO_DEADLOCK;
-	if (target_proc_here == NULL ||
-		target_proc_here->pid != caller_external_lock->target_pid ||
-		target_proc_here->lxid != caller_external_lock->target_txn)
-	{
-		/* The target backend from upstream databae is not stable */
-		goto returning;
-	}
-	if (database_system_id != local_wfg_here->database_system_identifier)
-		/* Database system ID of the current database in upstream external is not correct */
-		goto returning;
-
-	/* Check if this database's wfg is stable */
-	if(!check_local_wfg_is_stable(local_wfg_here))
-		/* Wait-for-graph local to this database is not stable */
-		goto returning;
-
-	if (my_pos + 1 >= global_wfg->nLocalWfg)
-		/* This database is the final database in global wait-for-graph */
-		goto returning;
-
-	/* Recheck remote */
-	state = GlobalDeadlockRecheckRemote(my_pos + 1, global_wfg_text, local_wfg_here->external_lock);
-
-returning:
-	if (global_wfg_text)
-		pfree(global_wfg_text);
-	free_global_wfg(global_wfg);
-	PG_RETURN_INT32(state);
+#undef COLNUM
 }
 
 /*
@@ -2495,10 +2296,15 @@ returning:
  *
  * SQL function name: pg_global_deadlock_check_describe_backend(IN int, OUT record)
  *
+ * Input parameter is pid of the downstream database transaction backend.
+ * Output tuple is (pid int, pgprocno int, lxid int)
+ *
+ * Application using global deadlock detection can issue this function
+ * K.Suzuki: lxid が符号つきになってしまっている。これを符号なし、あるいは numeric にする必要がある。
+ * NUMERICOID を型に使えばいいか。-> 後で検討すること。
+ *
  * Return value is one integer: DeadlockState
  */
-
-
 Datum
 pg_global_deadlock_check_describe_backend(PG_FUNCTION_ARGS)
 {
@@ -2519,7 +2325,7 @@ pg_global_deadlock_check_describe_backend(PG_FUNCTION_ARGS)
 	Datum			 result;
 
 	pid = PG_GETARG_INT32(0);
-	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	Lock_PgprocArray();
 	if (pid < 0)
 		proc = MyProc;
 	else
@@ -2527,13 +2333,13 @@ pg_global_deadlock_check_describe_backend(PG_FUNCTION_ARGS)
 		proc = find_pgproc(pid);
 		if (proc == NULL)
 		{
-			LWLockRelease(ProcArrayLock);
+			Unlock_PgprocArray();
 			elog(ERROR, "Specified pid %d is not in backend.", pid);
 		}
 	}
 	pgprocno = proc->pgprocno;
 	lxid = proc->lxid;
-	LWLockRelease(ProcArrayLock);
+	Unlock_PgprocArray();
 
 	for (ii = 0; ii < NCOLUMN; ii++)
 		values[ii] = &Values[ii][0];
@@ -2541,11 +2347,11 @@ pg_global_deadlock_check_describe_backend(PG_FUNCTION_ARGS)
 	ii = 1;
 	TupleDescInitEntry(tupd, ii++, "pid", INT4OID, -1, 0);
 	TupleDescInitEntry(tupd, ii++, "pgprocno", INT4OID, -1, 0);
-	TupleDescInitEntry(tupd, ii++, "lxid", INT4OID, -1, 0);
+	TupleDescInitEntry(tupd, ii++, "lxid", NUMERICOID, -1, 0);
 	ii = 0;
 	snprintf(values[ii++], CHARLEN, "%d", pid);
 	snprintf(values[ii++], CHARLEN, "%d", pgprocno);
-	snprintf(values[ii++], CHARLEN, "%d", lxid);
+	snprintf(values[ii++], CHARLEN, "%u", lxid);
 	tuple =  BuildTupleFromCStrings(TupleDescGetAttInMetadata(tupd), values);
 	result = TupleGetDatum(TupleDescGetSlot(tupd), tuple);
 
@@ -2555,6 +2361,63 @@ pg_global_deadlock_check_describe_backend(PG_FUNCTION_ARGS)
 #undef CHARLEN
 }
 	
+/*
+ * This check if external lock found in local database wait-for-graph is
+ * already in the global wait-for-graph.
+ *
+ * This works when DeadlockCheckMode is DLCMODE_GLOBAL_AGAIN or DLCMODE_GLOBAL_ORIGIN.
+ * In these modes, we should not check wait-for-graph beyond already-checked
+ * external lock.
+ */
+static bool
+external_lock_already_in_gwfg(GLOBAL_WFG *global_wfg, DEADLOCK_INFO_BUP *dl_info_bup)
+{
+	int			ii;
+	uint64		my_system_identifier;
+
+	if (global_wfg == NULL)
+		return false;
+
+	my_system_identifier = get_database_system_id();
+
+	if (dl_info_bup->state != DS_EXTERNAL_LOCK)
+		return false;
+	for (ii = 0; ii < global_wfg->nLocalWfg; ii++)
+	{
+		LOCAL_WFG			*local_wfg;
+		ExternalLockInfo	*external_lock;
+		DEADLOCK_INFO		*dl_info;
+		LOCKTAG				*dl_locktag;
+
+		local_wfg = (LOCAL_WFG *)(global_wfg->local_wfg[ii]);
+		if (local_wfg->database_system_identifier != my_system_identifier)
+			continue;
+		if (!(((LOCAL_WFG *)(global_wfg->local_wfg[ii]))->local_wfg_flag & WfG_HAS_EXTERNAL_LOCK))
+			continue;
+		external_lock = local_wfg->external_lock;
+		dl_info = &dl_info_bup->deadlock_info[dl_info_bup->nDeadlock_info - 1];
+		dl_locktag = &dl_info->locktag;
+		/* Check locktag against external lock in local wfg */
+		if (dl_locktag->locktag_field1 != external_lock->pgprocno)
+			continue;
+		if (dl_locktag->locktag_field2 != external_lock->pid)
+			continue;
+		if (dl_locktag->locktag_field3 != external_lock->txnid)
+			continue;
+		if (dl_locktag->locktag_field4 != external_lock->serno)
+			continue;
+		if (dl_locktag->locktag_type != LOCKTAG_EXTERNAL)
+			continue;
+		if (dl_locktag->locktag_lockmethodid != DEFAULT_LOCKMETHOD)
+			continue;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Acquire all the LWLocks for LOCK
+ */
 static void
 hold_all_lockline(void)
 {
@@ -2564,6 +2427,9 @@ hold_all_lockline(void)
 		LWLockAcquire(LockHashPartitionLockByIndex(ii), LW_EXCLUSIVE);
 }
 
+/*
+ * Release all the LWLocks for LOCK
+ */
 static void
 release_all_lockline(void)
 {
@@ -2573,23 +2439,6 @@ release_all_lockline(void)
 		LWLockRelease(LockHashPartitionLockByIndex(ii));
 }
 
-#if 0
-/*
- * Compare if the two external lock information is the same.
- *
- * Check entries except for dsn.
- */
-static bool
-external_lock_is_same(ExternalLockInfo *one, ExternalLockInfo *two)
-{
-	if (one->pid != two->pid || one->pgprocno != two->pgprocno ||
-		one->txnid != two->txnid || one->serno != two->serno ||
-		one->target_pid != two->target_pid || one->target_pgprocno != two->target_pgprocno ||
-		one->target_txn != two->target_txn)
-		return false;
-	return true;
-}
-#endif
 
 DEADLOCK_INFO *
 GetDeadLockInfo(int32 *nInfo)
@@ -2616,6 +2465,11 @@ find_pgproc(int pid)
     return NULL;
 }
 
+/*
+ * Caller does not have to acquire LWLock for ProcArrayLock.
+ * To refer to the value of PGPROC found, the caller should acquire appropriate
+ * LWLock for ProcArrayLock.
+ */
 static PGPROC *
 find_pgproc_pgprocno(int pgprocno)
 {
@@ -2625,6 +2479,7 @@ find_pgproc_pgprocno(int pgprocno)
 		elog(ERROR, "Pgprocno is out of bounds. Max should be %d.", ProcGlobal->allProcCount);
 	return &ProcGlobal->allProcs[pgprocno];
 }
+
 /*
  * Deadlock Info Backup code: For one scan, there could be more than one possible WfG path going
  * remote.
@@ -2696,7 +2551,7 @@ check_local_wfg_is_stable(LOCAL_WFG *localWfG)
 
 	info = localWfG->deadlock_info;
 	nDeadlockInfo = localWfG->nDeadlockInfo;
-	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	Lock_PgprocArray();
 
 	for (ii = 0; ii < nDeadlockInfo; ii++)
 	{
@@ -2712,11 +2567,11 @@ check_local_wfg_is_stable(LOCAL_WFG *localWfG)
 		if (proc->lxid != info[ii].txid)
 			goto instable;
 	}
-	LWLockRelease(ProcArrayLock);
+	Unlock_PgprocArray();
 	return true;
 
 instable:
-	LWLockRelease(ProcArrayLock);
+	Unlock_PgprocArray();
 	return false;
 }
 
@@ -2727,7 +2582,7 @@ instable:
  * shallow copy だと、呼び出し側が元の記憶域を再利用すると困ったことになる。
  * あるいは、shallow copy しても大丈夫なように呼び出し側を工夫する必要がある。
  */
-/* returned wfg に新たな returned wfg を追加する */
+/* Add new returne_wfg member to specified returned_wfg */
 static RETURNED_WFG *
 add_returned_wfg(RETURNED_WFG *dest, RETURNED_WFG *src, bool clean_opt)
 {
@@ -2744,7 +2599,7 @@ add_returned_wfg(RETURNED_WFG *dest, RETURNED_WFG *src, bool clean_opt)
 	return rv;
 }
 
-/* Reterned wfg に 新たな global wfg を追加する */
+/* Add new global wfg to specified returned wfg */
 static RETURNED_WFG *
 addGlobalWfgToReturnedWfg(RETURNED_WFG *returned_wfg, DeadLockState state, GLOBAL_WFG *global_wfg)
 {
@@ -2762,12 +2617,17 @@ addGlobalWfgToReturnedWfg(RETURNED_WFG *returned_wfg, DeadLockState state, GLOBA
 }
 
 
-/* global wfg から自ノードの local wfg を抽出してこの中のproc を visited proc に追加する */
 /*
  * K.Suzuki 20200626:
  * これは visited proc を追加するのではなく、external lockのlocktag と externla locktag info を追加すべきである
  */
 
+/*
+ * Determine the mode of global deadlock check and extract self node's local wait-for-graph and add backend informaton
+ * to visited proc.
+ *
+ * This mode affects the behavior of DeadLockCheck().
+ */
 static DeadlockCheckMode
 globalDeadlockCheckMode(GLOBAL_WFG *global_wfg)
 {
@@ -2788,9 +2648,7 @@ globalDeadlockCheckMode(GLOBAL_WFG *global_wfg)
 
 	if (global_wfg == NULL)
 		return DLCMODE_LOCAL;
-	if (global_wfg->nLocalWfg <= 0 ||
-		global_wfg->is_text[0] == true ||
-		global_wfg->is_text[global_wfg->nLocalWfg - 1] == true)
+	if (global_wfg->nLocalWfg <= 0 )
 	{
 		elog(WARNING, "The first or last local wait-for-graph was not compatible and could not deserialize.");
 		return DLCMODE_ERROR;
@@ -2800,8 +2658,6 @@ globalDeadlockCheckMode(GLOBAL_WFG *global_wfg)
 	{
 		LOCAL_WFG *local_wfg;
 
-		if (global_wfg->is_text[ii] == true)
-			continue;
 		local_wfg = (LOCAL_WFG *)global_wfg->local_wfg[ii];
 		if (local_wfg->database_system_identifier != my_database_system_id)
 			continue;
@@ -2822,7 +2678,7 @@ globalDeadlockCheckMode(GLOBAL_WFG *global_wfg)
 			PGPROC	*proc_wk;
 
 			info = &local_wfg->deadlock_info[0];
-			proc_wk = find_pgproc_pgprocno(info->pgprocno);	/* K.Suzuki どうもここでおかしくなっている。ここ調べる必要がある */
+			proc_wk = find_pgproc_pgprocno(info->pgprocno);
 			if (proc_wk == NULL || proc_wk->pid != info->pid || proc_wk->lxid != info->txid)
 				continue;
 
@@ -2885,13 +2741,7 @@ free_global_wfg(GLOBAL_WFG *global_wfg)
 	if (!global_wfg)
 		return;
 	for (ii = 0; ii < global_wfg->nLocalWfg; ii++)
-	{
-		if (global_wfg->is_text[ii])
-			pfree(global_wfg->local_wfg[ii]);
-		else
-			free_local_wfg((LOCAL_WFG *)global_wfg->local_wfg[ii]);
-	}
-	pfree(global_wfg->is_text);
+		free_local_wfg(global_wfg->local_wfg[ii]);
 	pfree(global_wfg->local_wfg);
 	pfree(global_wfg);
 }
@@ -3006,64 +2856,30 @@ copy_global_wfg(GLOBAL_WFG *g_wfg)
 
 	copied = (GLOBAL_WFG *)palloc(sizeof(GLOBAL_WFG));
 
-	copied->global_wfg_magic = g_wfg->global_wfg_magic;
 	copied->nLocalWfg = g_wfg->nLocalWfg;
-	copied->is_text = (bool *)palloc(sizeof(bool) * g_wfg->nLocalWfg);
-	memcpy(copied->is_text, g_wfg->is_text, sizeof(bool) * g_wfg->nLocalWfg);
-	copied->local_wfg = (void **)palloc(sizeof(void *) * g_wfg->nLocalWfg);
-	copied->txtsize = (int32 *)palloc(sizeof(int32) * g_wfg->nLocalWfg);
+	copied->local_wfg = (LOCAL_WFG **)palloc(sizeof(LOCAL_WFG *) * g_wfg->nLocalWfg);
 	for (ii = 0; ii < g_wfg->nLocalWfg; ii++)
-	{
-		if (copied->is_text[ii] == true)
-		{
-			copied->local_wfg[ii] = pstrdup((char *)(g_wfg->local_wfg[ii]));
-			copied->txtsize[ii] = strlen((char *)(g_wfg->local_wfg[ii]));
-		}
-		else
-		{
-			copied->local_wfg[ii] = copy_local_wfg((LOCAL_WFG *)(g_wfg->local_wfg[ii]));
-			copied->txtsize[ii] = -1;
-		}
-	}
+		copied->local_wfg[ii] = copy_local_wfg((g_wfg->local_wfg[ii]));
 	return copied;
 }
 
 #ifdef GDD_DEBUG
 static void
-prepare_debug_file(void)
-{
-	char	fname[1024];
-
-	if (gdd_out)
-		return;
-	snprintf(fname, 1023, "%s/pg_external_locks/DEBUG_%d_%03d.out", DataDir, MyProc->pid, gdd_debug_sno++);
-	gdd_out = fopen(fname, "w");
-	return;
-}
-
-static void
-print_global_wfg(GLOBAL_WFG *g_wfg, FILE *f)
+print_global_wfg(StringInfo out, GLOBAL_WFG *g_wfg)
 {
 	int 	 ii;
 	int		 arraymax;
 
-	if (!f)
+	appendStringInfo(out, "\n**** STARTING GLOBAL_WFG %016lx ***************************", (uint64)g_wfg);
+	if (g_wfg == NULL)
 	{
-		prepare_debug_file();
-		f = gdd_out;
-	}
-	fprintf(f, "**** STARTING GLOBAL_WFG %016lx ***************************\n", (uint64)g_wfg);
-	if (!g_wfg)
-	{
-		fprintf(f, "No global wait-for-graph.\n");
-		fflush(f);
+		appendStringInfo(out, "\nNo global wait-for-graph.");
 		return;
 	}
-	fprintf(f, "global_wfg_magic: %08x\n", g_wfg->global_wfg_magic);
-	fprintf(f, "nLocalWfg: %d\n", g_wfg->nLocalWfg);
+	appendStringInfo(out, "\nnLocalWfg: %d", g_wfg->nLocalWfg);
 	if (g_wfg->nLocalWfg > GDD_ARRAY_MAX)
 	{
-		fprintf(f, "** nLocalWfg: %d exceeds max value for debug. Printing only first %d **\n",
+		appendStringInfo(out, "\n** nLocalWfg: %d exceeds max value for debug. Printing only first %d **",
 				g_wfg->nLocalWfg, GDD_ARRAY_MAX);
 		arraymax = GDD_ARRAY_MAX;
 	}
@@ -3071,62 +2887,28 @@ print_global_wfg(GLOBAL_WFG *g_wfg, FILE *f)
 		arraymax = g_wfg->nLocalWfg;
 	for (ii = 0; ii < arraymax; ii++)
 	{
-		fprintf(f, "local_wfg[%d] **********\n", ii);
-		print_local_wfg((LOCAL_WFG *)g_wfg->local_wfg[ii], ii, g_wfg->nLocalWfg, f);
+		appendStringInfo(out, "\nlocal_wfg[%d] **********", ii);
+		print_local_wfg(out, g_wfg->local_wfg[ii], ii, g_wfg->nLocalWfg);
 	}
-	fprintf(f, "global_wfg_trailor: %d\n", g_wfg->global_wfg_trailor);
-	fprintf(f, "**** END OF GLOBAL_WFG %016lx ***********************\n", (uint64)g_wfg);
-	fflush(f);
+	appendStringInfo(out, "**** END OF GLOBAL_WFG %016lx ***********************\n", (uint64)g_wfg);
 }
 
-#if 0
-483 typedef struct ExternalLockInfo
-484 {
-	485     int         pid;
-	486     int         pgprocno;
-	487     LocalTransactionId  txnid;
-	488     int         serno;
-	489     char       *dsn;
-	490     int         target_pid;
-	491     int         target_pgprocno;
-	492     LocalTransactionId  target_txn;
-	493 } ExternalLockInfo;
-557 typedef struct LOCAL_WFG
-558 {
-	559     int32                local_wfg_magic;       /* Not needed but provide a workspace to check */
-	560     int32                local_wfg_flag;
-	561     int64                database_system_identifier;
-	562     int32                visitedProcPid;        /* PID of visitedProc[0], exist only in the origin node */
-	563     int32                visitedProcPgprocno;   /* pgprocno of visitedProc[0], exist only in the origin node */
-	564     int32                visitedProcLxid;       /* lxid of visitedProc[0], exist only in the origin node */
-	565     int32                nDeadlockInfo;
-	566     DEADLOCK_INFO       *deadlock_info;
-	567     ExternalLockInfo    *external_lock;
-	568     int32                local_wfg_trailor;     /* Not needed but provide a workspace to check */
-	569 } LOCAL_WFG;
-
-#endif
 static void
-print_local_wfg(LOCAL_WFG *l_wfg, int idx, int total, FILE *f)
+print_local_wfg(StringInfo out, LOCAL_WFG *l_wfg, int idx, int total)
 {
 	int ii;
 	int	arraymax;
 
-	if (!f)
-	{
-		prepare_debug_file();
-		f = gdd_out;
-	}
-	fprintf(f, "**** STARTING LOCAL_WFG %016lx idx: %d/%d ******************\n",
+	appendStringInfo(out, "\n**** STARTING LOCAL_WFG %016lx idx: %d/%d ******************",
 			   (uint64)l_wfg, idx, total);
-	fprintf(f, "magic: 0x%08x, flag: 0x%08x, database_syste_identifier: 0x%016lx\n",
-			   l_wfg->local_wfg_magic, l_wfg->local_wfg_flag, l_wfg->database_system_identifier);
-	fprintf(f, "visitedProcPid: %d, visitedProcPgorocni: %d, visitedProcLxid: %u\n",
+	appendStringInfo(out, "\nmagic: 0x%08x, flag: 0x%08x, database_syste_identifier: 0x%016lx",
+			   WfG_LOCAL_MAGIC, l_wfg->local_wfg_flag, l_wfg->database_system_identifier);
+	appendStringInfo(out, "\nvisitedProcPid: %d, visitedProcPgorocni: %d, visitedProcLxid: %u",
 			   l_wfg->visitedProcPid, l_wfg->visitedProcPgprocno, l_wfg->visitedProcLxid);
-	fprintf(f, "nDeadlockInfo: %d\n", l_wfg->nDeadlockInfo);
+	appendStringInfo(out, "\nnDeadlockInfo: %d", l_wfg->nDeadlockInfo);
 	if (l_wfg->nDeadlockInfo > GDD_ARRAY_MAX)
 	{
-		fprintf(f, "** nDeadlockInfo: %d exceeds max value for debug. Printing only first %d **\n",
+		appendStringInfo(out, "\n** nDeadlockInfo: %d exceeds max value for debug. Printing only first %d **",
 				   l_wfg->nDeadlockInfo, GDD_ARRAY_MAX);
 		arraymax = GDD_ARRAY_MAX;
 	}
@@ -3134,56 +2916,43 @@ print_local_wfg(LOCAL_WFG *l_wfg, int idx, int total, FILE *f)
 		arraymax = l_wfg->nDeadlockInfo;
 
 	for (ii = 0; ii < arraymax; ii++)
-		print_deadlock_info(&(l_wfg->deadlock_info[ii]), ii, l_wfg->nDeadlockInfo, f);
+		print_deadlock_info(out, &(l_wfg->deadlock_info[ii]), ii, l_wfg->nDeadlockInfo);
 	if (l_wfg->local_wfg_flag & WfG_HAS_EXTERNAL_LOCK)
-		print_external_lock_info(l_wfg->external_lock, f);
+		print_external_lock_info(out, l_wfg->external_lock);
 	else
-		fprintf(f, "====== EXTERNAL_LOCK: NULL: Not set ========\n");
-	fprintf(f, "**** END OF LOCAL_WFG %016lx idx: %d ******************\n", (uint64)l_wfg, idx);
-	fflush(f);
+		appendStringInfo(out, "\n====== EXTERNAL_LOCK: NULL: Not set ========");
+	appendStringInfo(out, "\n**** END OF LOCAL_WFG %016lx idx: %d ******************", (uint64)l_wfg, idx);
 }
 
 static void
-print_external_lock_info(ExternalLockInfo *e, FILE *f)
+print_external_lock_info(StringInfo out, ExternalLockInfo *e)
 {
-	if (!f)
-	{
-		prepare_debug_file();
-		f = gdd_out;
-	}
-	fprintf(f, "====== EXTERNAL_LOCK: %016ld: Not set ========\n", (uint64)e);
-	fprintf(f, "pid: %d, pgprocno: %d, txnid: %u, serno: %d,\n", e->pid, e->pgprocno, e->txnid, e->serno);
-	fprintf(f, "dsn: '%s'\n", e->dsn);
-	fprintf(f, "target_pid: %d, target_pgprocno: %d, target_txn: %u\n", e->target_pid, e->target_pgprocno, e->target_txn);
-	fflush(f);
+	appendStringInfo(out, "====== EXTERNAL_LOCK: %016ld: Not set ========\n", (uint64)e);
+	appendStringInfo(out, "pid: %d, pgprocno: %d, txnid: %u, serno: %d,\n", e->pid, e->pgprocno, e->txnid, e->serno);
+	appendStringInfo(out, "dsn: '%s'\n", e->dsn);
+	appendStringInfo(out, "target_pid: %d, target_pgprocno: %d, target_txn: %u\n", e->target_pid, e->target_pgprocno, e->target_txn);
 }
 
 
 static void
-print_deadlock_info(DEADLOCK_INFO *info, int idx, int total, FILE *f)
+print_deadlock_info(StringInfo out, DEADLOCK_INFO *info, int idx, int total)
 {
-	if (!f)
-	{
-		prepare_debug_file();
-		f = gdd_out;
-	}
-	fprintf(f, "---- STARTING DEADLOCK_INFO %016lx idx: %d/%d ------------------\n",
-			   (uint64)info, idx, total);
-	fprintf(f, "LOCKTAG: field1: %d, field2: %d, field3: %d, field4: %d, type: %d (%s), methodid: %d\n",
-			   info->locktag.locktag_field1,
-			   info->locktag.locktag_field2,
-			   info->locktag.locktag_field3,
-			   info->locktag.locktag_field4,
-			   info->locktag.locktag_type,
-			   locktagTypeName(info->locktag.locktag_type),
-			   info->locktag.locktag_lockmethodid);
-	fprintf(f, "lockmode: %d (%s), pid: %d, pgprocno: %d, txid: %d\n",
-			   info->lockmode,
-			   GetLockmodeName(info->locktag.locktag_lockmethodid, info->lockmode),
-			   info->pid,
-			   info->pgprocno,
-			   info->txid);
-	fflush(f);
+	appendStringInfo(out, "---- STARTING DEADLOCK_INFO %016lx idx: %d/%d ------------------\n",
+			   		 (uint64)info, idx, total);
+	appendStringInfo(out, "LOCKTAG: field1: %d, field2: %d, field3: %d, field4: %d, type: %d (%s), methodid: %d\n",
+			   		 info->locktag.locktag_field1,
+			   		 info->locktag.locktag_field2,
+			   		 info->locktag.locktag_field3,
+			   		 info->locktag.locktag_field4,
+			   		 info->locktag.locktag_type,
+			   		 locktagTypeName(info->locktag.locktag_type),
+			   		 info->locktag.locktag_lockmethodid);
+	appendStringInfo(out, "lockmode: %d (%s), pid: %d, pgprocno: %d, txid: %d\n",
+			   		 info->lockmode,
+			   		 GetLockmodeName(info->locktag.locktag_lockmethodid, info->lockmode),
+			   		 info->pid,
+			   		 info->pgprocno,
+			   		 info->txid);
 }
 #endif /* GDD_DEBUG */
 
@@ -3544,14 +3313,15 @@ DeserializeLocalWfG(char *buf, LOCAL_WFG **local_wfg)
 {
 	LOCAL_WFG	*l_wfg = (LOCAL_WFG *)palloc0(sizeof(LOCAL_WFG));
 	int			 ii;
+	int32		 magic;
 
 	*local_wfg = NULL;
 	FindChar(buf, '(');
-	GetHexaToInt(buf, &l_wfg->local_wfg_magic);				/* Magic */
-	if (l_wfg->local_wfg_magic != WfG_LOCAL_MAGIC)
+	GetHexaToInt(buf, &magic);				/* Magic */
+	if (magic != WfG_LOCAL_MAGIC)
 		elog(ERROR, "Invalid Magic Number in serialized local wait-for-graph.");
 	GetHexaToLong(buf, &l_wfg->database_system_identifier);	/* System ID */
-	GetHexaToInt(buf, &l_wfg->local_wfg_flag);				/* Magic */
+	GetHexaToInt(buf, &l_wfg->local_wfg_flag);				/* Flag */
 	if (l_wfg->local_wfg_flag & WfG_HAS_VISITED_PROC)
 	{
 		/* Visited Proc Info */
@@ -3620,7 +3390,7 @@ SerializeGlobalWfG(GLOBAL_WFG *g_wfg)
 
 	/* Start, open paren */
 	appendStringInfoString(&s, "( ");
-	appendStringInfo(&s, "%08x ", g_wfg->global_wfg_magic);
+	appendStringInfo(&s, "%08x ", WfG_GLOBAL_MAGIC);
 
 	/* Local WfG */
 	appendStringInfo(&s, "( %d ", g_wfg->nLocalWfg);
@@ -3650,19 +3420,18 @@ DeserializeGlobalWfG(char *buf)
 {
 	GLOBAL_WFG	*g_wfg;
 	int			 ii;
+	int32		 magic;
 
 	g_wfg = (GLOBAL_WFG *)palloc(sizeof(GLOBAL_WFG));
 	FindChar(buf, '(');
-	GetHexaToInt(buf, &g_wfg->global_wfg_magic);
-	if (g_wfg->global_wfg_magic != WfG_GLOBAL_MAGIC)
+	GetHexaToInt(buf, &magic);
+	if (magic != WfG_GLOBAL_MAGIC)
 		elog(ERROR, "Invalid MAGIC in global wait-for-graph.");
 	FindChar(buf, '(');
 	GetAtoInt32(buf, &g_wfg->nLocalWfg);
 	if (g_wfg->nLocalWfg <= 0)
 		elog(ERROR, "Negative local wait-for-graph in the global wait-for-graph.");
-	g_wfg->is_text = (bool *)palloc(sizeof(bool) * g_wfg->nLocalWfg);
-	g_wfg->txtsize = (int32 *)palloc0(sizeof(int32) * g_wfg->nLocalWfg);
-	g_wfg->local_wfg = (void **)palloc(sizeof(LOCAL_WFG *) * g_wfg->nLocalWfg);
+	g_wfg->local_wfg = (LOCAL_WFG **)palloc(sizeof(LOCAL_WFG *) * g_wfg->nLocalWfg);
 	
 	for (ii = 0; ii < g_wfg->nLocalWfg; ii++)
 	{
@@ -3670,7 +3439,6 @@ DeserializeGlobalWfG(char *buf)
 		buf = DeserializeLocalWfG(buf, &l_wfg);
 		if (buf == NULL)
 			elog(ERROR, "Inconsistent serialized global wait-for-graph.");
-		g_wfg->is_text[ii] = false;
 		g_wfg->local_wfg[ii] = l_wfg;
 	}
 	FindChar(buf, ')');

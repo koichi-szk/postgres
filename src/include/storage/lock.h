@@ -525,18 +525,12 @@ typedef enum
  * Note: because we want to examine this info after releasing the lock
  * manager's partition locks, we can't just store LOCK and PGPROC pointers;
  * we must extract out all the info we want to be able to print.
- *
- * K.Suzuki: この構造体の中に Global に使う wait-for-graph を入れておくといいかも。
- *           EDBE は作業用で、こちらは完成した DeadlockCycle になっているから。
- *           必要な情報を追加しておく。
- *           実際には、これは static な deadlockDetails 配列上ですべて操作
- *           されるので、ここに必要なコードを追加すれば global 用の WfG が
- *           作れる。
  */
 
 #define WfG_HAS_EXTERNAL_LOCK	0x00000001
 #define WfG_HAS_VISITED_PROC	0x00000002
 
+/* Used in serialized global/local wait-for-graph */
 #define WfG_GLOBAL_MAGIC		0x80800001
 #define WfG_LOCAL_MAGIC			0x80880001
 
@@ -556,7 +550,6 @@ typedef struct DEADLOCK_INFO
 
 typedef struct LOCAL_WFG
 {
-	int32			 	 local_wfg_magic;		/* Not needed but provide a workspace to check */
 	int32			 	 local_wfg_flag;
 	int64			 	 database_system_identifier;
 	int32				 visitedProcPid;		/* PID of visitedProc[0], exist only in the origin node */
@@ -565,25 +558,16 @@ typedef struct LOCAL_WFG
 	int32			 	 nDeadlockInfo;
 	DEADLOCK_INFO		*deadlock_info;
 	ExternalLockInfo	*external_lock;
-	int32				 local_wfg_trailor;		/* Not needed but provide a workspace to check */
 } LOCAL_WFG;
 
 /*
- * is_text[i], txtsize[i] and local_wfg[i] represents local WfG for i-th node.
- * if is_text is true, local_wfg[i] is binary stream representation of WfG, which is used
- * if version of local WfG is different from current one.  Otherwise, this is LOCAL_WFG *
+ * local_wfg[0] represents the local wait-for-graph for origine database.  local_wfg[1] represents
+ * the next downstream database.
  */
 typedef struct GLOBAL_WFG
 {
-	int32	  global_wfg_magic;
-	int32	  nLocalWfg;
-	bool	 *is_text;			/* For future extension.  At present, always false */
-	int32	 *txtsize;			/* For future extension.  At present, fixed to zero */
-	void	**local_wfg;		/* if (is_tex) then this is char *, otherwise LOCAL_WFG
-								 * For furuture extension to support different archtiecture
-								 * target
-								 */
-	int32	  global_wfg_trailor;
+	int32	  	  nLocalWfg;	/* Number of local wait-for-graph in this global wait-for-graph */
+	LOCAL_WFG	**local_wfg;	/* Local wait-for-graph for each database.  Local_wfg[0] represents origin */
 } GLOBAL_WFG;
 
 /*
