@@ -2077,7 +2077,7 @@ GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, RETURNED
 #endif	/* GDD_DEBUG */
 	pfree(cmd.data);
 	unlink(wfg_in_fname);
-	*returning_wfg = read_returned_wfg(cmd_out_fname);
+	*returning_wfg = read_returned_wfg(cmd_out_fname);	/* K.Suzuki ここ、トレースすること */
 	unlink(cmd_out_fname);
 	return (*returning_wfg)->nReturnedWfg;
 }
@@ -2586,17 +2586,28 @@ instable:
 static RETURNED_WFG *
 add_returned_wfg(RETURNED_WFG *dest, RETURNED_WFG *src, bool clean_opt)
 {
-	RETURNED_WFG *rv;
-	int			  ii;
+	int		ii, jj;
+	int		old_num;
+	int		new_num;
 
-	rv = (dest == NULL) ? palloc0(sizeof(RETURNED_WFG)) : dest;
-	rv->global_wfg_in_text = gdd_repalloc(rv->global_wfg_in_text, sizeof(char *) * (rv->nReturnedWfg + src->nReturnedWfg));
-	for (ii = 0; ii < src->nReturnedWfg; ii++)
-		rv->global_wfg_in_text[dest->nReturnedWfg + ii] = src->global_wfg_in_text[ii];
-	rv->nReturnedWfg += src->nReturnedWfg;
+	if ((src == NULL) || (src->nReturnedWfg == 0))
+		return dest;
+	if (dest == NULL)
+		dest = palloc0(sizeof(RETURNED_WFG));
+	old_num = dest->nReturnedWfg;
+	new_num = old_num + src->nReturnedWfg;
+
+	dest->state = (DeadLockState *)gdd_repalloc(dest->state, sizeof(DeadLockState) * new_num);
+	dest->global_wfg_in_text = (char **)gdd_repalloc(dest->global_wfg_in_text, sizeof(char *) * new_num);
+	for (ii = old_num, jj = 0; ii < new_num; ii++, jj++)
+	{
+		dest->state[ii] = src->state[jj];
+		dest->global_wfg_in_text[ii] = pstrdup(src->global_wfg_in_text[jj]);
+	}
+	dest->nReturnedWfg = new_num;
 	if (clean_opt)
-		pfree(src);
-	return rv;
+		free_returned_wfg(src);
+	return dest;
 }
 
 /* Add new global wfg to specified returned wfg */
@@ -2705,19 +2716,6 @@ globalDeadlockCheckMode(GLOBAL_WFG *global_wfg)
 }
 
 static void
-free_returned_wfg(RETURNED_WFG *returned_wfg)
-{
-	if (!returned_wfg)
-		return;
-	if (returned_wfg->state)
-		pfree(returned_wfg->state);
-	if (returned_wfg->global_wfg_in_text)
-		pfree(returned_wfg->global_wfg_in_text);
-	pfree(returned_wfg);
-	return;
-}
-
-static void
 free_local_wfg(LOCAL_WFG *local_wfg)
 {
 	if (!local_wfg)
@@ -2761,73 +2759,99 @@ build_worker_file_name(bool input_to_command)
 static RETURNED_WFG *
 read_returned_wfg(char *fname)
 {
+#define CHECK_EOF(c) do{if ((c) < 0) goto eof_exit;}while(0)
+
 	FILE	*wfg_out;
-	char	 c;
+	int		 c;
 	int		 ii;
-	RETURNED_WFG *returning_wfg;
+	RETURNED_WFG *returning_wfg = NULL;
 
 	wfg_out = AllocateFile(fname, "r");
-	while ((c = fgetc(wfg_out)) < '0' && c > '9')
-	{
-		if (c < 0)
-			return NULL;
-	}
+	while ((c = fgetc(wfg_out)) < '0' || c > '9')
+		CHECK_EOF(c);
+	ungetc(c, wfg_out);
 	returning_wfg = (RETURNED_WFG *)palloc(sizeof(RETURNED_WFG));
-	returning_wfg->nReturnedWfg = c - '0';
+	returning_wfg->nReturnedWfg = 0;
 	while ((c = fgetc(wfg_out)) >= '0' && c <= '9')
 		returning_wfg->nReturnedWfg = returning_wfg->nReturnedWfg * 10 + c - '0';
-	if (c < 0)
-	{
-		pfree(returning_wfg);
-		return NULL;
-	}
+	CHECK_EOF(c);
 	while (c != '\n')
 	{
 		c = fgetc(wfg_out);
-		if (c < 0)
-		{
-			pfree(returning_wfg);
-			return NULL;
-		}
+		CHECK_EOF(c);
 	}
 	returning_wfg->state = (DeadLockState *)palloc0(sizeof(DeadLockState) * returning_wfg->nReturnedWfg);
 	returning_wfg->global_wfg_in_text = (char **)palloc0(sizeof(char *) * returning_wfg->nReturnedWfg);
 	for (ii = 0; ii < returning_wfg->nReturnedWfg; ii++)
 	{
-		int				state_i;
+		int				state_i = 0;
 		int				sign = 1;
 		StringInfoData	wfg_text;
 
-		while(((c = fgetc(wfg_out)) != '-') || (c < '0' || c > '9'))
+		while((c = fgetc(wfg_out)) >= 0)
 		{
-			if (c < 0)
+			CHECK_EOF(c);
+			if (c == '-')
+				sign = -1 * sign;
+			if (c >= '0' && c <= '9')
 			{
-				free_returned_wfg(returning_wfg);
-				return NULL;
+				ungetc(c, wfg_out);
+				break;
 			}
+
 		}
-		if (c == '-')
-		{
-			sign = -1;
-			state_i = 0;
-		}
-		else
-			state_i = c - '0';
 		while ((c = fgetc(wfg_out)) >= '0' && c <= '9')
+		{
+			CHECK_EOF(c);
 			state_i = state_i * 10 + c - '0';
+		}
 		state_i *= sign;
 		while (c != ',')
+		{
 			c = fgetc(wfg_out);
-		while ((c = fgetc(wfg_out)) == ' ' || c == '\t');
+			CHECK_EOF(c);
+		}
+		while ((c = fgetc(wfg_out)) == ' ' || c == '\t')
+			CHECK_EOF(c);
 		initStringInfo(&wfg_text);
 		appendStringInfoChar(&wfg_text, c);
 		while((c = fgetc(wfg_out)) != '\n')
+		{
+			CHECK_EOF(c);
 			appendStringInfoChar(&wfg_text, c);
+		}
 		returning_wfg->state[ii] = (DeadLockState)state_i;
 		returning_wfg->global_wfg_in_text[ii] = wfg_text.data;
 	}
 	FreeFile(wfg_out);
 	return returning_wfg;
+
+eof_exit:
+	elog(ERROR, "Returned global wait-for-graph format error.");
+	free_returned_wfg(returning_wfg);
+	return NULL;
+#undef CHECK_EOF
+}
+
+static void
+free_returned_wfg(RETURNED_WFG *r_wfg)
+{
+	int	ii;
+
+	if (r_wfg == NULL)
+		return;
+	if (r_wfg->state)
+		pfree(r_wfg->state);
+	if (r_wfg->global_wfg_in_text)
+	{
+		for (ii = 0; ii < r_wfg->nReturnedWfg; ii++)
+		{
+			if (r_wfg->global_wfg_in_text[ii])
+				pfree(r_wfg->global_wfg_in_text[ii]);
+		}
+		pfree(r_wfg->global_wfg_in_text);
+	}
+	pfree(r_wfg);
 }
 
 static LOCAL_WFG *
