@@ -41,6 +41,7 @@
  */
 
 #define	GDD_DEBUG
+#undef	GDD_DEBUG
 #define GDD_SERIALIZE_IN_TEXT
 
 #include "postgres.h"
@@ -282,7 +283,6 @@ static RETURNED_WFG *add_returned_wfg(RETURNED_WFG *dest, RETURNED_WFG *src, boo
 static RETURNED_WFG *addGlobalWfgToReturnedWfg(RETURNED_WFG *returned_wfg, DeadLockState state, GLOBAL_WFG *global_wfg);
 static RETURNED_WFG *globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLockState *state);
 static void free_local_wfg(LOCAL_WFG *local_wfg);
-static void free_global_wfg(GLOBAL_WFG *global_wfg);
 static PGPROC *find_pgproc(int pid);
 static PGPROC *find_pgproc_pgprocno(int pgprocno);
 static char *build_worker_file_name(bool input_to_command);
@@ -292,6 +292,7 @@ static GLOBAL_WFG *copy_global_wfg(GLOBAL_WFG *g_wfg);
 static bool external_lock_already_in_gwfg(GLOBAL_WFG *global_wfg, DEADLOCK_INFO_BUP *dl_info_bup);
 static void *gdd_repalloc(void *pointer, Size size);
 #ifdef GDD_DEBUG
+static void free_global_wfg(GLOBAL_WFG *global_wfg);
 static void print_global_wfg(StringInfo out, GLOBAL_WFG *g_wfg);
 static void print_local_wfg(StringInfo out, LOCAL_WFG *l_wfg, int idx, int total);
 static void print_deadlock_info(StringInfo out, DEADLOCK_INFO *info, int idx, int total);
@@ -2557,15 +2558,15 @@ check_local_wfg_is_stable(LOCAL_WFG *localWfG)
 	{
 		proc = find_pgproc_pgprocno(info[ii].pgprocno);
 		if (proc == NULL)
-			goto instable;
+			goto instable;			/* No PGPROC found */
 		if (proc->pid != info[ii].pid)
-			goto instable;
+			goto instable;			/* PGPROC is running different process */
 		if (proc->waitLockMode != info[ii].lockmode)
-			goto instable;
+			goto instable;			/* PGPROC is waiting with different lock mode */
 		if (memcmp(&(proc->waitLock->tag), &info[ii].locktag, sizeof(LOCKTAG)))
-			goto instable;
+			goto instable;			/* PGPROC is waiting for different LOCK */
 		if (proc->lxid != info[ii].txid)
-			goto instable;
+			goto instable;			/* PGPROC is running different TXN */
 	}
 	Unlock_PgprocArray();
 	return true;
@@ -2576,13 +2577,8 @@ instable:
 }
 
 /*
- * K.Suzuki:
- *
- * 以下２つ、データコピーが shallow copy 担っていないか確認すること。
- * shallow copy だと、呼び出し側が元の記憶域を再利用すると困ったことになる。
- * あるいは、shallow copy しても大丈夫なように呼び出し側を工夫する必要がある。
+ * Add new returne_wfg member to specified returned_wfg
  */
-/* Add new returne_wfg member to specified returned_wfg */
 static RETURNED_WFG *
 add_returned_wfg(RETURNED_WFG *dest, RETURNED_WFG *src, bool clean_opt)
 {
@@ -2610,7 +2606,9 @@ add_returned_wfg(RETURNED_WFG *dest, RETURNED_WFG *src, bool clean_opt)
 	return dest;
 }
 
-/* Add new global wfg to specified returned wfg */
+/*
+ * Add new global wfg to specified returned wfg
+ */
 static RETURNED_WFG *
 addGlobalWfgToReturnedWfg(RETURNED_WFG *returned_wfg, DeadLockState state, GLOBAL_WFG *global_wfg)
 {
@@ -2627,11 +2625,6 @@ addGlobalWfgToReturnedWfg(RETURNED_WFG *returned_wfg, DeadLockState state, GLOBA
 	return returned_wfg;
 }
 
-
-/*
- * K.Suzuki 20200626:
- * これは visited proc を追加するのではなく、external lockのlocktag と externla locktag info を追加すべきである
- */
 
 /*
  * Determine the mode of global deadlock check and extract self node's local wait-for-graph and add backend informaton
@@ -2731,6 +2724,7 @@ free_local_wfg(LOCAL_WFG *local_wfg)
 	pfree(local_wfg);
 }
 
+#ifdef GDD_DEBUG
 static void
 free_global_wfg(GLOBAL_WFG *global_wfg)
 {
@@ -2743,6 +2737,7 @@ free_global_wfg(GLOBAL_WFG *global_wfg)
 	pfree(global_wfg->local_wfg);
 	pfree(global_wfg);
 }
+#endif
 
 static char *
 build_worker_file_name(bool input_to_command)

@@ -126,41 +126,18 @@ main(int argc, char *argv[])
 		fprintf(stderr, "Invalid argument.\n");
 		exit(1);
 	}
-	if (strcmp(argv[1], "c") == 0)
-		my_mode = MODE_CHECK;
-	else if (strcmp(argv[1], "r") == 0)
-		my_mode = MODE_RECHECK;
-	else
+	if (strcmp(argv[1], "c") != 0)
 	{
 		fprintf(stderr, "Invalid argument.\n");
 		exit(1);
 	}
-	if (my_mode == MODE_CHECK)
-	{
-		conn_str = argv[2];
-		if (argc >= 4)
-			inf = file_open(argv[3], 'r');
-		if (argc >= 5)
-			outf = file_open(argv[4], 'w');
-		rv = gdd_check(conn_str);
-		exit(rv);
-	}
-	else
-	{
-		if (argc <= 3)
-		{
-			fprintf(stderr, "Invalid argument.\n");
-			exit(1);
-		}
-		pos = atoi(argv[2]);
-		conn_str = argv[3];
-		if (argc >= 5)
-			inf = file_open(argv[4], 'r');
-		if (argc >= 6)
-			outf = file_open(argv[5], 'w');
-		rv = gdd_recheck(pos, conn_str);
-		exit(rv);
-	}
+	conn_str = argv[2];
+	if (argc >= 4)
+		inf = file_open(argv[3], 'r');
+	if (argc >= 5)
+		outf = file_open(argv[4], 'w');
+	rv = gdd_check(conn_str);
+	exit(rv);
 }
 
 #ifdef GDD_DEBUG
@@ -261,73 +238,6 @@ gdd_check(char *connstr)
 	return 0;
 #undef QUERY_LEN
 }
-
-/*
- * Body of recheck mode
- */
-static int
-gdd_recheck(int pos, char *connstr)
-{
-#define	QUERY_LEN	1024
-	PGconn		*conn;
-	PGresult	*res;
-	char		*wfg;
-	int			 wfg_len;
-	char		*query;
-	char		*state_s;
-
-	wfg = get_wfg(&wfg_len);
-	if (wfg == 0)
-		return 1;
-	query = malloc(QUERY_LEN + wfg_len);
-	if (query == NULL)
-		oom_err();
-	snprintf(query, QUERY_LEN + wfg_len, "SELECT * FROM pg_global_deadlock_recheck_from_remote(%d, $GDD$%s$GDD$);",
-										 pos, wfg);
-	free(wfg);
-	conn = connect(connstr);
-	if (conn == NULL)
-	{
-		return 1;
-	}
-#ifdef GDD_DEBUG
-	/* For debug, obtain remote checker PID */
-	{
-		char	*pid_query = "SELECT pg_backend_pid() as pid;";
-		char	*pid_str;
-
-		res = PQexec(conn, pid_query);
-		if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
-		{
-			fprintf(outf, "1\n%d, Failed to obtain backend pid of the remote database.\n", -1);
-			return 1;
-		}
-		else
-		{
-			pid_str = PQgetvalue(res, 0, 0);
-			gdd_debug_remote_pid = atoi(pid_str);
-			fprintf(stderr, "Downstream database backend pid: %d\n", gdd_debug_remote_pid);
-		}
-		if (res)
-			PQclear(res);
-	}
-#endif /* GDD_DEBUG */
-	res = PQexec(conn, query);
-	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		fprintf(outf, "1\n%d, Failed to run remote query to check global deadlock. %s\n",
-					  -1,
-					  res ? PQresultErrorMessage(res) : "");
-		exit(1);
-	}
-	state_s = PQgetvalue(res, 0, 0);
-	fprintf(outf, "%s\n", state_s);
-	PQclear(res);
-	PQfinish(conn);
-	return 0;
-#undef QUERY_LEN
-}
-
 
 static PGconn *
 connect(char *connstr)
