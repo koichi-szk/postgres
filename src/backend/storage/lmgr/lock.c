@@ -4636,41 +4636,6 @@ ExternalLockRelease(LOCKTAG *locktag)
 	return rv;
 }
 
-#if 0
-bool
-ExternalLockWaitProc(const LOCKTAG *locktag, PGPROC *proc)
-{
-	LOCK   *lock;
-	bool	found;
-
-	if (checkExternalLockTag(locktag, proc) != true)
-		return false;
-	if (proc->waitLock)
-		return false;
-	lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash,
-												(const void *) locktag,
-												LockTagHashCode(locktag),
-												HASH_FIND,
-												&found);
-	if (!lock)
-		return false;
-	proc->waitLock = lock;
-}
-
-bool
-ExternalLockWait(const LOCKTAG *locktag)
-{
-	bool rv;
-
-	rv = ExternalLockWaitProc(locktag, MyProc);
-	if (rv != true)
-		return rv;
-
-	externalLockFileUnlinkProc(locktag, MyProc);
-	return rv;
-}
-#endif
-
 bool
 ExternalLockUnWaitProc(const LOCKTAG *locktag, PGPROC *proc)
 {
@@ -4681,6 +4646,7 @@ ExternalLockUnWaitProc(const LOCKTAG *locktag, PGPROC *proc)
 	if (checkExternalLockTag(locktag, proc) != true)
 		return false;
 	proc->waitLock = NULL;
+	proc->waitLockMode = NoLock;
 	return true;
 }
 
@@ -4743,6 +4709,7 @@ ExternalLockWaitProc(const LOCKTAG *locktag, PGPROC *proc)
 		return false;
 	}
 	proc->waitLock = lock;
+	proc->waitLockMode = AccessExclusiveLock;
 	return true;
 }
 
