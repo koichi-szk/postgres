@@ -550,14 +550,15 @@ typedef struct DEADLOCK_INFO
 
 typedef struct LOCAL_WFG
 {
-	int32			 	 local_wfg_flag;
-	int64			 	 database_system_identifier;
-	int32				 visitedProcPid;		/* PID of visitedProc[0], exist only in the origin node */
-	int32			     visitedProcPgprocno;	/* pgprocno of visitedProc[0], exist only in the origin node */
-	int32				 visitedProcLxid;		/* lxid of visitedProc[0], exist only in the origin node */
-	int32			 	 nDeadlockInfo;
-	DEADLOCK_INFO		*deadlock_info;
-	ExternalLockInfo	*external_lock;
+	int32			 	  local_wfg_flag;
+	int64			 	  database_system_identifier;
+	int32				  visitedProcPid;		/* PID of visitedProc[0], exist only in the origin node */
+	int32			      visitedProcPgprocno;	/* pgprocno of visitedProc[0], exist only in the origin node */
+	int32				  visitedProcLxid;		/* lxid of visitedProc[0], exist only in the origin node */
+	int32			 	  nDeadlockInfo;
+	DEADLOCK_INFO		 *deadlock_info;
+	char				**backend_activity;		/* Each backend's activity in deadlock_info[] above. */
+	ExternalLockInfo	 *external_lock;
 } LOCAL_WFG;
 
 /*
