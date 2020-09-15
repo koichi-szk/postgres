@@ -530,9 +530,7 @@ DeadLockCheck_int(PGPROC *proc)
 
 	/* Search for deadlocks and possible fixes */
 	status = DeadLockCheckRecurse(proc);
-	/*
-	 * K.Suzuki: external lock 検出時の処理を追加
-	 */
+
 	if (status == DS_HARD_DEADLOCK)
 	{
 		/*
@@ -637,13 +635,8 @@ DeadLockCheckRecurse(PGPROC *proc)
 	int			i;
 	DeadLockState	status = DS_NOT_YET_CHECKED;
 
-	/*
-	 * K.Suzuki:
-	 * TestConfiguration() で、DS_HARD_DEADLOCK と DS_EXTERNAL_LOCK が
-	 * 識別できるようにしておく必要がある
-	 */
 	nEdges = TestConfiguration(proc);
-	if (nEdges == -2)		/* K.Suzuki external lock 検出処理の追加 */
+	if (nEdges == -2)		/* K.Suzuki external lock was detected. */
 		return DS_DEADLOCK_INFO;
 	if (nEdges == -1)
 		return DS_HARD_DEADLOCK;	/* hard deadlock --- no solution */
@@ -674,10 +667,6 @@ DeadLockCheckRecurse(PGPROC *proc)
 		if (!savedList && i > 0)
 		{
 			/* Regenerate the list of possible added constraints */
-			/*
-			 * K.Suzuki ここ、i = 0  に対する TestConfiguration() の呼び出しは loop の
-			 * 外で済んでいるので、i == 0 では呼び出さず、結果を利用するだけ。
-			 */
 			if (nEdges != TestConfiguration(proc))
 				elog(FATAL, "inconsistent results during deadlock check");
 		}
@@ -697,9 +686,6 @@ DeadLockCheckRecurse(PGPROC *proc)
 
 /*--------------------
  * Test a configuration (current set of constraints) for validity.
- *
- * K.Suzuki: ここ、external lock の検出とその返却方法を追加する必要がある。
- *           返却値に -2 を追加して、これが external lock 検出を示すようにしよう。
  *
  * Returns:
  *		0: the configuration is good (no deadlocks)
@@ -873,8 +859,8 @@ FindLockCycleRecurse(PGPROC *checkProc,
 	if (deadlockCheckMode == DLCMODE_LOCAL)
 	{
 		/*
-		 * K.Suzuki 以下の部分は元のコードを respect して活かしてあるが、そもそも ii == 0 の時だけを
-		 * チェックすればいいので、余分なことをしているのでは？
+		 * K.Suzuki: I kept original code not to forget this.   Howver, check is valid only
+		 * when ii == 0.  No other check look necessary.
 		 */
 		/*
 		 * Check if there's local wait-for-graph cycle.  This is done only at
@@ -910,10 +896,6 @@ FindLockCycleRecurse(PGPROC *checkProc,
 				 * Otherwise, we have a cycle but it does not include the start
 				 * point, so say "no deadlock".
 				 */
-				/*
-				 * K.Suzuki: これ、おかしい。他にもチェックすべき external lock があるかもしれないので、ここで
-				 * リターンしてはいけなのでは？
-				 */
 				return DS_NO_DEADLOCK;
 			}
 		}
@@ -926,10 +908,6 @@ FindLockCycleRecurse(PGPROC *checkProc,
 	/*
 	 * If the process is waiting, there is an outgoing waits-for edge to each
 	 * process that blocks it.
-	 */
-	/*
-	 * K.Suzuki: ここで waitLock を見ているので、external lockのチェックを
-	 *			 ここに追加できるはず。
 	 */
 	if (checkProc->waitLock != NULL)
 	{
@@ -946,10 +924,6 @@ FindLockCycleRecurse(PGPROC *checkProc,
 
 			info->locktag = checkProc->waitLock->tag;
 			info->lockmode = checkProc->waitLockMode;
-			/*
-			 * K.Suzuki: 以下のものはロックグループリーダのものである
-			 *			 必要はないか？
-			 */
 			info->pid = checkProc->pid;
 			info->pgprocno = checkProc->pgprocno;
 			info->txid = checkProc->lxid;
@@ -968,23 +942,12 @@ FindLockCycleRecurse(PGPROC *checkProc,
 			return DS_DEADLOCK_INFO;
 		}
 	}
-	/*
-	 * K.Suzuki: FindLockCycleRecurseMember() 内部で external lock を見る必要があるかどうか
-	 *			 調べること。これに寄っては FindLockCycleRecurseMember() の戻り値が変更になる
-	 *			 可能性がある。
-	 *			 確か FindFLockCYcleRecurseMember() 内部で FindLockCycleRecurse() 呼んでいたような
-	 *			 気がする。
-	 *			 取り敢えず上記は反映したけれど、DS_EXTERNAL_LOCK 時の後処理が別に必要かもしれない。
-	 */
 	if (checkProc->links.next != NULL && checkProc->waitLock != NULL)
 
 	{
 		DeadLockState	state;
 
 		state = FindLockCycleRecurseMember(checkProc, checkProc, depth, softEdges, nSoftEdges);
-#if 0
-		if (state == DS_HARD_DEADLOCK || state == DS_EXTERNAL_LOCK)
-#endif
 		if (state == DS_HARD_DEADLOCK)
 			return state;
 		rv = state;
@@ -1003,24 +966,12 @@ FindLockCycleRecurse(PGPROC *checkProc,
 
 		memberProc = dlist_container(PGPROC, lockGroupLink, iter.cur);
 
-		/*
-		 * K.Suzuki: FindLockCycleRecurseMember() 内部で external lock を見る必要があるかどうか
-		 *			 調べること。これに寄っては FindLockCycleRecurseMember() の戻り値が変更になる
-		 *			 可能性がある。
-		 *			 確か FindFLockCYcleRecurseMember() 内部で FindLockCycleRecurse() 呼んでいたような
-		 *			 気がする。
-		 *			 取り敢えず上記は反映したけれど、DS_EXTERNAL_LOCK 時の後処理が別に必要かもしれない。
-		 */
 		if (memberProc->links.next != NULL && memberProc->waitLock != NULL && memberProc != checkProc)
 		{
 			DeadLockState	state;
 
 			state = FindLockCycleRecurseMember(memberProc, checkProc, depth, softEdges, nSoftEdges);
-#if 0
-			if (state == DS_HARD_DEADLOCK || state == DS_EXTERNAL_LOCK)
-#else
 			if (state == DS_HARD_DEADLOCK)
-#endif
 				return state;
 			if (state == DS_EXTERNAL_LOCK)
 				rv = DS_EXTERNAL_LOCK;
@@ -1086,10 +1037,6 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 
 					info->locktag = lock->tag;
 					info->lockmode = checkProc->waitLockMode;
-					/*
-					 * K.Suzuki: 以下のものはロックグループリーダのものである
-					 *			 必要はないか？
-					 */
 					info->pid = checkProc->pid;
 					info->pgprocno = checkProc->pgprocno;
 					info->txid = checkProc->lxid;
@@ -1145,9 +1092,6 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 	 * If there is a proposed re-ordering of the lock's wait order, use that
 	 * rather than the current wait order.
 	 */
-	/*
-	 * K.Suzuki: 以下、これから見る。
-	 */
 	for (i = 0; i < nWaitOrders; i++)
 	{
 		if (waitOrders[i].lock == lock)
@@ -1188,9 +1132,6 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 
 				info->locktag = lock->tag;
 				info->lockmode = checkProc->waitLockMode;
-				/*
-				 * K.Suzuki: 以下のデータはロックグループリーダのものである必要はないか
-				 */
 				info->pid = checkProc->pid;
 				info->pgprocno = checkProc->pgprocno;
 				info->txid = checkProc->lxid;
@@ -1205,10 +1146,6 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 				{
 					/*
 					 * Add this edge to the list of soft edges in the cycle
-					 */
-					/*
-					 * K.Suzuki: 以下の後処理が EXTERNAL LOCK 時にも必要かどうか
-					 *			 後で見て見る必要がある。
 					 */
 					Assert(*nSoftEdges < MaxBackends);
 					softEdges[*nSoftEdges].waiter = checkProcLeader;
@@ -1277,9 +1214,6 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 
 				info->locktag = lock->tag;
 				info->lockmode = checkProc->waitLockMode;
-				/*
-				 * K.Suzuki: 以下のデータはロックグループリーダのものである必要はないか
-				 */
 				info->pid = checkProc->pid;
 				info->pgprocno = checkProc->pgprocno;
 				info->txid = checkProc->lxid;
@@ -1294,10 +1228,6 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 				{
 					/*
 					 * Add this edge to the list of soft edges in the cycle
-					 */
-					/*
-					 * K.Suzuki: 以下の後処理が EXRTERNAL LOCK 検出時にも必要か
-					 *			 チェックして見る必要がある。
 					 */
 					Assert(*nSoftEdges < MaxBackends);
 					softEdges[*nSoftEdges].waiter = checkProcLeader;
@@ -1331,8 +1261,6 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
  *
  * Returns true if able to build an ordering that satisfies all the
  * constraints, false if not (there are contradictory constraints).
- *
- * K.Suzuki: この関数に渡す Edge には external lock が含まれないように保証しておく必要がある。
  */
 static bool
 ExpandConstraints(EDGE *constraints,
@@ -1405,8 +1333,6 @@ ExpandConstraints(EDGE *constraints,
  *
  * Returns true if able to build an ordering that satisfies all the
  * constraints, false if not (there are contradictory constraints).
- *
- * K.Suzuki: この関数に渡す Edge には external lock が含まれないように保証しておく必要がある。
  */
 static bool
 TopoSort(LOCK *lock,
@@ -1619,8 +1545,6 @@ PrintLockQueue(LOCK *lock, const char *info)
 
 /*
  * Report a detected deadlock, with available details.
- *
- * K.Suzuki: EXTERNAL LOCK の追加も行うこと
  */
 void
 DeadLockReport(void)
@@ -1883,7 +1807,6 @@ GlobalDeadlockCheck(PGPROC *proc)
 static DeadLockState
 GlobalDeadlockCheck_int(PGPROC *proc, GLOBAL_WFG *global_wfg, RETURNED_WFG **rv)
 {
-	/* K.Suzuki: returning_wfg の処理が変 */
 	DeadLockState	 state;
 	int				 nWfG;
 	LOCAL_WFG		*local_wfg;
@@ -2213,11 +2136,6 @@ globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLockState *state)
 		LOCAL_WFG	*local_wfg;
 		GLOBAL_WFG	*global_wfg_here;
 
-		/*
-		 * K.Suzuki
-		 *
-		 * returning wfg に情報追加するとき、shallow copy されていても大丈夫か確認すること
-		 */
 		if (curr_bup->state == DS_HARD_DEADLOCK)
 		{
 			*state = DS_DEADLOCK_INFO;
@@ -2249,7 +2167,6 @@ globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLockState *state)
 	 *
 	 * Then continue further global wait-for-graph search to other downstream databae.
 	 */
-	/* K.Suzuki: ここなんか変。見つかった local wfg をきちんと引き継いでいるか? */
 	*state = GlobalDeadlockCheck_int(pgproc_in_passed_external_lock, global_wfg, &returned_wfg);
 	if (*state != DS_DEADLOCK_INFO)
 		goto returning;
@@ -2309,7 +2226,7 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
         funcctx->attinmeta = attinmeta;
 		global_wfg_text = PG_GETARG_CSTRING(0);
 
-		returning_global_wfg = globalDeadlockCheckFromRemote(global_wfg_text, &state);	/* K.Suzuki Trace this function with GDB!! */
+		returning_global_wfg = globalDeadlockCheckFromRemote(global_wfg_text, &state);
 
 		funcctx->user_fctx = returning_global_wfg;
 		funcctx->max_calls = returning_global_wfg ? returning_global_wfg->nReturnedWfg : 0;
@@ -2345,8 +2262,6 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
  * Output tuple is (pid int, pgprocno int, lxid int)
  *
  * Application using global deadlock detection can issue this function
- * K.Suzuki: lxid が符号つきになってしまっている。これを符号なし、あるいは numeric にする必要がある。
- * NUMERICOID を型に使えばいいか。-> 後で検討すること。
  *
  * Return value is one integer: DeadlockState
  */
@@ -3573,9 +3488,9 @@ static void
 GlobalDeadlockReport_int(void)
 {
 	StringInfoData	 clientbuf;	/* errdetail for client */
-	StringInfoData	 logbuf;		/* errdetail for server log */
+	StringInfoData	 logbuf;	/* errdetail for server log */
 	StringInfoData	 locktagbuf;
-	StringInfoData	 local_clientbuf;
+	StringInfoData	 local_clientbuf;	/* Local buffer common to clientbuf and localbuf */
 
 	DEADLOCK_INFO	*info;
 	DEADLOCK_INFO	*next_info;
@@ -3608,52 +3523,58 @@ GlobalDeadlockReport_int(void)
 
 		resetStringInfo(&local_clientbuf);
 		appendStringInfo(&local_clientbuf,
-						_("\nLocal deadlock info.  Database system id: %016lx,  "),
+						_("\nDeadlock info for Database system id: %016lx,  "),
 						my_db_id);
 
-		for (jj = 0; jj < (local_wfg->nDeadlockInfo - 2); jj++)
+		for (jj = 0; jj < local_wfg->nDeadlockInfo; jj++)
 		{
 			resetStringInfo(&locktagbuf);
 			info = &local_wfg->deadlock_info[jj];
-			next_info = &local_wfg->deadlock_info[jj + 1];
 
 			DescribeLockTag(&locktagbuf, &info->locktag);
-			appendStringInfo(&local_clientbuf,
-						_("Process %d waits for %s on %s; blocked by process %d.  "),
-						info->pid,
-						GetLockmodeName(info->locktag.locktag_lockmethodid,
-										info->lockmode),
-						locktagbuf.data,
-						next_info->pid);
-		}
-		/* Last deadlock-info: local or external */
-		if (local_wfg->deadlock_info[jj].locktag.locktag_type == LOCKTAG_EXTERNAL)
-		{
-			/*
-			 * Please note that last cyle information is included in global deadlock info.
-			 * We don't have to visit the first menber of local wait-for-graph if no
-			 * external lock is involved.
-			 */
-			ExternalLockInfo	*ext_lock = global_deadlock_info->local_wfg[ii]->external_lock;
-			info = &local_wfg->deadlock_info[jj];
+			if (local_wfg->deadlock_info[jj].locktag.locktag_type == LOCKTAG_EXTERNAL)
+			{
+				/*
+				 * Please note that last cyle information is included in global deadlock info.
+				 * We don't have to visit the first menber of local wait-for-graph if no
+				 * external lock is involved.
+				 */
+				ExternalLockInfo	*ext_lock = global_deadlock_info->local_wfg[ii]->external_lock;
+				info = &local_wfg->deadlock_info[jj];
 
-			appendStringInfo(&local_clientbuf,
-							_("Process %d waits for external lock targetted at database %016lx, remote process %d.  "),
-							info->pid, next_db_id, ext_lock->pid);
+				appendStringInfo(&local_clientbuf,
+								_("Process %d waits for remote database %016lx, process %d.  "),
+								info->pid, next_db_id, ext_lock->target_pid);
+			}
+			else
+			{
+				Assert(jj < (local_wfg->nDeadlockInfo - 1));
+
+				next_info = &local_wfg->deadlock_info[jj + 1];
+				appendStringInfo(&local_clientbuf,
+							_("Process %d waits for %s on %s; blocked by process %d.  "),
+							info->pid,
+							GetLockmodeName(info->locktag.locktag_lockmethodid,
+											info->lockmode),
+							locktagbuf.data,
+							next_info->pid);
+			}
 		}
 		appendStringInfoString(&clientbuf, local_clientbuf.data);
 		appendStringInfoString(&logbuf, local_clientbuf.data);
-		for (jj = 0; jj < (local_wfg->nDeadlockInfo - 1); jj++)
+		for (jj = 0; jj < local_wfg->nDeadlockInfo; jj++)
 		{
-			appendStringInfoChar(&logbuf, '\n');
 			appendStringInfo(&logbuf,
-						    _("Process %d: %s"),
+						    _("Process %d: \"%s\" "),
 						    local_wfg->deadlock_info[jj].pid,
-						    local_wfg->backend_activity[ii]);
+						    local_wfg->backend_activity[jj]);
 		}
 	}
 
-	pgstat_report_deadlock();		/* K.Suzuki: Should change to pgstart_report_global_deadlock() ? --> Maybe further issue */
+	/*
+	 * K.Suzuki: At present, we are reporting same deadlock to pgstat.
+	 */
+	pgstat_report_deadlock();
 
 	/* Until query datails are available, client message is the same as server log.  TDB */
 	ereport(ERROR,
@@ -3661,7 +3582,7 @@ GlobalDeadlockReport_int(void)
 			 errmsg("gobal deadlock detected"),
 			 errdetail_internal("%s", clientbuf.data),
 			 errdetail_log("%s", logbuf.data),
-			 errhint("See server log for query details. -- to be added later.")));
+			 errhint("See server log for query details.")));
 }
 
 static void *

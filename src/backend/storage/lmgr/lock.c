@@ -61,8 +61,8 @@
  *  GetExternalLockProperties(), FreeExternalLockProperties()
  *
  * K.Suzuki
- *  LOCKTAG が lock テーブルにあるかどうか確認する部分は取り敢えずスキップする。
- *  Caller が正しいシーケンスで呼んでくれることを期待。
+ *  We don't check strictly if LOCKTAG (in this case, EXTERNAL_LOCK, especially)
+ *  is in lock table.   Expects callers use external lock functions properly.
  *
  *-------------------------------------------------------------------------
  */
@@ -1598,8 +1598,6 @@ UnGrantLock(LOCK *lock, LOCKMODE lockmode,
  *
  * The appropriate partition lock must be held at entry, and will be
  * held at exit.
- *
- * K.Suzuki: External Lock の場合、prpoerty ファイルがあればこれを削除すること。
  */
 static void
 CleanUpLock(LOCK *lock, PROCLOCK *proclock,
@@ -1611,6 +1609,10 @@ CleanUpLock(LOCK *lock, PROCLOCK *proclock,
 	 */
 	if (lock->tag.locktag_type == LOCKTAG_EXTERNAL)
 	{
+		/*
+		 * Exernal Lock may be associated with property file.   We need to clean this
+		 * up too.
+		 */
 		char	*pfname;
 
 		pfname = findExternalLockFileName(&(lock->tag));
