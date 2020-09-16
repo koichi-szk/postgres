@@ -694,7 +694,6 @@ extern	bool	ExternalLockWaitProc(const LOCKTAG *locktag, PGPROC *proc);
 extern	bool	ExternalLockWait(const LOCKTAG *locktag);
 extern	bool	ExternalLockUnWaitProc(const LOCKTAG *locktag, PGPROC *proc);
 extern	bool	ExternalLockUnWait(const LOCKTAG *locktag);
-extern	bool	ExernalLockWait(const LOCKTAG *locktag);
 extern	bool	ExternalLockSetProperties(LOCKTAG *locktag,
 					PGPROC *proc, char *dsn, int target_pgprocno,
 					int target_pid, TransactionId target_xid, bool update_flag);
