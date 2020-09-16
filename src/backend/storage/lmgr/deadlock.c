@@ -3579,7 +3579,7 @@ GlobalDeadlockReport_int(void)
 	/* Until query datails are available, client message is the same as server log.  TDB */
 	ereport(ERROR,
 			(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
-			 errmsg("gobal deadlock detected"),
+			 errmsg("global deadlock detected"),
 			 errdetail_internal("%s", clientbuf.data),
 			 errdetail_log("%s", logbuf.data),
 			 errhint("See server log for query details.")));

@@ -701,6 +701,10 @@ extern	bool	ExternalLockSetProperties(LOCKTAG *locktag,
 extern DEADLOCK_INFO *BuildLocalDeadlockInfo(int *nInfo);
 extern ExternalLockInfo *GetExternalLockProperties(const LOCKTAG *locktag);
 extern void FreeExternalLockProperties(ExternalLockInfo *ext_lockinfo);
+extern bool ExternalLockSetPropertiesWaiting(PGPROC *proc, char *dsn,
+					int target_pgprocno, int target_pid, TransactionId target_xid,
+					bool update_flag);
+
 
 /* Functions for Global deadlock detection */
 

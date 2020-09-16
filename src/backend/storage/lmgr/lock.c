@@ -4766,6 +4766,36 @@ ExternalLockSetProperties(LOCKTAG *locktag,
 	return true;
 }
 
+/*
+ * This function is used by SQL function pg_external_lock_set().   This is defined in deadlock.c
+ *
+ * This sets external lock property for specified backend.   Specified backed must be waiting for
+ * an external lock.
+ */
+bool
+ExternalLockSetPropertiesWaiting(PGPROC *proc,
+								 char *dsn,
+								 int target_pgprocno,
+								 int target_pid,
+								 TransactionId target_xid,
+								 bool update_flag)
+{
+	LOCKTAG	*locktag;
+	LOCK	*waitlock;
+
+	Assert(proc);
+
+	waitlock = proc->waitLock;
+	if (waitlock == NULL)
+		elog(ERROR, "Specified proc has no waiting lock.");
+	locktag = &waitlock->tag;
+
+	Assert(locktag);
+	if (locktag->locktag_type != LOCKTAG_EXTERNAL)
+		elog(ERROR, "Specified proc is not waiting for external lock.");
+	return ExternalLockSetProperties(locktag, proc, dsn, target_pgprocno, target_pid, target_xid, update_flag);
+}
+
 ExternalLockInfo *
 GetExternalLockProperties(const LOCKTAG *locktag)
 {
