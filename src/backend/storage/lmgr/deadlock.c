@@ -56,6 +56,7 @@
 #include "pg_trace.h"
 #include "pgstat.h"
 #include "postmaster/postmaster.h"
+#include "storage/global_deadlock.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "utils/fmgrprotos.h"
@@ -222,20 +223,6 @@ typedef struct DEADLOCK_INFO_BUP
 DEADLOCK_INFO_BUP	*deadlock_info_bup_head;	/* Head of the queue */
 DEADLOCK_INFO_BUP	*deadlock_info_bup_tail;	/* Tail of the queue */
 
-/*
- * The following represents discovered candidate of wait-for-graph segment.
- * This was used in several global deadlock detection functions.
- *
- * By checking Wfg stability locally at downstream database, number of global_wfg_in_text
- * is practically one.
- */
-typedef struct RETURNED_WFG
-{
-	int				  nReturnedWfg;
-	DeadLockState	 *state;				/* DS_HARD_DEADLOCK or DS_EXTERNL_LOCK */
-	char			**global_wfg_in_text;	/* Text-format global wait-for-graph discovered */
-} RETURNED_WFG;
-
 
 /*
  * Functions for local deadlock detection and and wait-for-graph extraction
@@ -284,8 +271,6 @@ static RETURNED_WFG *globalDeadlockCheckFromRemote(char *global_wfg_text, DeadLo
 static void free_local_wfg(LOCAL_WFG *local_wfg);
 static PGPROC *find_pgproc(int pid);
 static PGPROC *find_pgproc_pgprocno(int pgprocno);
-static char *build_worker_file_name(bool input_to_command);
-static RETURNED_WFG *read_returned_wfg(char *fname);
 static LOCAL_WFG *copy_local_wfg(LOCAL_WFG *l_wfg);
 static GLOBAL_WFG *copy_global_wfg(GLOBAL_WFG *g_wfg);
 static bool external_lock_already_in_gwfg(GLOBAL_WFG *global_wfg, DEADLOCK_INFO_BUP *dl_info_bup);
@@ -293,8 +278,6 @@ static void *gdd_repalloc(void *pointer, Size size);
 static void DeadLockReport_int(void) pg_attribute_noreturn();
 static void GlobalDeadlockReport_int(void) pg_attribute_noreturn();
 static void	add_backend_activities_local_wfg(LOCAL_WFG *local_wfg);
-static void gddSystem(char *cmd, char *inf, char *outf);
-static char *read_file(char *fname);
 #ifdef GDD_DEBUG
 void free_global_wfg(GLOBAL_WFG *global_wfg);
 static void print_global_wfg(StringInfo out, GLOBAL_WFG *g_wfg);
@@ -380,6 +363,9 @@ static uint64 my_database_system_identifier = 0;
 
 /* Global wait-for-graph for deadlock report */
 static GLOBAL_WFG *global_deadlock_info = NULL;
+
+/* Entry point for remote database WfG check */
+PGDLLIMPORT gdd_check_fn	*pg_gdd_check_func = NULL;
 
 #ifdef GDD_DEBUG
 #define	GDD_ARRAY_MAX 128
@@ -1830,6 +1816,12 @@ GlobalDeadlockCheck_int(PGPROC *proc, GLOBAL_WFG *global_wfg, RETURNED_WFG **rv)
 	resetStringInfo(&out);
 #endif /* GDD_DEBUG */
 	/*
+	 * Initialize .so for remote database WfG check
+	 */
+	if (pg_gdd_check_func == NULL)
+		load_file("libpqgddcheckremote", false);
+
+	/*
 	 * Previous DeadLockCheck() may have found more than one possible piece of wait-for-graph
 	 * spanning to remote transactions.
 	 *
@@ -1954,8 +1946,10 @@ returning:
  * The caller must check that local_wfg is stable and it terminates with LOCKTAG_EXTERNAL
  */
 #ifdef GDD_DEBUG
-int				 gdd_debug_remote_pid;		/* For debug only */
+int		gdd_debug_remote_pid;		/* For debug only */
 #endif /* GDD_DEBUG */
+
+#define	GDD_CHECK_BY_FUNC	true
 
 static int
 GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, RETURNED_WFG **returning_wfg)
@@ -1963,10 +1957,6 @@ GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, RETURNED
 	GLOBAL_WFG		*new_global_wfg;
 	char			*global_wfg_text = NULL;
 	StringInfoData	 cmd;
-	char			*wfg_in_fname;
-	char			*cmd_out_fname;
-	FILE			*wfg_in;
-	FILE			*cmd_out;
 	char			*dsn_downstream;
 
 	if (!(local_wfg->local_wfg_flag & WfG_HAS_EXTERNAL_LOCK))
@@ -1983,63 +1973,10 @@ GlobalDeadlockCheckRemote(LOCAL_WFG *local_wfg, GLOBAL_WFG *global_wfg, RETURNED
 	 */
 	new_global_wfg = addToGlobalWfG(new_global_wfg, (void *)local_wfg);
 	global_wfg_text = SerializeGlobalWfG(new_global_wfg);
-	/*
-	 *-------------------------------------------------------------------------------------
-	 * Check WfG cycle involving remote transactions.
-	 *
-	 * Because we cannot use libpq-fe in the backend, we use small exernal worker.
-	 *--------------------------------------------------------------------------------------
-	 */
-	wfg_in_fname = build_worker_file_name(true);
-	cmd_out_fname = build_worker_file_name(false);
-	appendStringInfo(&cmd, "%s c %s %s %s", WORKER_NAME,
-											normalizeString(dsn_downstream),
-											normalizeString(wfg_in_fname),
-											normalizeString(cmd_out_fname));
-	wfg_in = AllocateFile(wfg_in_fname, "w");
-	cmd_out = AllocateFile(cmd_out_fname, "w");
-	fwrite(global_wfg_text, strlen(global_wfg_text), 1, wfg_in);
-	FreeFile(wfg_in);
-	FreeFile(cmd_out);
-	/* Here, in the debug, the command should be invoked manually for debug */
-	elog(DEBUG1, "Executing worker \"%s\", Input data: \"%s\"", cmd.data, global_wfg_text);
-	gddSystem(cmd.data, wfg_in_fname, cmd_out_fname);
-	pfree(cmd.data);
-	unlink(wfg_in_fname);
-	elog(DEBUG1, "Worker output: \"%s\"", read_file(cmd_out_fname));
-	*returning_wfg = read_returned_wfg(cmd_out_fname);
-	unlink(cmd_out_fname);
+
+	*returning_wfg = pg_gdd_check_func(dsn_downstream, global_wfg_text);
+
 	return (*returning_wfg)->nReturnedWfg;
-}
-
-static char *
-read_file(char *fname)
-{
-	FILE *f = AllocateFile(fname, "r");
-	int	c;
-	StringInfoData	s;
-
-	initStringInfo(&s);
-	while((c = fgetc(f)) > 0)
-		appendStringInfoChar(&s, c);
-	FreeFile(f);
-	return s.data;
-}
-
-static void
-gddSystem(char *cmd, char *inf, char *outf)
-{
-#ifdef GDD_DEBUG
-	elog(DEBUG1, "Issuing worker command: %s", cmd);
-#else
-	int				 cmd_ret;
-
-	elog(DEBUG1, "Issuing worker command: %s", cmd);
-	cmd_ret = system(cmd);
-	if (!WIFEXITED(cmd_ret) || (WEXITSTATUS(cmd_ret) != 0))
-		elog(ERROR, "Global deadlock detection worker error. Remove files %s, %s from %s/%s directly manually if needed.",
-				inf, outf, DataDir, "pg_external_locks");
-#endif /* GDD_DEBUG */
 }
 
 /*
@@ -2719,18 +2656,6 @@ free_global_wfg(GLOBAL_WFG *global_wfg)
 }
 #endif
 
-static char *
-build_worker_file_name(bool input_to_command)
-{
-	StringInfoData	fname;
-
-	initStringInfo(&fname);
-	appendStringInfo(&fname, "%s/pg_external_locks/wfg_%d.%s",
-							 DataDir, MyProc->pid,
-							 input_to_command ? "in" : "out");
-	return fname.data;
-}
-
 static void
 add_backend_activities_local_wfg(LOCAL_WFG *local_wfg)
 {
@@ -2738,83 +2663,6 @@ add_backend_activities_local_wfg(LOCAL_WFG *local_wfg)
 	
 	for (ii = 0; ii < local_wfg->nDeadlockInfo; ii++)
 		local_wfg->backend_activity[ii] = pstrdup(pgstat_get_backend_current_activity(local_wfg->deadlock_info[ii].pid, false));
-}
-
-static RETURNED_WFG *
-read_returned_wfg(char *fname)
-{
-#define CHECK_EOF(c) do{if ((c) < 0) goto eof_exit;}while(0)
-
-	FILE	*wfg_out;
-	int		 c;
-	int		 ii;
-	RETURNED_WFG *returning_wfg = NULL;
-
-	wfg_out = AllocateFile(fname, "r");
-	while ((c = fgetc(wfg_out)) < '0' || c > '9')
-		CHECK_EOF(c);
-	ungetc(c, wfg_out);
-	returning_wfg = (RETURNED_WFG *)palloc(sizeof(RETURNED_WFG));
-	returning_wfg->nReturnedWfg = 0;
-	while ((c = fgetc(wfg_out)) >= '0' && c <= '9')
-		returning_wfg->nReturnedWfg = returning_wfg->nReturnedWfg * 10 + c - '0';
-	CHECK_EOF(c);
-	while (c != '\n')
-	{
-		c = fgetc(wfg_out);
-		CHECK_EOF(c);
-	}
-	returning_wfg->state = (DeadLockState *)palloc0(sizeof(DeadLockState) * returning_wfg->nReturnedWfg);
-	returning_wfg->global_wfg_in_text = (char **)palloc0(sizeof(char *) * returning_wfg->nReturnedWfg);
-	for (ii = 0; ii < returning_wfg->nReturnedWfg; ii++)
-	{
-		int				state_i = 0;
-		int				sign = 1;
-		StringInfoData	wfg_text;
-
-		while((c = fgetc(wfg_out)) >= 0)
-		{
-			CHECK_EOF(c);
-			if (c == '-')
-				sign = -1 * sign;
-			if (c >= '0' && c <= '9')
-			{
-				ungetc(c, wfg_out);
-				break;
-			}
-
-		}
-		while ((c = fgetc(wfg_out)) >= '0' && c <= '9')
-		{
-			CHECK_EOF(c);
-			state_i = state_i * 10 + c - '0';
-		}
-		state_i *= sign;
-		while (c != ',')
-		{
-			c = fgetc(wfg_out);
-			CHECK_EOF(c);
-		}
-		while ((c = fgetc(wfg_out)) == ' ' || c == '\t')
-			CHECK_EOF(c);
-		initStringInfo(&wfg_text);
-		appendStringInfoChar(&wfg_text, c);
-		while((c = fgetc(wfg_out)) != '\n')
-		{
-			CHECK_EOF(c);
-			appendStringInfoChar(&wfg_text, c);
-		}
-		returning_wfg->state[ii] = (DeadLockState)state_i;
-		returning_wfg->global_wfg_in_text[ii] = wfg_text.data;
-	}
-	FreeFile(wfg_out);
-	return returning_wfg;
-
-eof_exit:
-	elog(ERROR, "Returned global wait-for-graph format error.");
-	free_returned_wfg(returning_wfg);
-	return NULL;
-#undef CHECK_EOF
 }
 
 static void

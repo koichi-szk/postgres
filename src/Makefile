@@ -23,6 +23,7 @@ SUBDIRS = \
 	include \
 	backend/replication/libpqwalreceiver \
 	backend/replication/pgoutput \
+	backend/storage/lmgr/libpqgddcheckremote \
 	fe_utils \
 	bin \
 	pl \

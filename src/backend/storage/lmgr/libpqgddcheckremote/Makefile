@@ -1,0 +1,35 @@
+#-------------------------------------------------------------------------
+#
+# Makefile--
+#    Makefile for src/backend/storage/lmgr/libpqgddcheckremote
+#
+# IDENTIFICATION
+#    src/backend/storage/lmgr/libpqgddcheckremote/Makefile
+#
+#-------------------------------------------------------------------------
+
+subdir = src/backend/storage/lmgr/libpqgddcheckremote
+top_builddir = ../../../../..
+include $(top_builddir)/src/Makefile.global
+
+override CPPFLAGS := -I$(srcdir) -I$(libpq_srcdir) $(CPPFLAGS)
+
+OBJS = libpqgddcheckremote.o $(WIN32RES)
+SHLIB_LINK_INTERNAL = $(libpq)
+SHLIB_LINK = $(filter -lintl, $(LIBS))
+SHLIB_PREREQS = submake-libpq
+PGFILEDESC = "libpqgddcheckremote - global deadlock check - trace remote wait-for-graph"
+NAME = libpqgddcheckremote
+
+all: all-shared-lib
+
+include $(top_srcdir)/src/Makefile.shlib
+
+install: all installdirs install-lib
+
+installdirs: installdirs-lib
+
+uninstall: uninstall-lib
+
+clean distclean maintainer-clean: clean-lib
+	rm -f $(OBJS)
