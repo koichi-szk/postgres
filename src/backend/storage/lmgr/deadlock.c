@@ -3413,7 +3413,7 @@ GlobalDeadlockReport_int(void)
 		for (jj = 0; jj < local_wfg->nDeadlockInfo; jj++)
 		{
 			appendStringInfo(&logbuf,
-						    _("Process %d: \"%s\" "),
+						    _("Process %d query: \"%s\" "),
 						    local_wfg->deadlock_info[jj].pid,
 						    local_wfg->backend_activity[jj]);
 		}
