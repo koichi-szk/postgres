@@ -36,6 +36,7 @@ const char *const LockTagTypeNames[] = {
 	"virtualxid",
 	"spectoken",
 	"object",
+	"external",
 	"userlock",
 	"advisory"
 };
