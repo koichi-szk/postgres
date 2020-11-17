@@ -34,6 +34,8 @@ void		_PG_init(void);
 static RETURNED_WFG *pg_gdd_check_remote(const char *connstr, char *wfg);
 static PGconn *gdd_check_connect(const char *connstr);
 
+#define	LIBGDDCHECKREMOTE_DEBUG
+
 void
 _PG_init(void)
 {
@@ -52,11 +54,28 @@ pg_gdd_check_remote(const char *connstr, char *wfg)
 	RETURNED_WFG	*returning_wfg;
 	int			 nTuples;
 	int			 ii;
+#ifdef	LIBGDDCHECKREMOTE_DEBUG
+	pid_t		 remote_pid;
+#endif
 
+	/* Connect to downstream database */
+	conn = gdd_check_connect(connstr);
+
+	/* Get downstream database session pid for further debug */
+#ifdef	LIBGDDCHECKREMOTE_DEBUG
+	res = PQexec(conn, "SELECT pg_backend_pid();");
+	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)
+		elog(ERROR, "Cannot get remote session pid. %s\n",
+					res ? PQresultErrorMessage(res) : "");
+	remote_pid = atoi(PQgetvalue(res, 0, 0));
+	elog(LOG, "Checking downstream WfG, connstr: '%s', remote pid: %d.", connstr, remote_pid);
+	PQclear(res);
+#endif
+
+	/* Check WfG for downstream database */
 	initStringInfo(&query);
 	initStringInfo(&rv);
 	appendStringInfo(&query, "SELECT * FROM pg_global_deadlock_check_from_remote($GDD$%s$GDD$);", wfg);
-	conn = gdd_check_connect(connstr);
 	res = PQexec(conn, query.data);
 	pfree(query.data);
 	query.data = NULL;

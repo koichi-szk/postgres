@@ -49,7 +49,6 @@
 
 #include <unistd.h>
 
-#include "../interfaces/libpq/libpq-fe.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_type_d.h"
 #include "common/controldata_utils.h"
