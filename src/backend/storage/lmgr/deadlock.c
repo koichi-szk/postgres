@@ -840,7 +840,7 @@ FindLockCycleRecurse(PGPROC *checkProc,
 			else
 				return DS_NO_DEADLOCK;
 		}
-		else
+		else if (checkProc->waitLock == NULL)
 			return DS_NO_DEADLOCK;
 	}
 	if (deadlockCheckMode == DLCMODE_LOCAL)
