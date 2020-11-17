@@ -94,25 +94,25 @@ SELECT f1 AS "Ten" FROM TIMETZ_TBL WHERE f1 >= '00:00-07';
 SELECT '23:59:59.999999'::timetz;
        timetz       
 --------------------
- 23:59:59.999999-07
+ 23:59:59.999999-08
 (1 row)
 
 SELECT '23:59:59.9999999'::timetz;  -- rounds up
    timetz    
 -------------
- 24:00:00-07
+ 24:00:00-08
 (1 row)
 
 SELECT '23:59:60'::timetz;  -- rounds up
    timetz    
 -------------
- 24:00:00-07
+ 24:00:00-08
 (1 row)
 
 SELECT '24:00:00'::timetz;  -- allowed
    timetz    
 -------------
- 24:00:00-07
+ 24:00:00-08
 (1 row)
 
 SELECT '24:00:00.01'::timetz;  -- not allowed
