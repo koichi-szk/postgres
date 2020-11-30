@@ -1655,7 +1655,7 @@ BuildLocalWfG(PGPROC *origin, DEADLOCK_INFO_BUP *info)
 	LOCAL_WFG	*local_wfg;
 
 	local_wfg = (LOCAL_WFG *)palloc0(sizeof(LOCAL_WFG));
-	if (deadlockDetails[nDeadlockDetails - 1].locktag.locktag_type == LOCKTAG_EXTERNAL)
+	if (info->deadlock_info[info->nDeadlock_info -1].locktag.locktag_type == LOCKTAG_EXTERNAL)
 		local_wfg->local_wfg_flag |= WfG_HAS_EXTERNAL_LOCK;
 	local_wfg->database_system_identifier = get_database_system_id();
 	if (origin)
@@ -1675,7 +1675,7 @@ BuildLocalWfG(PGPROC *origin, DEADLOCK_INFO_BUP *info)
 	}
 	local_wfg->backend_activity = (char **)palloc0(sizeof(char *) * info->nDeadlock_info);
 	if (local_wfg->local_wfg_flag & WfG_HAS_EXTERNAL_LOCK)
-		local_wfg->external_lock = GetExternalLockProperties(&deadlockDetails[info->nDeadlock_info -1].locktag);
+		local_wfg->external_lock = GetExternalLockProperties(&info->deadlock_info[info->nDeadlock_info -1].locktag);
 	else
 		local_wfg->external_lock = NULL;
 
