@@ -801,6 +801,7 @@ FindLockCycleRecurse(PGPROC *checkProc,
 {
 	dlist_iter	iter;
 	DeadLockState	rv = DS_NO_DEADLOCK;
+	int			i;
 
 	/*
 	 * If this process is a lock group member, check the leader instead. (Note
@@ -853,7 +854,7 @@ FindLockCycleRecurse(PGPROC *checkProc,
 		 * Check if there's local wait-for-graph cycle.  This is done only at
 		 * LOCAL check mode.
 		 */
-#if 1
+#if 0
 		if (visitedProcs[0] == checkProc)
 		{
 			Assert(depth <= MaxBackends);
