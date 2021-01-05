@@ -2333,6 +2333,7 @@ hold_all_lockline(void)
 {
 	int ii;
 
+	LWLockAcquire(LocalDeadLockCheckLock, LW_EXCLUSIVE);
 	for (ii = 0; ii < NUM_LOCK_PARTITIONS; ii++)
 		LWLockAcquire(LockHashPartitionLockByIndex(ii), LW_EXCLUSIVE);
 }
@@ -2345,6 +2346,7 @@ release_all_lockline(void)
 {
 	int	ii;
 
+	LWLockRelease(LocalDeadLockCheckLock);
 	for (ii = 0; ii < NUM_LOCK_PARTITIONS; ii++)
 		LWLockRelease(LockHashPartitionLockByIndex(ii));
 }

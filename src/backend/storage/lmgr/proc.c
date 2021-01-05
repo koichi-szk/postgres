@@ -1790,8 +1790,9 @@ acquire_all_lockline(void)
 {
 	int ii;
 
+	LWLockAcquire(LocalDeadLockCheckLock, LW_EXCLUSIVE);
 	for (ii = 0; ii < NUM_LOCK_PARTITIONS; ii++)
-	LWLockAcquire(LockHashPartitionLockByIndex(ii), LW_EXCLUSIVE);
+		LWLockAcquire(LockHashPartitionLockByIndex(ii), LW_EXCLUSIVE);
 }
 
 static void
@@ -1799,8 +1800,9 @@ release_all_lockline(void)
 {
 	int ii;
 
+	LWLockRelease(LocalDeadLockCheckLock);
 	for (ii = 0; ii < NUM_LOCK_PARTITIONS; ii++)
-	LWLockRelease(LockHashPartitionLockByIndex(ii));
+		LWLockRelease(LockHashPartitionLockByIndex(ii));
 }
 
 
