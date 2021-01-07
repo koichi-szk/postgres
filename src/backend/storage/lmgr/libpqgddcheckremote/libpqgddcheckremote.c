@@ -5,7 +5,7 @@
  *	libapqgddcheckremote.c is an interface function to use libpq from the backend.
  *  This is using similar strategy as in libpqwalreceiver.c
  *
- * Portions Copyright (c) 2020, 2ndQUadrant Ltd.,
+ * Portions Copyright (c) 2020-2021, 2ndQUadrant Ltd.,
  * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
@@ -30,12 +30,16 @@
 
 PG_MODULE_MAGIC;
 
-void		_PG_init(void);
-static RETURNED_WFG *pg_gdd_check_remote(const char *connstr, char *wfg);
-static PGconn *gdd_check_connect(const char *connstr);
+void	_PG_init(void);
+
+static RETURNED_WFG	*pg_gdd_check_remote(const char *connstr, char *wfg);
+static PGconn		*gdd_check_connect(const char *connstr);
 
 #define	LIBGDDCHECKREMOTE_DEBUG
 
+/*
+ * Caller 
+ */
 void
 _PG_init(void)
 {
@@ -44,6 +48,16 @@ _PG_init(void)
 	pg_gdd_check_func = pg_gdd_check_remote;
 }
 
+/*
+ * Check global deadlock status of downstream database.
+ *
+ * Arguments:
+ *	connstr: connection string for libpq to the downstream database,
+ *  wfg: global wait-for-graph discovered so far.
+ *
+ * Return value:
+ *	struct RETURNED_WFG. See global_deadlock.h for details.
+ */
 static RETURNED_WFG *
 pg_gdd_check_remote(const char *connstr, char *wfg)
 {
@@ -61,7 +75,11 @@ pg_gdd_check_remote(const char *connstr, char *wfg)
 	/* Connect to downstream database */
 	conn = gdd_check_connect(connstr);
 
-	/* Get downstream database session pid for further debug */
+	/*
+	 * Get downstream database session pid for further debug
+	 *
+	 * This pid can be used to invoke gdb on global deadlock check backend at downstream database.
+	 */
 #ifdef	LIBGDDCHECKREMOTE_DEBUG
 	res = PQexec(conn, "SELECT pg_backend_pid();");
 	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK)

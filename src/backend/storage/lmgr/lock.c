@@ -19,29 +19,26 @@
  *	  For the most part, this code should be invoked via lmgr.c
  *	  or another lock-management module, not directly.
  *
- * Notes for additional lock type
+ * Notes for EXTERNAL_LOCK lock type
  *
  *	  Added lock type EXTERNAL_LOCK for global deadlock detection.
  *	  This represents remote transaction which the backend is waiting
  *	  for.
  *
- *    Because blocking backend is not in this postgres instance,
- *	  this lock is held by the waiting backend and is waited by the same
- *	  backend.
- *
- *    For this, EXTERNAL_LOCK needs dedicated API to handle.
- *    These API are used by deadlock detection internals and modules
- *	  which issue remote transactions.
- *
- *	  Because EXTERNAL LOCK represents dependency of the backend on
- *    a remote transaction, LOCK is held by the backend and waited
- *	  by the same backend.
+ *    Blocking backend is not in this postgres instance, we don't have
+ *	  any backend in the local database to hold the lock other than
+ *	  waiting backend.   Because of this, this lock is held by the waiting
+ *	  backend and is waited by the same backend.
  *
  *    For this reason, it is not recommended to handle EXTERNAL_LOCK
- *    with existing low leven API.
+ *    with existing low level API and dedicated API is needed.
  *
  *    This lock is used to find the backend is waiting for a remote
  *	  transaction and hence to track global wait-for-graph.
+ *
+ *	  Additional information of remote transaction must associate with
+ *	  EXTERNAL_LOCK.   We don't have good room in the common lock structure
+ *	  and this is stored in $(PGDATA)/external_lock directory.
  *
  *    Deadlock detection mechanism (DeadLockCheck() in deadlock.c)
  *    is used to detect this.   For details, please take a look at
@@ -4662,7 +4659,7 @@ LockWaiterCount(const LOCKTAG *locktag)
 /*
  * ---------------------------------------------------------------------------------
  *
- * Dedicated API for external lock.
+ * Dedicated API for EXTERNAL_LOCK lock type
  *
  * ---------------------------------------------------------------------------------
  */
@@ -4693,6 +4690,22 @@ set_locktag_external(LOCKTAG *locktag, PGPROC *proc, bool incr)
 }
 
 
+/*
+ * Here, we don't assign additional remote transaction information.
+ * Use ExternalLockSetProperties() for this.
+ *
+ * This function acquires lock but does not wait for this lock.
+ *
+ * Typical calling sequence is:
+ *
+ * ExternalLockAcquire() -> ExternalLockSetProperties() -> ExternalLockWaitProc() ->
+ * ExternalLockUnWaitProc() -> ExternalLockRelease().
+ *
+ * Because of 2PL constraint, users of EXTERNAL_LOCK don't have to release the lock.
+ * However, to maintain global wait-for-graph tacking information, the caller should
+ * call ExternalLockUnWaitProc() to indicate that the caller completed remote transaction
+ * and EXTERNAL_LOCK has not been waited by the backend any longer.
+ */
 LockAcquireResult
 ExternalLockAcquire(PGPROC *proc, LOCKTAG *locktag)
 {
@@ -4722,6 +4735,7 @@ ExternalLockRelease(LOCKTAG *locktag)
 {
 	bool rv;
 
+	Assert(locktag && locktag->locktag_type == LOCKTAG_EXTERNAL);
 	rv = LockRelease(locktag, AccessExclusiveLock, false);
 	if (rv != true)
 		return rv;
@@ -4729,9 +4743,13 @@ ExternalLockRelease(LOCKTAG *locktag)
 	return rv;
 }
 
+/*
+ * Indicates that the EXTERNAL_LOCK has not been waited.
+ */
 bool
 ExternalLockUnWaitProc(const LOCKTAG *locktag, PGPROC *proc)
 {
+	Assert(locktag && locktag->locktag_type == LOCKTAG_EXTERNAL);
 	if (!proc->waitLock)
 		return false;
 	if (memcmp(locktag, &(proc->waitLock->tag), sizeof(LOCKTAG)))
@@ -4758,6 +4776,7 @@ checkExternalLockTag(const LOCKTAG *locktag, PGPROC *proc)
 {
 	PGPROC *leader = get_leader_proc(proc);
 
+	Assert(locktag);
 	if ((locktag->locktag_type != LOCKTAG_EXTERNAL) ||
 		(locktag->locktag_lockmethodid != DEFAULT_LOCKMETHOD))
 		return false;
@@ -4895,6 +4914,7 @@ GetExternalLockProperties(const LOCKTAG *locktag)
 	StringInfoData		 linebuf;
 	char				*lockfname;
 
+	Assert(locktag);
 	if (locktag->locktag_type != LOCKTAG_EXTERNAL)
 		return NULL;
 	lockfname = findExternalLockFileName(locktag);
@@ -4935,6 +4955,7 @@ findExternalLockFileName(const LOCKTAG *locktag)
 {
 	StringInfoData	fname;
 
+	Assert(locktag);
 	initStringInfo(&fname);
 	appendStringInfo(&fname, "%s/pg_external_locks/%08x%08x%08x%08x",
 			DataDir, locktag->locktag_field1, locktag->locktag_field2,
@@ -4949,6 +4970,7 @@ findExternalLock(const LOCKTAG *locktag)
 	LOCALLOCKTAG localtag;
 	LOCALLOCK  *locallock;
 
+	Assert(locktag);
 	localtag.lock = *locktag;
 	localtag.mode = AccessExclusiveLock;
 
@@ -4989,6 +5011,7 @@ fmterr:
 void
 FreeExternalLockProperties(ExternalLockInfo *ext_lockinfo)
 {
+	Assert(ext_lockinfo);
 	if (ext_lockinfo->dsn)
 		pfree(ext_lockinfo->dsn);
 	pfree(ext_lockinfo);
@@ -5001,6 +5024,7 @@ externalLockFileUnlinkProc(const LOCKTAG *locktag, PGPROC *proc)
 	char *externalLockFilePath;
 	int	rv;
 
+	Assert(locktag && proc);
 	if (checkExternalLockTag(locktag, proc) == true)
 		return false;
 

@@ -229,7 +229,7 @@ DEADLOCK_INFO_BUP	*deadlock_info_bup_tail;	/* Tail of the queue */
  * Functions for local deadlock detection and and wait-for-graph extraction
  */
 static DeadLockState DeadLockCheckRecurse(PGPROC *proc);
-static int          TestConfiguration(PGPROC *startProc);
+static int           TestConfiguration(PGPROC *startProc);
 static DeadLockState FindLockCycle(PGPROC *checkProc,
 							   EDGE *softEdges, int *nSoftEdges);
 static DeadLockState FindLockCycleRecurse(PGPROC *checkProc, int depth,
@@ -244,7 +244,6 @@ static bool TopoSort(LOCK *lock, EDGE *constraints, int nConstraints,
 
 static LOCAL_WFG *BuildLocalWfG(PGPROC *origin, DEADLOCK_INFO_BUP *info);
 static void hold_all_lockline(void);
-static void release_all_lockline(void);
 static void release_all_lockline(void);
 #ifdef DEBUG_DEADLOCK
 static void PrintLockQueue(LOCK *lock, const char *info);
@@ -847,22 +846,9 @@ FindLockCycleRecurse(PGPROC *checkProc,
 	if (deadlockCheckMode == DLCMODE_LOCAL)
 	{
 		/*
-		 * K.Suzuki: I kept original code not to forget this.   Howver, check is valid only
-		 * when ii == 0.  No other check look necessary.
-		 */
-		/*
 		 * Check if there's local wait-for-graph cycle.  This is done only at
 		 * LOCAL check mode.
 		 */
-#if 0
-		if (visitedProcs[0] == checkProc)
-		{
-			Assert(depth <= MaxBackends);
-
-			nDeadlockDetails = depth;
-			return DS_HARD_DEADLOCK;
-		}
-#else
 		for (i = 0; i < nVisitedProcs; i++)
 		{
 			if (visitedProcs[i] == checkProc)
@@ -887,7 +873,6 @@ FindLockCycleRecurse(PGPROC *checkProc,
 				return DS_NO_DEADLOCK;
 			}
 		}
-#endif
 	}
 	/* Mark proc as seen */
 	Assert(nVisitedProcs < MaxBackends);
@@ -1136,9 +1121,6 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 
 				/* This proc soft-blocks checkProc */
 				state = FindLockCycleRecurse(proc, depth + 1, softEdges, nSoftEdges);
-#if 0
-				if (state == DS_HARD_DEADLOCK || DS_EXTERNAL_LOCK)
-#endif
 				if (state == DS_HARD_DEADLOCK)
 				{
 					/*
@@ -1218,9 +1200,6 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 
 				/* This proc soft-blocks checkProc */
 				state = FindLockCycleRecurse(proc, depth + 1, softEdges, nSoftEdges);
-#if 0
-				if (state == DS_HARD_DEADLOCK || state == DS_EXTERNAL_LOCK)
-#endif
 				if (state == DS_HARD_DEADLOCK)
 				{
 					/*
@@ -1752,7 +1731,7 @@ locktagTypeName(LockTagType type)
 static GLOBAL_WFG *
 addToGlobalWfG(GLOBAL_WFG *global_wfg, LOCAL_WFG *local_wfg)
 {
-	Assert(data);
+	Assert(local_wfg);
 
 	if (global_wfg == NULL)
 	{
@@ -1944,7 +1923,7 @@ returning:
 /*
  ********************************************************************************************
  *
- * K.Suzuki: Global deadlock detection part
+ * K.Suzuki: Global deadlock detection functions
  *
  ********************************************************************************************
  */
@@ -2128,7 +2107,7 @@ returning:
 }
 
 /*
- * Function name
+ * SQL functions
  *
  *	SQL function name: pg_global_deadlock_check_from_remote(IN wfg text, OUT record)
  *
@@ -2204,7 +2183,7 @@ pg_global_deadlock_check_from_remote(PG_FUNCTION_ARGS)
 }
 
 /*
- * Function
+ * SQl Function
  *
  * SQL function name: pg_global_deadlock_check_describe_backend(IN int, OUT record)
  *

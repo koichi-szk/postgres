@@ -1757,10 +1757,18 @@ CheckDeadLock(void)
 	else if (deadlock_state == DS_EXTERNAL_LOCK)
 	{
 		/*
-		 * K.Suzuki: Release LWLocks to wait for remote site deadlock check
+		 * External lock was found.   We need to check downstream database
+		 * for global deadlock.
+		 *
+		 * Now we don't need LWLock any more. Release them and allow all the
+		 * other backend to acquire locks.
 		 */
 		release_all_lockline();
 		deadlock_state = GlobalDeadlockCheck(MyProc);
+		/*
+		 * Now remote deadlock check has been done.  Do the rest of work.
+		 * We need LWLocks again.
+		 */
 		acquire_all_lockline();
 		if (deadlock_state == DS_HARD_DEADLOCK)
 		{
