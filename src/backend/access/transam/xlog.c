@@ -13115,3 +13115,17 @@ XLogRequestWalReceiverReply(void)
 {
 	doRequestWalReceiverReply = true;
 }
+
+/*
+ * Update XLogCtl from outside
+ */
+void
+XLogCtlDataUpdatePtr(XLogRecPtr lastReplayedEndRecPtr, TimeLineID timeline, bool need_lock)
+{
+	if (need_lock)
+		SpinLockAcquire(&XLogCtl->info_lck);
+	XLogCtl->lastReplayedEndRecPtr = lastReplayedEndRecPtr;
+	XLogCtl->lastReplayedTLI = timeline;
+	if (need_lock)
+		SpinLockRelease(&XLogCtl->info_lck);
+}
