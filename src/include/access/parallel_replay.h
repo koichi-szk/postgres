@@ -42,6 +42,7 @@ extern bool PR_test;					/* Option to sync to the debugger */
  */
 
 typedef struct PR_shm		PR_shm;
+typedef struct PR_invalidPages	PR_invalidPages;
 typedef struct PR_history	PR_history;
 typedef struct PR_hist_el	PR_hist_el;
 typedef struct PR_worker	PR_worker;
@@ -56,6 +57,7 @@ typedef struct XLogReaderState_PR	XLogReaderState_PR;
 struct PR_shm
 {
 	PR_worker	*workers;
+	PR_invalidPages	*invalidPages;
 	PR_history	*history;
 	PR_queue	*queue;
 	PR_buffer	*buffer;
@@ -64,6 +66,15 @@ struct PR_shm
 	TimeLineID  MinTimeLineID;	/* Min Timeline ID among workers */
 	XLogRecPtr	*wk_EndRecPtr;
 	TimeLineID	*wk_TimeLineID;
+};
+
+/*
+ * Keep track of invalid pages found in replay.
+ */
+struct PR_invalidPages
+{
+	slock_t	slock;
+	bool	invalidPageFound;
 };
 
 /*
@@ -157,6 +168,27 @@ typedef struct PR_worker
 #define PR_IS_BLK_WORKER_IDX(i)		((i) > PR_TXN_WORKER_IDX)
 
 
+typedef enum PR_invalidPageCheckCmd
+{
+	PR_LOG,
+	PR_FORGET_PAGES,
+	PR_FORGET_DB,
+	PR_CHECK_INVALID_PAGES,
+	MAXVALUE
+} PR_invalidPageCheckCmd;
+
+/*
+ * Invalid page interface data
+ */
+typedef struct XLogInvalidPageData_PR
+{
+	PR_invalidPageCheckCmd	cmd;
+	RelFileNode	node;
+	ForkNumber	forkno;
+	BlockNumber	blkno;
+	bool		present;
+	Oid			dboid;
+} XLogInvalidPageData_PR;
 
 /*
  ************************************************************************************************
@@ -185,18 +217,6 @@ typedef struct XLogDispatchData_PR
 
 extern XLogDispatchData_PR *PR_alloc_XLogDispatchData_PR(void);
 extern void			     	PR_free_XLogDispatchData_PR(XLogDispatchData_PR *dispatch_data);
-
-/*
- ************************************************************************************************
- * 
- * XLog invalid page data
- * 
- ************************************************************************************************
- */
-typedef struct XLogInvalidPageData_PR
-{
-	/* TBD */
-} XLogInvalidPageData_PR;
 
 /*
  ************************************************************************************************

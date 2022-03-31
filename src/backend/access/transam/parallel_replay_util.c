@@ -63,6 +63,7 @@ static dsm_segment	*pr_shm_seg = NULL;
 
 /* The following variables are initialized by PR_initShm() */
 static PR_shm   	*pr_shm = NULL;
+static PR_invalidPages   	*pr_invalidPages = NULL;
 static PR_history	*pr_history = NULL;
 static PR_worker	*pr_worker = NULL;
 static PR_queue		*pr_queue = NULL;
@@ -126,6 +127,8 @@ static Size my_worker_msg_sz = 0;
  ***********************************************************************************************
  */
 
+/* Invalid Page info */
+static void initInvalidPages(void);
 
 /* History info functions */
 INLINE Size history_size(void);
@@ -349,6 +352,7 @@ void
 PR_initShm(void)
 {
 	Size	my_shm_size;
+	Size	my_invalidP_sz;
 	Size	my_history_sz;
 	Size	my_worker_sz;
 	Size	my_queue_sz;
@@ -357,6 +361,7 @@ PR_initShm(void)
 	Assert(my_worker_idx == PR_READER_WORKER);
 
 	my_shm_size = Sizeof(PR_shm)
+		+ (my_invalidP_sz = Sizeof(PR_invalidPages))
 		+ (my_history_sz = history_size())
 		+ (my_worker_sz = worker_size())
 	   	+ (my_queue_sz = queue_size())
@@ -365,7 +370,8 @@ PR_initShm(void)
 	pr_shm_seg = dsm_create(my_shm_size, 0);
 	
 	pr_shm = dsm_segment_address(pr_shm_seg);
-	pr_shm->history = pr_history = addr_forward(pr_shm, Sizeof(pr_shm));
+	pr_shm->invalidPages = pr_invalidPages = addr_forward(pr_shm, Sizeof(pr_shm));
+	pr_shm->history = pr_history = addr_forward(pr_invalidPages, Sizeof(PR_invalidPages));
 	pr_shm->workers = pr_worker = addr_forward(pr_history, my_history_sz);
 	pr_shm->queue = pr_queue = addr_forward(pr_worker, my_worker_sz);
 	pr_shm->buffer = pr_buffer = addr_forward(pr_queue, my_queue_sz);
@@ -375,6 +381,7 @@ PR_initShm(void)
 	SpinLockInit(&pr_shm->slock);
 
 	initHistory();
+	initInvalidPages();
 	initWorker();
 	initQueue();
 	initBuffer();
@@ -389,6 +396,101 @@ PR_finishShm(void)
 		dsm_detach(pr_shm_seg);
 		pr_shm_seg = NULL;
 	}
+}
+
+/*
+ ****************************************************************************
+ *
+ * Invalid Page info functions
+ *
+ ****************************************************************************
+ */
+static void
+initInvalidPages(void)
+{
+	pr_invalidPages->invalidPageFound = false;
+	SpinLockInit(&pr_invalidPages->slock);
+}
+
+void
+PR_log_invalid_page(RelFileNode node, ForkNumber forkno, BlockNumber blkno, bool present)
+{
+	XLogInvalidPageData_PR	*invalidData;
+
+	Assert(PR_isInParallelRecovery());
+
+	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(Sizeof(invalidData), true);
+	invalidData->cmd = PR_LOG;
+	invalidData->node = node;
+	invalidData->forkno = forkno;
+	invalidData->blkno = blkno;
+	invalidData->present = present;
+	invalidData->dboid = InvalidOid;
+
+	PR_enqueue(invalidData, InvalidPageData, PR_INVALID_PAGE_WORKER_IDX);
+}
+
+void
+PR_forget_invalid_pages(RelFileNode node, ForkNumber forkno, BlockNumber minblkno)
+{
+	XLogInvalidPageData_PR	*invalidData;
+
+	Assert(PR_isInParallelRecovery());
+
+	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(Sizeof(invalidData), true);
+	invalidData->cmd = PR_FORGET_PAGES;
+	invalidData->node = node;
+	invalidData->forkno = forkno;
+	invalidData->blkno = minblkno;
+	invalidData->present = false;
+	invalidData->dboid = InvalidOid;
+
+	PR_enqueue(invalidData, InvalidPageData, PR_INVALID_PAGE_WORKER_IDX);
+}
+
+void
+PR_forget_invalid_pages_db(Oid dbid)
+{
+	XLogInvalidPageData_PR	*invalidData;
+
+	Assert(PR_isInParallelRecovery());
+
+	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(Sizeof(invalidData), true);
+	invalidData->cmd = PR_FORGET_DB;
+	invalidData->forkno = 0;
+	invalidData->blkno = 0;
+	invalidData->present = false;
+	invalidData->dboid = dbid;
+
+	PR_enqueue(invalidData, InvalidPageData, PR_INVALID_PAGE_WORKER_IDX);
+}
+
+bool
+PR_XLogHaveInvalidPages(void)
+{
+	bool	rv;
+
+	SpinLockAcquire(&pr_invalidPages->slock);
+	rv = pr_invalidPages->invalidPageFound;
+	SpinLockRelease(&pr_invalidPages->slock);
+	return rv;
+}
+
+void
+PR_XLogCheckInvalidPages(void)
+{
+	XLogInvalidPageData_PR	*invalidData;
+
+	Assert(PR_isInParallelRecovery());
+
+	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(Sizeof(invalidData), true);
+	invalidData->cmd = PR_CHECK_INVALID_PAGES;
+	invalidData->forkno = 0;
+	invalidData->blkno = 0;
+	invalidData->present = false;
+	invalidData->dboid = InvalidOid;
+
+	PR_enqueue(invalidData, InvalidPageData, PR_INVALID_PAGE_WORKER_IDX);
 }
 
 /*
