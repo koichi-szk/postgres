@@ -349,18 +349,25 @@ extern void PR_finishShm(void);
 /*
  * History data function
  */
-extern void		PR_setXLogReplayed(PR_hist_el *el);
-extern bool		PR_addXLogHistory(XLogRecPtr currPtr, XLogRecPtr endPtr, TimeLineID my_timeline);
+extern void	PR_setXLogReplayed(PR_hist_el *el);
+extern bool	PR_addXLogHistory(XLogRecPtr currPtr, XLogRecPtr endPtr, TimeLineID my_timeline);
 
 /* Worker functions */
 
-extern void		 PR_initWorker(PR_worker *worker, int n_worker);
-extern void		 PR_WorkerStartup(void);
-extern void		 PR_WorkerFinish(void);
-extern void 	 ParallelRedoProcessMain(int idx);
-extern void		 PR_setWorker(int worker_idx);
-extern int		 PR_myWorkerIdx(void);
+extern void	PR_initWorker(PR_worker *worker, int n_worker);
+extern void	PR_WorkerStartup(void);
+extern void	PR_WorkerFinish(void);
+extern void	ParallelRedoProcessMain(int idx);
+extern void	PR_setWorker(int worker_idx);
+extern int	PR_myWorkerIdx(void);
 extern PR_worker	*PR_myWorker(void);
+
+/* Invalid Page Worker functions */
+extern void PR_log_invalid_page(RelFileNode node, ForkNumber forkno, BlockNumber blkno, bool present);
+extern void PR_forget_invalid_pages(RelFileNode node, ForkNumber forkno, BlockNumber minblkno);
+extern void PR_forget_invalid_pages_db(Oid dbid);
+extern bool PR_XLogHaveInvalidPages(void);
+extern void PR_XLogCheckInvalidPages(void);
 
 /* Synchronization functions */
 extern void	 PR_syncInitSockDir(void);
@@ -377,19 +384,19 @@ extern void	*PR_expandBuffer(void *buffer, Size newsz, bool need_lock);
 extern void	 PR_freeBuffer(void *buffer, bool need_lock);
 
 /* Queue functions */
-extern void			 PR_queue_init(void);
-extern void			 PR_free_queue_el(PR_queue_el *el);
-extern void			 PR_initQueue(PR_queue *queue, int n_queue, int n_worker);
-extern void			 PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx);
+extern void	PR_queue_init(void);
+extern void	PR_free_queue_el(PR_queue_el *el);
+extern void	PR_initQueue(PR_queue *queue, int n_queue, int n_worker);
+extern void	PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx);
+extern void	freeQueueElement(PR_queue_el *el);
 extern PR_queue_el	*fetchQueue(void);
-extern void			 freeQueueElement(PR_queue_el *el);
 
 /* Dispatch functions */
 extern void  PR_dispatch(XLogDispatchData_PR *data, int worker_idx);
 extern void  PR_dispatch_state(XLogReaderState_PR *state, int worker_idx);
 extern void	 PR_enqueueXLogReaderState(XLogReaderState *state, XLogRecord *record, int worker_idx);
-extern XLogDispatchData_PR *PR_allocXLogDispatchData(void);
-extern XLogDispatchData_PR * PR_analyzeXLogReaderState(XLogReaderState *state, XLogRecord *record);
+extern XLogDispatchData_PR	*PR_allocXLogDispatchData(void);
+extern XLogDispatchData_PR	*PR_analyzeXLogReaderState(XLogReaderState *state, XLogRecord *record);
 
 /* Miscellaneous */
 extern int	PR_myWorkerIdx(void);

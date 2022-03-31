@@ -19,6 +19,7 @@
 
 #include <unistd.h>
 
+#include "access/parallel_replay.h"
 #include "access/timeline.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -59,6 +60,12 @@ typedef struct xl_invalid_page
 
 static HTAB *invalid_page_tab = NULL;
 
+/* Internal functions */
+static void log_invalid_page_int(RelFileNode node, ForkNumber forkno, BlockNumber blkno, bool present);
+static void forget_invalid_pages_int(RelFileNode node, ForkNumber forkno, BlockNumber minblkno);
+static void forget_invalid_pages_db_int(Oid dbid);
+static bool XLogHaveInvalidPages_int(void);
+static void XLogCheckInvalidPages_int(void);
 
 /* Report a reference to an invalid page */
 static void
@@ -76,9 +83,25 @@ report_invalid_page(int elevel, RelFileNode node, ForkNumber forkno,
 	pfree(path);
 }
 
-/* Log a reference to an invalid page */
+void
+PR_log_invalid_page_int(RelFileNode node, ForkNumber forkno, BlockNumber blkno,
+				 bool present)
+{
+	log_invalid_page_int(node, forkno, blkno, present);
+}
 static void
 log_invalid_page(RelFileNode node, ForkNumber forkno, BlockNumber blkno,
+				 bool present)
+{
+	if (PR_isInParallelRecovery())
+		PR_log_invalid_page(node, forkno, blkno, present);
+	else
+		log_invalid_page_int(node, forkno, blkno, present);
+	return;
+}
+/* Log a reference to an invalid page */
+static void
+log_invalid_page_int(RelFileNode node, ForkNumber forkno, BlockNumber blkno,
 				 bool present)
 {
 	xl_invalid_page_key key;
@@ -141,8 +164,23 @@ log_invalid_page(RelFileNode node, ForkNumber forkno, BlockNumber blkno,
 }
 
 /* Forget any invalid pages >= minblkno, because they've been dropped */
+void
+PR_forget_invalid_pages_int(RelFileNode node, ForkNumber forkno, BlockNumber minblkno)
+{
+	return forget_invalid_pages_int(node, forkno, minblkno);
+}
+
 static void
 forget_invalid_pages(RelFileNode node, ForkNumber forkno, BlockNumber minblkno)
+{
+	if (PR_isInParallelRecovery())
+		PR_forget_invalid_pages(node, forkno, minblkno);
+	else
+		forget_invalid_pages_int(node, forkno, minblkno);
+	return;
+}
+static void
+forget_invalid_pages_int(RelFileNode node, ForkNumber forkno, BlockNumber minblkno)
 {
 	HASH_SEQ_STATUS status;
 	xl_invalid_page *hentry;
@@ -176,8 +214,23 @@ forget_invalid_pages(RelFileNode node, ForkNumber forkno, BlockNumber minblkno)
 }
 
 /* Forget any invalid pages in a whole database */
+void
+PR_forget_invalid_pages_db_int(Oid dbid)
+{
+	forget_invalid_pages_db_int(dbid);
+	return;
+}
 static void
 forget_invalid_pages_db(Oid dbid)
+{
+	if (PR_isInParallelRecovery())
+		PR_forget_invalid_pages_db(dbid);
+	else
+		forget_invalid_pages_db_int(dbid);
+	return;
+}
+static void
+forget_invalid_pages_db_int(Oid dbid)
 {
 	HASH_SEQ_STATUS status;
 	xl_invalid_page *hentry;
@@ -212,6 +265,15 @@ forget_invalid_pages_db(Oid dbid)
 bool
 XLogHaveInvalidPages(void)
 {
+	if (PR_isInParallelRecovery())
+		return PR_XLogHaveInvalidPages();
+	else
+		return XLogHaveInvalidPages_int();
+}
+
+static bool
+XLogHaveInvalidPages_int(void)
+{
 	if (invalid_page_tab != NULL &&
 		hash_get_num_entries(invalid_page_tab) > 0)
 		return true;
@@ -219,8 +281,19 @@ XLogHaveInvalidPages(void)
 }
 
 /* Complain about any remaining invalid-page entries */
+
 void
 XLogCheckInvalidPages(void)
+{
+	if (PR_isInParallelRecovery())
+		PR_XLogCheckInvalidPages();
+	else
+		XLogCheckInvalidPages_int();
+	return;
+}
+
+static void
+XLogCheckInvalidPages_int(void)
 {
 	HASH_SEQ_STATUS status;
 	xl_invalid_page *hentry;

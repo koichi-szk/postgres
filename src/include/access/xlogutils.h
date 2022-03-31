@@ -60,4 +60,10 @@ extern void XLogReadDetermineTimeline(XLogReaderState *state,
 
 extern void WALReadRaiseError(WALReadError *errinfo);
 
+/* Parallel replay */
+
+extern void PR_log_invalid_page_int(RelFileNode node, ForkNumber forkno, BlockNumber blkno, bool present);
+extern void PR_forget_invalid_pages_int(RelFileNode node, ForkNumber forkno, BlockNumber minblkno);
+extern void PR_forget_invalid_pages_db_int(Oid dbid);
+
 #endif
