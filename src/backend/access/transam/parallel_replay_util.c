@@ -166,7 +166,7 @@ static int fold_int2int8(int val);
  */
 bool PR_isInParallelRecovery(void)
 {
-	return(parallel_replay && pr_shm);
+	return(InRecovery && pr_shm);
 }
 
 /*
