@@ -183,7 +183,7 @@ struct XLogReaderState
 	 * should not be accessed directly.
 	 * ----------------------------------------
 	 */
-	XLogRecord *record; 		/* used in parallel replay */
+	XLogRecord *record; 		/* XLog record used in parallel replay */
 	XLogRecord *decoded_record; /* currently decoded record */
 
 	char	   *main_data;		/* record's main data portion */
