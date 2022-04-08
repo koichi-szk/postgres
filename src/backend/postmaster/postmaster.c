@@ -433,7 +433,6 @@ static int	CountChildren(int target);
 static bool assign_backendlist_entry(RegisteredBgWorker *rw);
 static void maybe_start_bgworkers(void);
 static bool CreateOptsFile(int argc, char *argv[], char *fullprogname);
-static pid_t StartChildProcess(AuxProcType type);
 static void StartAutovacuumWorker(void);
 static void MaybeStartWalReceiver(void);
 static void InitPostmasterDeathWatchHandle(void);
@@ -551,12 +550,14 @@ static void ShmemBackendArrayAdd(Backend *bn);
 static void ShmemBackendArrayRemove(Backend *bn);
 #endif							/* EXEC_BACKEND */
 
-#define StartupDataBase()		StartChildProcess(StartupProcess)
-#define StartArchiver()			StartChildProcess(ArchiverProcess)
-#define StartBackgroundWriter() StartChildProcess(BgWriterProcess)
-#define StartCheckpointer()		StartChildProcess(CheckpointerProcess)
-#define StartWalWriter()		StartChildProcess(WalWriterProcess)
-#define StartWalReceiver()		StartChildProcess(WalReceiverProcess)
+#define StartupDataBase()		StartChildProcess(StartupProcess, -1)
+#define StartArchiver()			StartChildProcess(ArchiverProcess, -1)
+#define StartBackgroundWriter() StartChildProcess(BgWriterProcess, -1)
+#define StartCheckpointer()		StartChildProcess(CheckpointerProcess, -1)
+#define StartWalWriter()		StartChildProcess(WalWriterProcess, -1)
+#define StartWalReceiver()		StartChildProcess(WalReceiverProcess, -1)
+
+#define StartRarallelRedo(idx)	StartChildProcess(ParallelRedoProcess, (idx))
 
 /* Macros to check exit status of a child process */
 #define EXIT_STATUS_0(st)  ((st) == 0)
@@ -5437,8 +5438,8 @@ CountChildren(int target)
  * Return value of StartChildProcess is subprocess' PID, or 0 if failed
  * to start subprocess.
  */
-static pid_t
-StartChildProcess(AuxProcType type)
+pid_t
+StartChildProcess(AuxProcType type, int idx)
 {
 	pid_t		pid;
 	char	   *av[10];
@@ -5455,7 +5456,10 @@ StartChildProcess(AuxProcType type)
 	av[ac++] = NULL;			/* filled in by postmaster_forkexec */
 #endif
 
-	snprintf(typebuf, sizeof(typebuf), "-x%d", type);
+	if (idx < 0)
+		snprintf(typebuf, sizeof(typebuf), "-x%d", type);
+	else
+		snprintf(typebuf, sizeof(typebuf), "-x%d -I%d", type, idx);
 	av[ac++] = typebuf;
 
 	av[ac] = NULL;
@@ -5513,6 +5517,10 @@ StartChildProcess(AuxProcType type)
 			case WalReceiverProcess:
 				ereport(LOG,
 						(errmsg("could not fork WAL receiver process: %m")));
+				break;
+			case ParallelRedoProcess:
+				ereport(LOG,
+						(errmsg("could not fork parallel redo process: %m")));
 				break;
 			default:
 				ereport(LOG,

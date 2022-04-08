@@ -20,6 +20,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/parallel_replay.h"
 #include "access/tableam.h"
 #include "access/toast_compression.h"
 #include "access/xact.h"
@@ -69,6 +70,7 @@ static void cleanup(void);
  */
 
 AuxProcType MyAuxProcType = NotAnAuxProcess;	/* declared in miscadmin.h */
+int			MyAuxProcIdx = -1;	/* declared in miscadmin.h */
 
 Relation	boot_reldesc;		/* current relation descriptor */
 
@@ -225,7 +227,7 @@ AuxiliaryProcessMain(int argc, char *argv[])
 	/* If no -x argument, we are a CheckerProcess */
 	MyAuxProcType = CheckerProcess;
 
-	while ((flag = getopt(argc, argv, "B:c:d:D:Fkr:x:X:-:")) != -1)
+	while ((flag = getopt(argc, argv, "B:c:d:D:Fkr:x:X:I:-:")) != -1)
 	{
 		switch (flag)
 		{
@@ -271,6 +273,9 @@ AuxiliaryProcessMain(int argc, char *argv[])
 					SetConfigOption("wal_segment_size", optarg, PGC_INTERNAL,
 									PGC_S_OVERRIDE);
 				}
+				break;
+			case 'I':
+				MyAuxProcIdx = atoi(optarg);
 				break;
 			case 'c':
 			case '-':
@@ -332,6 +337,9 @@ AuxiliaryProcessMain(int argc, char *argv[])
 			break;
 		case WalReceiverProcess:
 			MyBackendType = B_WAL_RECEIVER;
+			break;
+		case ParallelRedoProcess:
+			MyBackendType = B_PARALLEL_REPLAY;
 			break;
 		default:
 			MyBackendType = B_INVALID;
@@ -467,6 +475,10 @@ AuxiliaryProcessMain(int argc, char *argv[])
 		case WalReceiverProcess:
 			WalReceiverMain();
 			proc_exit(1);
+
+		case ParallelRedoProcess:
+			ParallelRedoProcessMain(MyAuxProcIdx);
+			proc_exit(1);		/* should never return */
 
 		default:
 			elog(PANIC, "unrecognized process type: %d", (int) MyAuxProcType);

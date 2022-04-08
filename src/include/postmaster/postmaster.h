@@ -54,6 +54,7 @@ extern void InitProcessGlobals(void);
 extern int	MaxLivePostmasterChildren(void);
 
 extern bool PostmasterMarkPIDForWorkerNotify(int);
+extern pid_t StartChildProcess(AuxProcType type, int proc_idx);
 
 #ifdef EXEC_BACKEND
 extern pid_t postmaster_forkexec(int argc, char *argv[]);
