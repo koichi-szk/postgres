@@ -175,6 +175,11 @@ struct XLogReaderState
 	XLogRecPtr	ReadRecPtr;		/* start of last record read */
 	XLogRecPtr	EndRecPtr;		/* end+1 of last record read */
 
+	/*
+	 * Timeline ID for this state
+	 */
+	TimeLineID	timeline;
+
 
 	/* ----------------------------------------
 	 * Decoded representation of current record

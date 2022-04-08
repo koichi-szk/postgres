@@ -392,7 +392,7 @@ static XLogRecPtr RedoRecPtr;
 static bool doPageWrites;
 
 /* Has the recovery code requested a walreceiver wakeup? */
-static bool doRequestWalReceiverReply;
+bool doRequestWalReceiverReply;		/* parallel_replay.c need to see this */
 
 /*
  * RedoStartLSN points to the checkpoint's REDO location which is specified
@@ -984,7 +984,6 @@ static char *GetXLogBuffer(XLogRecPtr ptr);
 static XLogRecPtr XLogBytePosToRecPtr(uint64 bytepos);
 static XLogRecPtr XLogBytePosToEndRecPtr(uint64 bytepos);
 static uint64 XLogRecPtrToBytePos(XLogRecPtr ptr);
-static void checkXLogConsistency(XLogReaderState *record);
 
 static void WALInsertLockAcquire(void);
 static void WALInsertLockAcquireExclusive(void);
@@ -1422,7 +1421,7 @@ ReserveXLogSwitch(XLogRecPtr *StartPos, XLogRecPtr *EndPos, XLogRecPtr *PrevPtr)
  * function should be called once WAL replay has been completed for a
  * given record.
  */
-static void
+void
 checkXLogConsistency(XLogReaderState *record)
 {
 	RmgrId		rmid = XLogRecGetRmid(record);

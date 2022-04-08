@@ -167,7 +167,8 @@ log_invalid_page_int(RelFileNode node, ForkNumber forkno, BlockNumber blkno,
 void
 PR_forget_invalid_pages_int(RelFileNode node, ForkNumber forkno, BlockNumber minblkno)
 {
-	return forget_invalid_pages_int(node, forkno, minblkno);
+	forget_invalid_pages_int(node, forkno, minblkno);
+	return;
 }
 
 static void
@@ -263,6 +264,12 @@ forget_invalid_pages_db_int(Oid dbid)
 
 /* Are there any unresolved references to invalid pages? */
 bool
+PR_XLogHaveInvalidPages_int(void)
+{
+	return XLogHaveInvalidPages_int();
+}
+
+bool
 XLogHaveInvalidPages(void)
 {
 	if (PR_isInParallelRecovery())
@@ -281,6 +288,12 @@ XLogHaveInvalidPages_int(void)
 }
 
 /* Complain about any remaining invalid-page entries */
+
+void
+PR_XLogCheckInvalidPages_int(void)
+{
+	XLogCheckInvalidPages_int();
+}
 
 void
 XLogCheckInvalidPages(void)

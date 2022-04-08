@@ -18,7 +18,7 @@ OBJS = \
 	generic_xlog.o \
 	multixact.o \
 	parallel.o \
-	parallel_replay_util.o \
+	parallel_replay.o \
 	rmgr.o \
 	slru.o \
 	subtrans.o \

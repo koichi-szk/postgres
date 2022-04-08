@@ -27,6 +27,7 @@ extern bool	parallel_replay;
 extern int	num_preplay_workers;		/* Number of workers, must be >=2 and one of them
 									 	 * is for common resources, including TXN */
 extern int	num_preplay_worker_queue;	/* Total queue size */
+extern int	num_preplay_max_txn;		/* If less than max_connections, max_connections will be taken */
 extern int	PR_buf_size_mb;				/* Buffer size in MB (2^^10)  */
 extern bool PR_test;					/* Option to sync to the debugger */
 
@@ -53,10 +54,16 @@ typedef struct PR_queue_el	PR_queue_el;
 typedef struct PR_RecChunk	PR_RecChunk;
 typedef struct XLogReaderState_PR	XLogReaderState_PR;
 
+typedef struct txn_wal_info_PR	txn_wal_info_PR;
+typedef struct txn_hash_el_PR	txn_hash_el_PR;
+typedef struct txn_cell_PR		txn_cell_PR;
+typedef struct txn_cell_pool_PR	txn_cell_pool_PR;
+typedef struct XLogDispatchData_PR XLogDispatchData_PR;
 
 struct PR_shm
 {
 	PR_worker	*workers;
+	txn_wal_info_PR	*txn_wal_info;
 	PR_invalidPages	*invalidPages;
 	PR_history	*history;
 	PR_queue	*queue;
@@ -168,6 +175,56 @@ typedef struct PR_worker
 #define PR_IS_BLK_WORKER_IDX(i)		((i) > PR_TXN_WORKER_IDX)
 
 
+/*
+ ************************************************************************************************
+ *
+ * Structure to keep track of XLogRecord for each transaction.   Needed to synchronize
+ * replay for speciic transaction.
+ *
+ ************************************************************************************************
+ */
+
+
+struct txn_wal_info_PR
+{
+	txn_hash_el_PR		*txn_hash;		/* Hash */
+	txn_cell_pool_PR	*cell_pool;		/* Cell pool */
+};
+
+/*
+ * Transaction hash entry.
+ */
+struct txn_hash_el_PR
+{
+	slock_t		 slock;
+	txn_cell_PR	*head;
+	txn_cell_PR	*tail;
+};
+
+/*
+ * Entry for each transaction
+ */
+struct txn_cell_PR
+{
+	TransactionId		 xid;
+	txn_cell_PR			*next;
+	XLogDispatchData_PR *head;
+	XLogDispatchData_PR *tail;
+};
+
+struct txn_cell_pool_PR
+{
+	slock_t		 slock;
+	txn_cell_PR	*next;
+};
+
+/*
+ ************************************************************************************************
+ *
+ * Invalid page registration
+ *
+ ************************************************************************************************
+ */
 typedef enum PR_invalidPageCheckCmd
 {
 	PR_LOG,
@@ -199,19 +256,22 @@ typedef struct XLogInvalidPageData_PR
  *
  ************************************************************************************************
  */
-typedef struct XLogDispatchData_PR
+struct XLogDispatchData_PR
 {
 	slock_t	 	 slock;
-	bool	 	 registered;		/* Indicates that TXN worker registered this info */
-	PR_hist_el	*history_el;
-	XLogRecPtr	 recPtr;
+	XLogReaderState	*reader;		/* Allocated in the separated buffer area */
+	PR_hist_el	*history_el;		/* PTR to history data */
+	XLogDispatchData_PR	*next;		/* Chain in txh_cell_PR */
+	XLogDispatchData_PR	*prev;		/* Chain in txh_cell_PR */
 	TransactionId	xid;
+	bool	 	 txn_waiting;		/* Indicates that TXN worker is waiting for this dispatch to be done */
+	bool	 	 txn_registered;	/* Indicates that TXN worker registered this dispatch */
+	bool		 done;				/* Indicates that this dispatch has been replayed */
 	int		 	 n_remaining;		/* If this becomes zero, then this worker should replay */
 	int		 	 n_involved;		/* Total number of BLK workers assigned */
 	int			*worker_list;		/* Allocated as a part of this struct */
 	bool		*worker_array;		/* Allocated as a part of this struct */
-	XLogReaderState	*state;		/* Allocated in the separated buffer area */
-} XLogDispatchData_PR;
+};
 
 /* Dispatch Data Functions */
 
@@ -266,7 +326,9 @@ struct PR_queue
 	PR_queue_el	*element;
 };
 
-#define PR_queue_sz		(PR_queue_el_sz + Sizeof(PR_queue)
+#define PR_queue_sz		(PR_queue_el_sz + (Sizeof(PR_queue) * num_preplay_worker_queue))
+
+
 
 
 /*
@@ -369,8 +431,8 @@ extern void PR_finishShm(void);
 /*
  * History data function
  */
-extern void	PR_setXLogReplayed(PR_hist_el *el);
-extern bool	PR_addXLogHistory(XLogRecPtr currPtr, XLogRecPtr endPtr, TimeLineID my_timeline);
+extern void PR_setXLogReplayed(PR_hist_el *el);
+extern PR_hist_el *PR_addXLogHistory(XLogRecPtr currPtr, XLogRecPtr endPtr, TimeLineID my_timeline);
 
 /* Worker functions */
 
@@ -405,11 +467,10 @@ extern void	 PR_freeBuffer(void *buffer, bool need_lock);
 
 /* Queue functions */
 extern void	PR_queue_init(void);
-extern void	PR_free_queue_el(PR_queue_el *el);
 extern void	PR_initQueue(PR_queue *queue, int n_queue, int n_worker);
 extern void	PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx);
-extern void	freeQueueElement(PR_queue_el *el);
-extern PR_queue_el	*fetchQueue(void);
+extern void	PR_freeQueueElement(PR_queue_el *el);
+extern PR_queue_el	*PR_fetchQueue(void);
 
 /* Dispatch functions */
 extern void  PR_dispatch(XLogDispatchData_PR *data, int worker_idx);
