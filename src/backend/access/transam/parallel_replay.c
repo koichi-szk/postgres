@@ -77,9 +77,9 @@ static dsm_segment	*pr_shm_seg = NULL;
 
 /* The following variables are initialized by PR_initShm() */
 static PR_shm   	*pr_shm = NULL;
-static txn_wal_info_PR	*pr_txn_wal_info;
-static txn_hash_el_PR	*pr_txn_hash;
-static txn_cell_pool_PR	*pr_txn_cell_pool;
+static txn_wal_info_PR	*pr_txn_wal_info = NULL;
+static txn_hash_el_PR	*pr_txn_hash = NULL;
+static txn_cell_pool_PR	*pr_txn_cell_pool = NULL;
 static PR_invalidPages   	*pr_invalidPages = NULL;
 static PR_history	*pr_history = NULL;
 static PR_worker	*pr_worker = NULL;
@@ -179,7 +179,7 @@ static void			*expandBuffer_new(void *buffer, Size newsz, bool need_lock);
  * Transaction WAL info function
  */
 static Size pr_txn_hash_size(void);
-static void init_txn_hash(txn_wal_info_PR *txn_wal_info);
+static void init_txn_hash(void);
 static txn_cell_PR *get_txn_cell(bool need_lock);
 static void return_txn_cell(txn_cell_PR *txn_cell, bool need_lock);
 static txn_cell_PR *find_txn_cell(TransactionId xid, bool create, bool need_lock);
@@ -385,6 +385,7 @@ void
 PR_initShm(void)
 {
 	Size	my_shm_size;
+	Size	my_txn_hash_sz;
 	Size	my_invalidP_sz;
 	Size	my_history_sz;
 	Size	my_worker_sz;
@@ -394,6 +395,7 @@ PR_initShm(void)
 	Assert(my_worker_idx == PR_READER_WORKER);
 
 	my_shm_size = Sizeof(PR_shm)
+		+ (my_txn_hash_sz = pr_txn_hash_size())
 		+ (my_invalidP_sz = Sizeof(PR_invalidPages))
 		+ (my_history_sz = history_size())
 		+ (my_worker_sz = worker_size())
@@ -403,7 +405,8 @@ PR_initShm(void)
 	pr_shm_seg = dsm_create(my_shm_size, 0);
 	
 	pr_shm = dsm_segment_address(pr_shm_seg);
-	pr_shm->invalidPages = pr_invalidPages = addr_forward(pr_shm, Sizeof(pr_shm));
+	pr_shm->txn_wal_info = pr_txn_wal_info = addr_forward(pr_shm, Sizeof(pr_shm));
+	pr_shm->invalidPages = pr_invalidPages = addr_forward(pr_txn_wal_info, my_txn_hash_sz);
 	pr_shm->history = pr_history = addr_forward(pr_invalidPages, Sizeof(PR_invalidPages));
 	pr_shm->workers = pr_worker = addr_forward(pr_history, my_history_sz);
 	pr_shm->queue = pr_queue = addr_forward(pr_worker, my_worker_sz);
@@ -413,6 +416,7 @@ PR_initShm(void)
 
 	SpinLockInit(&pr_shm->slock);
 
+	init_txn_hash();
 	initHistory();
 	initInvalidPages();
 	initWorker();
@@ -429,6 +433,15 @@ PR_finishShm(void)
 		dsm_detach(pr_shm_seg);
 		pr_shm_seg = NULL;
 	}
+	pr_shm = NULL;
+	pr_txn_wal_info = NULL;
+	pr_txn_hash = NULL;
+	pr_txn_cell_pool = NULL;
+	pr_invalidPages = NULL;
+	pr_history = NULL;
+	pr_worker = NULL;
+	pr_queue = NULL;
+	pr_buffer = NULL;
 }
 
 /*
@@ -452,22 +465,22 @@ pr_txn_hash_size(void)
 }
 
 static void
-init_txn_hash(txn_wal_info_PR *txn_wal_info)
+init_txn_hash(void)
 {
 	int	ii;
 	txn_cell_PR		*cell_pool;
 	txn_hash_el_PR	*txn_hash;
 
 
-	pr_shm->txn_wal_info = pr_txn_wal_info = txn_wal_info;
-	txn_wal_info->txn_hash = addr_forward(txn_wal_info, Sizeof(txn_wal_info_PR));
-	txn_wal_info->cell_pool = addr_forward(txn_wal_info->txn_hash, Sizeof(txn_hash_el_PR) * txn_hash_size);
-	for (ii = 0, txn_hash = txn_wal_info->txn_hash; ii < txn_hash_size; ii++)
+	pr_txn_wal_info = pr_shm->txn_wal_info;
+	pr_txn_wal_info->txn_hash = pr_txn_hash = addr_forward(pr_txn_wal_info, Sizeof(txn_wal_info_PR));
+	pr_txn_wal_info->cell_pool = pr_txn_cell_pool = addr_forward(pr_txn_wal_info->txn_hash, Sizeof(txn_hash_el_PR) * txn_hash_size);
+	for (ii = 0, txn_hash = pr_txn_wal_info->txn_hash; ii < txn_hash_size; ii++)
 	{
 		SpinLockInit(&txn_hash[ii].slock);
 		txn_hash[ii].head = txn_hash[ii].tail = NULL;
 	}
-	for (ii = 0, cell_pool = txn_wal_info->cell_pool->next; ii < num_preplay_max_txn; ii++)
+	for (ii = 0, cell_pool = pr_txn_wal_info->cell_pool->next; ii < num_preplay_max_txn; ii++)
 	{
 		cell_pool[ii].next = &cell_pool[ii+1];
 		cell_pool[ii].xid = InvalidTransactionId;
