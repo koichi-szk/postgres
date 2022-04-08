@@ -443,6 +443,7 @@ extern void	ParallelRedoProcessMain(int idx);
 extern void	PR_setWorker(int worker_idx);
 extern int	PR_myWorkerIdx(void);
 extern PR_worker	*PR_myWorker(void);
+extern void PR_WaitDispatcherQueueHandling(void);
 
 /* Invalid Page Worker functions */
 extern void PR_log_invalid_page(RelFileNode node, ForkNumber forkno, BlockNumber blkno, bool present);
