@@ -557,7 +557,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartWalWriter()		StartChildProcess(WalWriterProcess, -1)
 #define StartWalReceiver()		StartChildProcess(WalReceiverProcess, -1)
 
-#define StartRarallelRedo(idx)	StartChildProcess(ParallelRedoProcess, (idx))
+#define StartParallelRedo(idx)	StartChildProcess(ParallelRedoProcess, (idx))
 
 /* Macros to check exit status of a child process */
 #define EXIT_STATUS_0(st)  ((st) == 0)

@@ -19,6 +19,7 @@
 
 #include <unistd.h>
 
+#include "access/parallel_replay.h"
 #include "access/transam.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -249,7 +250,7 @@ XLogBeginRead(XLogReaderState *state, XLogRecPtr RecPtr)
 }
 
 /*
- * Attempt to read an XLOG record.
+* Attempt to read an XLOG record.
  *
  * XLogBeginRead() or XLogFindNextRecord() must be called before the first call
  * to XLogReadRecord().
@@ -566,6 +567,20 @@ restart:
 		state->EndRecPtr -= XLogSegmentOffset(state->EndRecPtr, state->segcxt.ws_segsize);
 	}
 
+	if (PR_isInParallelRecovery())
+	{
+		XLogRecord *record_old;
+		uint32	tot_len;
+
+		/*
+		 * Koichi:
+		 *		In the case of parallel recovery, we need to copy XLogRecord to shared memory buffer
+		 */
+		record_old = record;
+		tot_len = record_old->xl_tot_len;
+		record = (XLogRecord *)PR_allocBuffer(tot_len, true);
+		memcpy(record, record_old, tot_len);
+	}
 	if (DecodeXLogRecord(state, record, errormsg))
 		return record;
 	else

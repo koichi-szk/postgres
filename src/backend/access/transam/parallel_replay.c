@@ -191,8 +191,11 @@ static bool removeTxnCell(txn_cell_PR *txn_cell);
 static int blockHash(int spc, int db, int rel, int blk, int n_max);
 static int fold_int2int8(int val);
 
-/* Invalid Page Worker functions */
+/* Workerr Loop */
+static void dispatcherWorkerLoop(void);
+static void txnWorkerLoop(void);
 static void invalidPageWorkerLoop(void);
+static void blockWorkerLoop(void);
 
 
 /*
@@ -445,6 +448,8 @@ PR_finishShm(void)
 }
 
 /*
+ ****************************************************************************
+ *
  * LSN for each transaction: transaction worker need to synchronize block workers
  * before applying commit/abort WAL record 
  *
@@ -940,7 +945,6 @@ initWorker(void)
 		worker->finishedLSN = 0;
 		worker->waitLSN = 0;
 		worker->wait_dispatch = false;
-		worker->ready = false;
 		worker->flags = 0;
 		worker->head = NULL;
 		worker->tail = NULL;
@@ -948,6 +952,89 @@ initWorker(void)
 	}
 }
 
+/*
+ * Startup all the workers
+ */
+
+static void
+atStartWorker(int idx)
+{
+	int	ii;
+
+	my_worker_idx = idx;
+	my_worker = &pr_shm->workers[idx];
+	PR_syncInit();
+
+	if (idx == PR_READER_WORKER_IDX)
+		return;
+	SpinLockAcquire(&my_worker->slock);
+	my_worker->wait_dispatch = true;
+	my_worker->flags = 0;
+	SpinLockRelease(&my_worker->slock);
+
+	/* Tell the READER worker that I'm ready */
+
+	if (my_worker_idx != PR_READER_WORKER_IDX)
+		PR_sendSync(PR_READER_WORKER_IDX);
+}
+
+/*
+ * Should be called by READER WORKERR
+ */
+void
+PR_WorkerStartup(void)
+{
+	int	ii;
+	int	rv;
+	pid_t	pid;
+
+	atStartWorker(PR_READER_WORKER_IDX);
+
+	for (ii = 1; ii < num_preplay_workers; ii++)
+	{
+		pid_t = StartChildProcess(ParallelRedoProcess, ii);
+		if (pid_t > 0)
+		{
+			rv = PR_recvSync();
+			if (rv != ii)
+				elog(PANIC, "Invalid initial redo sequence.");
+			elsle
+				elog(LOG, "Parallel Redo Process (%d) start.", ii);
+		}
+		else if (pid_t == 0)
+		{
+			/* Should not return here */
+			elog(PANIC, "Internal error.  Should not come here.");
+			exit(1);
+		}
+	}
+}
+
+/*
+ * Main entry to Parallel Replay worker process
+ *
+ * Call chain is as follows:
+ * PR_WorkerStartup() (parallel_replay.c)
+ * -> StartChildProcess() (postmaster.c)
+ * -> AuxiliaryProcessMain() (bootstrap.c)
+ * -> ParallelRedoProcessMaiin(idx) (parallel_replay.c)
+ */
+void ParallelRedoProcessMain(int idx)
+{
+	/* The worker does not return */
+	Assert(idx > PR_READER_WORKER_IDX);
+
+	if (idx == PR_DISPATCHER_WORKER_IDX)
+		dispatcherWorkerLoop();
+	else if (idx == PR_TXN_WORKER_IDX)
+		txnWorkerLoop();
+	else if (idx == PR_INVALID_PAGE_WORKER_IDX)
+		invalidPageWorkerLoop();
+	else if (PR_IS_BLK_WORKER_IDX(idx))
+		blockWorkerLoop(idx);
+	else
+		elog(PANIC, "Internal error. Invalid Parallel Redo worker index: %d", idx);
+}
 /*
  ****************************************************************************
  *

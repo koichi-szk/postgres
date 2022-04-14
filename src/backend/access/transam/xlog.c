@@ -7344,6 +7344,18 @@ StartupXLOG(void)
 		CheckRecoveryConsistency();
 
 		/*
+		 * Koichi: Start parallel worker here.
+		 */
+		if (parallel_replay)
+		{
+			ereport(LOG,
+					(errmsg("redo in parallel.   Number of worker: %d",
+							num_preplay_workers)));
+			PR_initShm();
+			PR_WorkerStartup();
+		}
+
+		/*
 		 * Find the first record that logically follows the checkpoint --- it
 		 * might physically precede it, though.
 		 */
@@ -7374,16 +7386,6 @@ StartupXLOG(void)
 					(errmsg("redo starts at %X/%X",
 							LSN_FORMAT_ARGS(ReadRecPtr))));
 			
-			/*
-			 * Koichi: Start parallel worker here.
-			 */
-			if (parallel_replay)
-			{
-				ereport(LOG,
-						(errmsg("redo in parallel.   Number of worker: %d",
-								num_preplay_workers)));
-				PR_WorkerStartup();
-			}
 
 			/*
 			 * main redo apply loop
@@ -7406,16 +7408,6 @@ StartupXLOG(void)
 				 * There may be better way to minimize simple copy all
 				 * the records.
 				 */
-				if (PR_isInParallelRecovery())
-				{
-					XLogRecord	*wk_record;
-					uint32		 tot_len;
-
-					wk_record = record;
-					tot_len = record->xl_tot_len;
-					record = (XLogRecord *)PR_allocBuffer(tot_len, true);
-					memcpy(record, wk_record, tot_len);
-				}
 #ifdef WAL_DEBUG
 				if (XLOG_DEBUG ||
 					(rmid == RM_XACT_ID && trace_recovery_messages <= DEBUG2) ||
@@ -7618,6 +7610,7 @@ StartupXLOG(void)
 				if (switchedTLI)
 				{
 					if (PR_isInParallelRecovery())
+						/* Wait worker process to handle all the assigned XLogRecord */
 						PR_WaitDispatcherQueueHandling();
 					/*
 					 * Before we continue on the new timeline, clean up any
@@ -7718,6 +7711,16 @@ StartupXLOG(void)
 		}
 		else
 		{
+			if (PR_isInParallelRecovery())
+			{
+				PR_WorkerFinish();
+				PR_finishShm();
+				/*
+				 * We need to call this here to check all the outstanding WAL
+				 * replay not found in the previous call.
+				 */
+				CheckRecoveryConsistency();
+			}
 			/* there are no WAL records following the checkpoint */
 			ereport(LOG,
 					(errmsg("redo is not required")));

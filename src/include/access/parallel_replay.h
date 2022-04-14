@@ -133,7 +133,6 @@ typedef struct PR_worker
 	XLogRecPtr 	waitLSN;		/* TXN worker is waiting for this LSN to finish */
 	bool	 	wait_dispatch;	/* Flag to indicate the worker is waiting for xlogrec to handle */
 								/* Dispatcher check this and sync. */
-	bool	 	ready;			/* Readyness of the worker */
 	unsigned	flags;			/* Indicates instructions from outside */
 	PR_queue_el	*head;			/* Dispatched queue head.   Pick queue element from here. */
 	PR_queue_el	*tail;			/* Dispatched queue tail.   Append queue element after this. */
@@ -170,9 +169,9 @@ typedef struct PR_worker
 #define	PR_READER_WORKER_IDX		0
 #define PR_DISPATCHER_WORKER_IDX	1
 #define PR_TXN_WORKER_IDX			2
-#define PR_INVALID_PAGE_WORKER_IDX	2
+#define PR_INVALID_PAGE_WORKER_IDX	3
 #define PR_BLK_WORKER_MIN_IDX		4
-#define PR_IS_BLK_WORKER_IDX(i)		((i) > PR_TXN_WORKER_IDX)
+#define PR_IS_BLK_WORKER_IDX(i)		((i) >= PR_BLK_WORKER_MIN_IDX)
 
 
 /*
