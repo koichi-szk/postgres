@@ -270,6 +270,7 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 {
 	XLogRecPtr	RecPtr;
 	XLogRecord *record;
+	XLogRecord *record_old;
 	XLogRecPtr	targetPagePtr;
 	bool		randAccess;
 	uint32		len,
@@ -569,9 +570,7 @@ restart:
 
 	if (PR_isInParallelRecovery())
 	{
-		XLogRecord *record_old;
-		uint32	tot_len;
-
+		uint32		 tot_len;
 		/*
 		 * Koichi:
 		 *		In the case of parallel recovery, we need to copy XLogRecord to shared memory buffer
@@ -580,11 +579,26 @@ restart:
 		tot_len = record_old->xl_tot_len;
 		record = (XLogRecord *)PR_allocBuffer(tot_len, true);
 		memcpy(record, record_old, tot_len);
+		state->record = record;
 	}
 	if (DecodeXLogRecord(state, record, errormsg))
 		return record;
 	else
+	{
+		if (PR_isInParallelRecovery())
+		{
+			/*
+			 * Koichi:
+			 *	We leave another status in the reader state as is.
+			 *	Such info will not be used before set again by
+			 *	subsequent call.
+			 */
+			PR_freeBuffer(record, true);
+			state->record = NULL;
+			state->decoded_record = NULL;
+		}
 		return NULL;
+	}
 
 err:
 	if (assembled)
