@@ -44,8 +44,8 @@ extern bool PR_test;					/* Option to sync to the debugger */
 
 typedef struct PR_shm		PR_shm;
 typedef struct PR_invalidPages	PR_invalidPages;
-typedef struct PR_history	PR_history;
-typedef struct PR_hist_el	PR_hist_el;
+typedef struct PR_XLogHistory		PR_XLogHistory;
+typedef struct PR_XLogHistory_el	PR_XLogHistory_el;
 typedef struct PR_worker	PR_worker;
 typedef struct PR_queue		PR_queue;
 typedef struct PR_queue_el	PR_queue_el;
@@ -65,7 +65,7 @@ struct PR_shm
 	PR_worker	*workers;
 	txn_wal_info_PR	*txn_wal_info;
 	PR_invalidPages	*invalidPages;
-	PR_history	*history;
+	PR_XLogHistory	*history;
 	PR_queue	*queue;
 	PR_buffer	*buffer;
 	slock_t		slock;			/* Spin lock for EndRecPtr and MinTimeLineID */
@@ -91,23 +91,23 @@ struct PR_invalidPages
  * If all the elements from head to some point is replayed,
  * this is reflected to XCloCtl.
  */
-struct PR_history
+struct PR_XLogHistory
 {
-	PR_hist_el	*hist_head;
-	PR_hist_el	*hist_end;	/* Last + 1 */
+	PR_XLogHistory_el	*hist_head;
+	PR_XLogHistory_el	*hist_end;	/* Last + 1 */
 	slock_t		 slock;
 };
 
 /*
  * Num of element is num_preplay_worker_queue.
  */
-struct PR_hist_el
+struct PR_XLogHistory_el
 {
-	XLogRecPtr	 curr_ptr;
-	XLogRecPtr	 end_ptr;
-	TimeLineID	 my_timeline;
-	bool		 replayed;
-	PR_hist_el	*next;
+	PR_XLogHistory_el	*next;
+	XLogRecPtr	 		 curr_ptr;
+	XLogRecPtr	 		 end_ptr;
+	TimeLineID	 		 my_timeline;
+	bool		 		 replayed;
 };
 
 
@@ -209,6 +209,7 @@ struct txn_cell_PR
 	txn_cell_PR			*next;
 	XLogDispatchData_PR *head;
 	XLogDispatchData_PR *tail;
+	bool txn_worker_waiting;	/* if true, last replayed worker should sync with txn worker */
 };
 
 struct txn_cell_pool_PR
@@ -255,17 +256,19 @@ typedef struct XLogInvalidPageData_PR
  *
  ************************************************************************************************
  */
+/*
+ * next and prev is used only for XLogRecord with valid xid.
+ * Tey are set by DISPATCHER worker to non-NULL value.   If it's NULL, we don't need
+ * lock txn_hash_el_PR->slock.
+ */
 struct XLogDispatchData_PR
 {
 	slock_t	 	 slock;
-	XLogReaderState	*reader;		/* Allocated in the separated buffer area */
-	PR_hist_el	*history_el;		/* PTR to history data */
-	XLogDispatchData_PR	*next;		/* Chain in txh_cell_PR */
-	XLogDispatchData_PR	*prev;		/* Chain in txh_cell_PR */
-	TransactionId	xid;
-	bool	 	 txn_waiting;		/* Indicates that TXN worker is waiting for this dispatch to be done */
-	bool	 	 txn_registered;	/* Indicates that TXN worker registered this dispatch */
-	bool		 done;				/* Indicates that this dispatch has been replayed */
+	XLogReaderState		*reader;	/* Allocated in the separated buffer area */
+	PR_XLogHistory_el	*xlog_history_el;	/* PTR to history data */
+	XLogDispatchData_PR	*next;		/* Chain in txh_cell_PR, use txn_hash_el_PR->slock for this */
+	XLogDispatchData_PR	*prev;		/* Chain in txh_cell_PR, use txn_hash_el_PR->slock for this */
+	TransactionId		 xid;
 	int		 	 n_remaining;		/* If this becomes zero, then this worker should replay */
 	int		 	 n_involved;		/* Total number of BLK workers assigned */
 	int			*worker_list;		/* Allocated as a part of this struct */
@@ -430,8 +433,8 @@ extern void PR_finishShm(void);
 /*
  * History data function
  */
-extern void PR_setXLogReplayed(PR_hist_el *el);
-extern PR_hist_el *PR_addXLogHistory(XLogRecPtr currPtr, XLogRecPtr endPtr, TimeLineID my_timeline);
+extern void PR_setXLogReplayed(PR_XLogHistory_el *el);
+extern PR_XLogHistory_el *PR_addXLogHistory(XLogRecPtr currPtr, XLogRecPtr endPtr, TimeLineID my_timeline);
 
 /* Worker functions */
 

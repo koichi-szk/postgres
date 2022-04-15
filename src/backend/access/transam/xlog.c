@@ -7529,6 +7529,23 @@ StartupXLOG(void)
 				}
 
 
+				/*
+				 * Update shared replayEndRecPtr before replaying this record,
+				 * so that XLogFlush will update minRecoveryPoint correctly.
+				 */
+				SpinLockAcquire(&XLogCtl->info_lck);
+				XLogCtl->replayEndRecPtr = EndRecPtr;
+				XLogCtl->replayEndTLI = ThisTimeLineID;
+				SpinLockRelease(&XLogCtl->info_lck);
+
+					/*
+					 * If we are attempting to enter Hot Standby mode, process
+					 * XIDs we see
+					 */
+					if (standbyState >= STANDBY_INITIALIZED &&
+						TransactionIdIsValid(record->xl_xid))
+						RecordKnownAssignedTransactionIds(record->xl_xid);
+
 				if (PR_isInParallelRecovery())
 				{
 					/*
@@ -7546,22 +7563,6 @@ StartupXLOG(void)
 				}
 				else
 				{
-					/*
-					 * Update shared replayEndRecPtr before replaying this record,
-					 * so that XLogFlush will update minRecoveryPoint correctly.
-					 */
-					SpinLockAcquire(&XLogCtl->info_lck);
-					XLogCtl->replayEndRecPtr = EndRecPtr;
-					XLogCtl->replayEndTLI = ThisTimeLineID;
-					SpinLockRelease(&XLogCtl->info_lck);
-
-					/*
-					 * If we are attempting to enter Hot Standby mode, process
-					 * XIDs we see
-					 */
-					if (standbyState >= STANDBY_INITIALIZED &&
-						TransactionIdIsValid(record->xl_xid))
-						RecordKnownAssignedTransactionIds(record->xl_xid);
 
 					/* Now apply the WAL record itself */
 					RmgrTable[record->xl_rmid].rm_redo(xlogreader);
