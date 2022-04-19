@@ -266,8 +266,8 @@ struct XLogDispatchData_PR
 	slock_t	 	 slock;
 	XLogReaderState		*reader;	/* Allocated in the separated buffer area */
 	PR_XLogHistory_el	*xlog_history_el;	/* PTR to history data */
-	XLogDispatchData_PR	*next;		/* Chain in txh_cell_PR, use txn_hash_el_PR->slock for this */
-	XLogDispatchData_PR	*prev;		/* Chain in txh_cell_PR, use txn_hash_el_PR->slock for this */
+	XLogDispatchData_PR	*next;		/* Chain in txn_cell_PR, use txn_hash_el_PR->slock for this */
+	XLogDispatchData_PR	*prev;		/* Chain in txn_cell_PR, use txn_hash_el_PR->slock for this */
 	TransactionId		 xid;
 	int		 	 n_remaining;		/* If this becomes zero, then this worker should replay */
 	int		 	 n_involved;		/* Total number of BLK workers assigned */
@@ -446,6 +446,7 @@ extern void	PR_setWorker(int worker_idx);
 extern int	PR_myWorkerIdx(void);
 extern PR_worker	*PR_myWorker(void);
 extern void PR_WaitDispatcherQueueHandling(void);
+extern void PR_atStartWorker(int idx);
 
 /* Invalid Page Worker functions */
 extern void PR_log_invalid_page(RelFileNode node, ForkNumber forkno, BlockNumber blkno, bool present);

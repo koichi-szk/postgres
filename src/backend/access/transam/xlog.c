@@ -7352,6 +7352,7 @@ StartupXLOG(void)
 					(errmsg("redo in parallel.   Number of worker: %d",
 							num_preplay_workers)));
 			PR_initShm();
+			PR_atStartWorker(PR_READER_WORKER_IDX);
 			PR_WorkerStartup();
 		}
 

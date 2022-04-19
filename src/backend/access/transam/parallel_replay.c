@@ -991,8 +991,8 @@ initWorker(void)
  * Startup all the workers
  */
 
-static void
-atStartWorker(int idx)
+void
+PR_atStartWorker(int idx)
 {
 	my_worker_idx = idx;
 	my_worker = &pr_shm->workers[idx];
@@ -1021,7 +1021,7 @@ PR_WorkerStartup(void)
 	int		ii;
 	int		rv;
 
-	atStartWorker(PR_READER_WORKER_IDX);
+	PR_atStartWorker(PR_READER_WORKER_IDX);
 
 	for (ii = 1; ii < num_preplay_workers; ii++)
 	{
@@ -1059,22 +1059,22 @@ void ParallelRedoProcessMain(int idx)
 
 	if (idx == PR_DISPATCHER_WORKER_IDX)
 	{
-		atStartWorker(PR_DISPATCHER_WORKER_IDX);
+		PR_atStartWorker(PR_DISPATCHER_WORKER_IDX);
 		dispatcherWorkerLoop();
 	}
 	else if (idx == PR_TXN_WORKER_IDX)
 	{
-		atStartWorker(PR_TXN_WORKER_IDX);
+		PR_atStartWorker(PR_TXN_WORKER_IDX);
 		txnWorkerLoop();
 	}
 	else if (idx == PR_INVALID_PAGE_WORKER_IDX)
 	{
-		atStartWorker(PR_INVALID_PAGE_WORKER_IDX);
+		PR_atStartWorker(PR_INVALID_PAGE_WORKER_IDX);
 		invalidPageWorkerLoop();
 	}
 	else if (PR_IS_BLK_WORKER_IDX(idx))
 	{
-		atStartWorker(idx);
+		PR_atStartWorker(idx);
 		blockWorkerLoop();
 	}
 	else
