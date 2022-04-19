@@ -31,6 +31,7 @@ extern int	num_preplay_max_txn;		/* If less than max_connections, max_connection
 extern int	PR_buf_size_mb;				/* Buffer size in MB (2^^10)  */
 extern bool PR_test;					/* Option to sync to the debugger */
 
+
 #define MAX_PR_NUM_WORKERS	127			/* Max number of replay worker */
 
 
@@ -59,6 +60,11 @@ typedef struct txn_hash_el_PR	txn_hash_el_PR;
 typedef struct txn_cell_PR		txn_cell_PR;
 typedef struct txn_cell_pool_PR	txn_cell_pool_PR;
 typedef struct XLogDispatchData_PR XLogDispatchData_PR;
+
+/*
+ * Shared memory for parallel replay
+ */
+extern PR_shm *pr_shm;
 
 struct PR_shm
 {
@@ -420,10 +426,11 @@ extern bool	PR_needTestSync(void);
 
 /*
  ****************************************************************************
- * Global Function Definitions
+ * Global Function Definitions and Macros
  ****************************************************************************
  */
 
+#define PR_isInParallelRecovery()	(InRecovery && pr_shm)
 /*
  * Shared memory functions
  */
@@ -486,6 +493,5 @@ extern XLogDispatchData_PR	*PR_analyzeXLogReaderState(XLogReaderState *state, XL
 /* Miscellaneous */
 extern int	PR_myWorkerIdx(void);
 extern void	PR_setWorker(int worker_idx);
-extern bool PR_isInParallelRecovery(void);
 
 #endif /* PARALLEL_REPLAY_H */

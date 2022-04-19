@@ -4,7 +4,7 @@
  *      PostgreSQL write-ahead log manager
  *
  *
- * Portions Copyright (c) 2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2022, PostgreSQL Global Development Group
  *
  * src/backend/access/transam/parallel_replay.c
  *
@@ -76,7 +76,7 @@ int		num_preplay_max_txn;		/* If less than max_connections, max_connections will
 static dsm_segment	*pr_shm_seg = NULL;
 
 /* The following variables are initialized by PR_initShm() */
-static PR_shm   	*pr_shm = NULL;
+PR_shm   	*pr_shm = NULL;
 static txn_wal_info_PR	*pr_txn_wal_info = NULL;
 static txn_hash_el_PR	*pr_txn_hash = NULL;
 static txn_cell_pool_PR	*pr_txn_cell_pool = NULL;
@@ -207,17 +207,6 @@ static void blockWorkerLoop(void);
 
 
 /*
- ************************************************************************************************
- * Parllel replay overall
- ************************************************************************************************
- */
-bool PR_isInParallelRecovery(void)
-{
-	return(InRecovery && pr_shm);
-}
-
-/*
- * Initialize global socket information in the shared memory for all workers
  ************************************************************************************************
  * Synchronization Functions: synchronizing among worker processes
  ************************************************************************************************
