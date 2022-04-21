@@ -5459,6 +5459,10 @@ StartChildProcess(AuxProcType type, int idx)
 	if (idx < 0)
 		snprintf(typebuf, sizeof(typebuf), "-x%d", type);
 	else
+		/*
+		 * For parallel recovery worker processes.  Need additional worker
+		 * process identifier.
+		 */
 		snprintf(typebuf, sizeof(typebuf), "-x%d -I%d", type, idx);
 	av[ac++] = typebuf;
 

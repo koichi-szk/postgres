@@ -422,7 +422,6 @@ extern void PRDebug_attach(void);
 extern void PRDebug_sync(void);
 extern void PRDebug_log(char *fmt, ...) __attribute__ ((format (printf, 1, 2)));
 extern void PRDebug_finish(void);
-extern bool	PR_needTestSync(void);
 
 /*
  ****************************************************************************
@@ -431,6 +430,8 @@ extern bool	PR_needTestSync(void);
  */
 
 #define PR_isInParallelRecovery()	(InRecovery && pr_shm)
+#define PR_needTestSync()			(parallel_replay && PR_test)
+
 /*
  * Shared memory functions
  */

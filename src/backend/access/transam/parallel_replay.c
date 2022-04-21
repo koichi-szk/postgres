@@ -983,8 +983,14 @@ initWorker(void)
 void
 PR_atStartWorker(int idx)
 {
+
+	if (idx != PR_READER_WORKER_IDX)
+		/* PRDebug_start() has already called in READER WORKER */
+		PRDebug_start(idx);	/* Do tiny things for gdb to attach this process */
+
 	my_worker_idx = idx;
 	my_worker = &pr_shm->workers[idx];
+
 	PR_syncInit();
 
 	if (idx == PR_READER_WORKER_IDX)
@@ -1700,20 +1706,6 @@ alloc_chunk(Size sz, void *start, void *end)
 /*
  ******************************************************************************************************
  *
- * Miscellaneous
- *
- ******************************************************************************************************
- */
-
-bool
-PR_needTestSync(void)
-{
-	return (PR_isInParallelRecovery() & PR_test);
-}
-
-/*
- ******************************************************************************************************
- *
  * Test code
  *
  ******************************************************************************************************
@@ -1799,8 +1791,9 @@ PRDebug_init(bool force_init)
 	}
 }
 
-#define timeofday_len 64
-static char	my_timeofday_val[timeofday_len];
+#define PR_TIEOFDAY_LEN 64
+static char	my_timeofday_val[PR_TIEOFDAY_LEN];
+
 static char *
 my_timeofday(void)
 {
@@ -1814,6 +1807,7 @@ my_timeofday(void)
 				timeofday->tm_hour, timeofday->tm_min, timeofday->tm_sec);
 	return my_timeofday_val;
 }
+#undef PR_TIEOFDAY_LEN
 
 /*
  * Should be called by each worker, including READER WORKER

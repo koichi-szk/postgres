@@ -7351,6 +7351,11 @@ StartupXLOG(void)
 			ereport(LOG,
 					(errmsg("redo in parallel.   Number of worker: %d",
 							num_preplay_workers)));
+			if (PR_needTestSync())	/* Do tiny things for gdb to attach this process */
+			{
+				PRDebug_init(true);
+				PRDebug_start(PR_READER_WORKER_IDX);
+			}
 			PR_initShm();
 			PR_atStartWorker(PR_READER_WORKER_IDX);
 			PR_WorkerStartup();
