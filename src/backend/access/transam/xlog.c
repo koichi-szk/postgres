@@ -7351,6 +7351,7 @@ StartupXLOG(void)
 			ereport(LOG,
 					(errmsg("redo in parallel.   Number of worker: %d",
 							num_preplay_workers)));
+			PR_syncInitSockDir();
 			if (PR_needTestSync())	/* Do tiny things for gdb to attach this process */
 			{
 				PRDebug_init(true);
@@ -7656,6 +7657,9 @@ StartupXLOG(void)
 			{
 				PR_WorkerFinish();
 				PR_finishShm();
+				PR_syncFinishSockDir();
+				if (PR_test)
+					PRDebug_finish();
 				/*
 				 * We need to call this here to check all the outstanding WAL
 				 * replay not found in the previous call.

@@ -54,6 +54,8 @@ typedef struct PR_buffer	PR_buffer;
 typedef struct PR_queue_el	PR_queue_el;
 typedef struct PR_RecChunk	PR_RecChunk;
 typedef struct XLogReaderState_PR	XLogReaderState_PR;
+typedef struct XLogInvalidPageData_PR XLogInvalidPageData_PR;
+typedef struct PR_BufChunk PR_BufChunk;
 
 typedef struct txn_wal_info_PR	txn_wal_info_PR;
 typedef struct txn_hash_el_PR	txn_hash_el_PR;
@@ -135,8 +137,6 @@ typedef struct PR_worker
 	slock_t	 	slock;			/* TXN and other BLK worker need to read worker status */
 								/* Dispatcher uses this lock to assign new XLogRec */
 								/* Can be spinlock */
-	XLogRecPtr 	finishedLSN;	/* Just finished LSN */
-	XLogRecPtr 	waitLSN;		/* TXN worker is waiting for this LSN to finish */
 	bool	 	wait_dispatch;	/* Flag to indicate the worker is waiting for xlogrec to handle */
 								/* Dispatcher check this and sync. */
 	unsigned	flags;			/* Indicates instructions from outside */
@@ -243,7 +243,7 @@ typedef enum PR_invalidPageCheckCmd
 /*
  * Invalid page interface data
  */
-typedef struct XLogInvalidPageData_PR
+struct XLogInvalidPageData_PR
 {
 	PR_invalidPageCheckCmd	cmd;
 	RelFileNode	node;
@@ -251,7 +251,7 @@ typedef struct XLogInvalidPageData_PR
 	BlockNumber	blkno;
 	bool		present;
 	Oid			dboid;
-} XLogInvalidPageData_PR;
+};
 
 /*
  ************************************************************************************************
@@ -385,7 +385,7 @@ struct PR_buffer
 	char		 data[0];			/* Assiciated data */
 };
 
-typedef struct PR_BufChunk
+struct PR_BufChunk
 {
 	/*
 	 * XLogRec begins this header and ends with the same information for backward search.
@@ -403,7 +403,7 @@ typedef struct PR_BufChunk
 	 * the size of the chunk.
 	 * This helps to scan chunks backwards.
 	 */
-}PR_BufChunk;
+};
 
 
 /* Magic number */
