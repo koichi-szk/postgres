@@ -3584,7 +3584,7 @@ static struct config_int ConfigureNamesInt[] =
 			gettext_noop("Specifies maximum number of transactions from WAL active in parallel recovery."),
 			NULL
 		},
-		&num_preplay_worker_queue,
+		&num_preplay_max_txn,
 		0, 0, INT_MAX / 2,
 		NULL, NULL, NULL
 	},
