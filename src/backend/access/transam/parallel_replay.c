@@ -199,7 +199,7 @@ static void			 dispatchDataToXLogHistory(XLogDispatchData_PR *dispatch_data);
 
 /* XLogReaderState/XLogRecord functions */
 static int	blockHash(int spc, int db, int rel, int blk, int n_max);
-inline int	fold_int2int8(int val);
+INLINE int	fold_int2int8(int val);
 
 /* Workerr Loop */
 static void dispatcherWorkerLoop(void);
@@ -571,6 +571,10 @@ freeDispatchData(XLogDispatchData_PR *dispatch_data)
 {
 	Assert(dispatch_data);
 
+#ifdef WAL_DEBUG
+	if (dispatch_data->reader->xlog_string)
+		PR_freeBuffer(dispatch_data->reader->xlog_string, true);
+#endif
 	if (dispatch_data->reader)
 	{
 		if (dispatch_data->reader->record)
@@ -1062,6 +1066,20 @@ PR_WorkerStartup(void)
 	}
 }
 
+/* See xlog.c */
+void
+PR_WorkerFinish(void)
+{
+	/* TDB */
+}
+
+/* See xlog.c */
+void
+PR_WaitDispatcherQueueHandling(void)
+{
+	/* TDB */
+}
+
 /*
  * Main entry to Parallel Replay worker process
  *
@@ -1385,7 +1403,7 @@ blockHash(int spc, int db, int rel, int blk, int n_max)
 	return wk_all;
 }
 
-inline int
+INLINE int
 fold_int2int8(int val)
 {
 	int ii;

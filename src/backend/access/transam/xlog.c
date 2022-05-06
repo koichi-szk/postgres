@@ -7400,6 +7400,9 @@ StartupXLOG(void)
 			do
 			{
 				bool		 switchedTLI = false;
+#ifdef WAL_DEBUG
+				char		*xlog_string;
+#endif
 
 				/*
 				 * Koichi:
@@ -7430,6 +7433,11 @@ StartupXLOG(void)
 					appendStringInfoString(&buf, " - ");
 					xlog_outdesc(&buf, xlogreader);
 					elog(LOG, "%s", buf.data);
+					if (PR_isInParallelRecovery())
+					{
+						xlog_string = PR_allocBuffer(buf.len, true);
+						memcpy(xlog_string, buf.data, buf.len);
+					}
 					pfree(buf.data);
 				}
 #endif
@@ -7566,6 +7574,9 @@ StartupXLOG(void)
 					xlogreader_PR = (XLogReaderState *)PR_allocBuffer(sizeof(XLogReaderState), true);
 					memcpy(xlogreader_PR, xlogreader, sizeof(XLogReaderState));
 					xlogreader_PR->record = record;
+#ifdef WAL_DEBUG
+					xlogreader_PR->xlog_string = xlog_string;
+#endif
 					PR_enqueue(xlogreader_PR, ReaderState, PR_DISPATCHER_WORKER_IDX);
 				}
 				else

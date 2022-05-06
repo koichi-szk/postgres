@@ -279,6 +279,9 @@ struct XLogDispatchData_PR
 	int		 	 n_involved;		/* Total number of BLK workers assigned */
 	int			*worker_list;		/* Allocated as a part of this struct */
 	bool		*worker_array;		/* Allocated as a part of this struct */
+#ifdef WAL_DEBUG
+	char		*xlog_string;		/* String representation of dispatched WAL record */
+#endif
 };
 
 /* Dispatch Data Functions */

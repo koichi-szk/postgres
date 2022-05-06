@@ -19,7 +19,9 @@
 
 #include <unistd.h>
 
+#ifndef FRONTEND
 #include "access/parallel_replay.h"
+#endif
 #include "access/transam.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -270,7 +272,9 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 {
 	XLogRecPtr	RecPtr;
 	XLogRecord *record;
+#ifndef FRONTEND
 	XLogRecord *record_old;
+#endif
 	XLogRecPtr	targetPagePtr;
 	bool		randAccess;
 	uint32		len,
@@ -568,6 +572,7 @@ restart:
 		state->EndRecPtr -= XLogSegmentOffset(state->EndRecPtr, state->segcxt.ws_segsize);
 	}
 
+#ifndef FRONTEND
 	if (PR_isInParallelRecovery())
 	{
 		uint32		 tot_len;
@@ -581,10 +586,12 @@ restart:
 		memcpy(record, record_old, tot_len);
 		state->record = record;
 	}
+#endif
 	if (DecodeXLogRecord(state, record, errormsg))
 		return record;
 	else
 	{
+#ifndef FRONTEND
 		if (PR_isInParallelRecovery())
 		{
 			/*
@@ -597,6 +604,7 @@ restart:
 			state->record = NULL;
 			state->decoded_record = NULL;
 		}
+#endif
 		return NULL;
 	}
 

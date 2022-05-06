@@ -268,6 +268,9 @@ struct XLogReaderState
 	XLogRecPtr	missingContrecPtr;
 	/* Set when XLP_FIRST_IS_OVERWRITE_CONTRECORD is found */
 	XLogRecPtr	overwrittenRecPtr;
+#ifdef WAL_DEBUG
+	char	*xlog_string;		/* String representation of the WAL record */
+#endif
 };
 
 /* Get a new XLogReader */
