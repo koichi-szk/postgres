@@ -1070,14 +1070,42 @@ PR_WorkerStartup(void)
 void
 PR_WorkerFinish(void)
 {
-	/* TDB */
+	/*
+	 * Koichi:
+	 *
+	 * これは READER worker から呼ばれるもの。そこで、Dispatcher worker の終了だけを待つようにする。
+	 * DISPATCHER WORKER は、READER から dispatch された全ての queue を他の worker に dispatch した後、
+	 * 終了する。
+	 *
+	 * READER WORKER は、DISPATCH WORKER の終了を待った後、その他の WORKER の termiante フラグを立てて、
+	 * これらの終了を待つ。
+	 *
+	 * このようにするのは、DISPATCHER がまだ割り当てる queue があるのに、他の WORKER が終了を勘違いして
+	 * 集結するのを防ぐためで、DISPATCHER が全ての処理を終了し、これらが全て他の worker に割り当て済である
+	 * ことを確実にするためである。
+	 *
+	 * また、全ての worker は READER の子プロセスなので、これらの終了を待つのは READER worker であるのが
+	 * 望ましい。
+	 */
+
 }
 
 /* See xlog.c */
 void
 PR_WaitDispatcherQueueHandling(void)
 {
-	/* TDB */
+	/*
+	 * Koichi:
+	 *
+	 * これは、READER 以外のすべての worker がその時点で READER から割り当てられた queue をすべて処理
+	 * し終わったことの同期をとるためのものである。
+	 *
+	 * 同様に、まず DISPATCHER にこの指示を出し、DISPATCHER は、自分に割り当て済の全ての queue の処理を
+	 * 完了したことを確認して、その他全ての worker の処理完了を監視する。
+	 *
+	 * これは、プロセスの完了を伴わないので、socket を使った同期処理を使うことができるし、どの worker で
+	 * 同期をとってもいい。
+	 */
 }
 
 /*

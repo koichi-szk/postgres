@@ -163,9 +163,10 @@ typedef struct PR_worker
  */
 
 #define PR_WK_TERMINATE			0x00000001	/* Instruction to terminate the worker process */
-#define PR_WK_SYNC_READER		0x00000002	/* Sync to the READER worker needed */
-#define PR_WK_SYNC_DISPATCHER	0x00000004	/* Sync to the DISPATCHER worker needed */
-#define PR_WK_SYNC_TXN			0x00000008	/* Sync to the TXN worker needed */
+#define PR_WK_SYNC_READER		0x00000002	/* Sync to the READER when all the dispatched data was done */
+#define PR_WK_SYNC_DISPATCHER	0x00000004	/* Sync to the DISPATCHER when all the didpsatched data was done */
+#define PR_WK_SYNC_TXN			0x00000008	/* Sync to the TXN worker when all the didpsatched data was done */
+#define PR_WK_SYNC				0x0000000E	/* Mask to indicate any of SYNC bit above */
 
 /* Worker Idx */
 /*
