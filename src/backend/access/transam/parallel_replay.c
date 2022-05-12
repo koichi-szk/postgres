@@ -41,6 +41,7 @@
 #include "replication/origin.h"
 #include "replication/walreceiver.h"
 #include "storage/dsm.h"
+#include "storage/ipc.h"
 #include "storage/pg_shmem.h"
 #include "utils/elog.h"
 
@@ -1069,23 +1070,44 @@ PR_WorkerStartup(void)
 void
 PR_WorkerFinish(void)
 {
+	int ii;
+	int	wstatus;
+
 	/*
-	 * Koichi:
-	 *
-	 * これは READER worker から呼ばれるもの。そこで、Dispatcher worker の終了だけを待つようにする。
-	 * DISPATCHER WORKER は、READER から dispatch された全ての queue を他の worker に dispatch した後、
-	 * 終了する。
-	 *
-	 * READER WORKER は、DISPATCH WORKER の終了を待った後、その他の WORKER の termiante フラグを立てて、
-	 * これらの終了を待つ。
-	 *
-	 * このようにするのは、DISPATCHER がまだ割り当てる queue があるのに、他の WORKER が終了を勘違いして
-	 * 集結するのを防ぐためで、DISPATCHER が全ての処理を終了し、これらが全て他の worker に割り当て済である
-	 * ことを確実にするためである。
-	 *
-	 * また、全ての worker は READER の子プロセスなので、これらの終了を待つのは READER worker であるのが
-	 * 望ましい。
+	 * Terminate all the worker process and wait for exit().
 	 */
+
+	Assert(my_worker_idx == PR_READER_WORKER_IDX);
+
+	/* First, need to terminate DISPATCHER worker */
+	SpinLockAcquire(&pr_worker[PR_DISPATCHER_WORKER_IDX].slock);
+	pr_worker[PR_DISPATCHER_WORKER_IDX].flags |= PR_WK_TERMINATE;
+	SpinLockRelease(&pr_worker[PR_DISPATCHER_WORKER_IDX].slock);
+
+	waitpid(pr_worker[PR_DISPATCHER_WORKER_IDX].worker_pid, &wstatus, 0);
+
+	/*
+	 * Then wait for other worker to terminate, except for INVALID PAGE worker
+	 */
+	for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers; ii++)
+	{
+		if (ii != PR_INVALID_PAGE_WORKER_IDX)
+			waitpid(pr_worker[ii].worker_pid, &wstatus, 0);
+	}
+
+	/*
+	 * Finally, terminate INVALID PAGE worker
+	 *
+	 * This was needed because request to invalid page worker is done by
+	 * individual block worker.  We need to terminate this worker when
+	 * all the other workers terminates and all the invalid block request
+	 * has been dispatched to the invalid block worker.
+	 */
+	SpinLockAcquire(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
+	pr_worker[PR_INVALID_PAGE_WORKER_IDX].flags |= PR_WK_TERMINATE;
+	SpinLockRelease(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
+
+	waitpid(pr_worker[PR_INVALID_PAGE_WORKER_IDX].worker_pid, &wstatus, 0);
 
 }
 
@@ -1093,6 +1115,17 @@ PR_WorkerFinish(void)
 void
 PR_WaitDispatcherQueueHandling(void)
 {
+	/*
+	 * Syncchronize all the workers to handle all the dispatched queue
+	 */
+	Assert(my_worker_idx == PR_READER_WORKER_IDX);
+
+	SpinLockAcquire(&pr_worker[PR_DISPATCHER_WORKER_IDX].slock);
+	pr_worker[PR_DISPATCHER_WORKER_IDX].flags |= PR_WK_SYNC_READER;
+	SpinLockRelease(&pr_worker[PR_DISPATCHER_WORKER_IDX].slock);
+
+	PR_recvSync();
+
 	/*
 	 * Koichi:
 	 *
@@ -1118,8 +1151,12 @@ PR_WaitDispatcherQueueHandling(void)
  */
 void ParallelRedoProcessMain(int idx)
 {
-	/* The worker does not return */
+	/*
+	 * Note: READER worker is in fact Startup process and is handled by
+	 * StartupProcessMain().
+	 */
 	Assert(idx > PR_READER_WORKER_IDX);
+
 
 	if (idx == PR_DISPATCHER_WORKER_IDX)
 	{
@@ -1144,8 +1181,15 @@ void ParallelRedoProcessMain(int idx)
 	else
 		elog(PANIC, "Internal error. Invalid Parallel Redo worker index: %d", idx);
 
-	return;
+	/* The worker does not return */
+
+	/*
+	 * Exit normally.  Exit code 0 tells that parallel redo process completed
+	 * all the assigned recovery work.
+	 */
+	proc_exit(0);
 }
+
 /*
  ****************************************************************************
  *
@@ -1261,11 +1305,56 @@ PR_fetchQueue(void)
 			if (flags & PR_WK_TERMINATE)
 			{
 				Assert(my_worker_idx != PR_READER_WORKER_IDX);
+				if (my_worker_idx == PR_DISPATCHER_WORKER_IDX)
+				{
+					int ii;
+					/*
+					 * First, worker terminate request is sent from READER to DISPATCHER.
+					 * So, if DISPATCHER receives this, after dispatching everything from
+					 * READER worker, it asks all the other workers to terminate.
+					 */
+					for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers; ii++)
+					{
+						if (ii != PR_INVALID_PAGE_WORKER_IDX)
+						{
+							/*
+							 * Invalid page worker can terminate after all the other
+							 * workers terminate
+							 */
+							SpinLockAcquire(&pr_worker[ii].slock);
+							pr_worker[ii].flags |= PR_WK_TERMINATE;
+							SpinLockRelease(&pr_worker[ii].slock);
+						}
+					}
+				}
 				return NULL;
 			}
 			if (flags & PR_WK_SYNC_READER)
 			{
 				Assert(my_worker_idx != PR_READER_WORKER_IDX);
+				if (my_worker_idx == PR_DISPATCHER_WORKER_IDX)
+				{
+					int ii;
+
+					/* Sync all workers but INVALID PAGE workers */
+					for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers; ii++)
+					{
+						if (ii != PR_INVALID_PAGE_WORKER_IDX)
+						{
+							SpinLockAcquire(&pr_worker[ii].slock);
+							pr_worker[ii].flags |= PR_WK_SYNC_DISPATCHER;
+							SpinLockRelease(&pr_worker[ii].slock);
+						}
+					}
+					for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers - 1; ii++)
+						PR_recvSync();
+
+					/* Finally INVALID PAGE worker */
+					SpinLockAcquire(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
+					pr_worker[PR_INVALID_PAGE_WORKER_IDX].flags |= PR_WK_SYNC_DISPATCHER;
+					SpinLockRelease(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
+					PR_recvSync();
+				}
 				PR_sendSync(PR_READER_WORKER_IDX);
 			}
 			if (flags & PR_WK_SYNC_DISPATCHER)
