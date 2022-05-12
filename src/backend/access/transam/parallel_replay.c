@@ -174,7 +174,6 @@ static void			 chunk_arrange_free_wraparound(void);
 static void			*retry_allocBuffer(Size sz, bool need_lock);
 INLINE PR_BufChunk	*next_chunk(PR_BufChunk *chunk);
 static Size			 available_size(PR_buffer *buffer);
-static void			*expandBuffer_new(void *buffer, Size newsz, bool need_lock); 
 
 /*
  * Dispatch Data function
@@ -1245,36 +1244,41 @@ PR_queue_el *
 PR_fetchQueue(void)
 {
 	PR_queue_el *rv;
+	unsigned flags;
 
 	SpinLockAcquire(&my_worker->slock);
+	flags = my_worker->flags;
 	rv = my_worker->head;
 	if (my_worker->head == NULL)
 	{
 		/*
 		 * The following looks unnecessarily long. Needs simplification.
 		 */
-		if (my_worker->flags & PR_WK_SYNC_READER)
+		if (flags & PR_WK_SYNC)
 		{
+			my_worker->flags = 0;
 			SpinLockRelease(&my_worker->slock);
-			PR_sendSync(PR_READER_WORKER_IDX);
+			if (flags & PR_WK_TERMINATE)
+			{
+				Assert(my_worker_idx != PR_READER_WORKER_IDX);
+				return NULL;
+			}
+			if (flags & PR_WK_SYNC_READER)
+			{
+				Assert(my_worker_idx != PR_READER_WORKER_IDX);
+				PR_sendSync(PR_READER_WORKER_IDX);
+			}
+			if (flags & PR_WK_SYNC_DISPATCHER)
+			{
+				Assert(my_worker_idx != PR_DISPATCHER_WORKER_IDX);
+				PR_sendSync(PR_DISPATCHER_WORKER_IDX);
+			}
+			if (flags & PR_WK_SYNC_TXN)
+			{
+				Assert(my_worker_idx != PR_TXN_WORKER_IDX);
+				PR_sendSync(PR_TXN_WORKER_IDX);
+			}
 			return PR_fetchQueue();
-		}
-		else if (my_worker->flags & PR_WK_SYNC_DISPATCHER)
-		{
-			SpinLockRelease(&my_worker->slock);
-			PR_sendSync(PR_DISPATCHER_WORKER_IDX);
-			return PR_fetchQueue();
-		}
-		else if (my_worker->flags & PR_WK_SYNC_TXN)
-		{
-			SpinLockRelease(&my_worker->slock);
-			PR_sendSync(PR_TXN_WORKER_IDX);
-			return PR_fetchQueue();
-		}
-		else if (my_worker->flags & PR_WK_TERMINATE)
-		{
-			SpinLockRelease(&my_worker->slock);
-			return NULL;
 		}
 		else
 		{
@@ -1539,45 +1543,6 @@ retry_allocBuffer(Size sz, bool need_lock)
 		SpinLockRelease(&pr_buffer->slock);
 	PR_recvSync();
 	return PR_allocBuffer(sz, need_lock);
-}
-
-/* Size is "buffer size", not chunk size */
-void	*
-PR_expandBuffer(void *buffer, Size newsz, bool need_lock)
-{
-	PR_BufChunk	*chunk,
-				*next;
-
-	Assert(buffer && Chunk(buffer)->magic == PR_BufChunk_Allocated);
-
-	if (need_lock)
-		SpinLockAcquire(&pr_buffer->slock);
-	chunk = Chunk(buffer);
-	if (newsz <= chunk->size)
-	{
-		if (need_lock)
-			SpinLockRelease(&pr_buffer->slock);
-		return buffer;
-	}
-	next = (PR_BufChunk *)addr_forward(chunk, chunk->size);
-	if (addr_after_eq(next, pr_buffer->tail))
-	{
-		if (need_lock)
-			SpinLockRelease(&pr_buffer->slock);
-		return expandBuffer_new(buffer, newsz, need_lock); 
-	}
-	
-
-			
-	/* Koichi: WIP */
-	return NULL;
-}
-
-
-static void *
-expandBuffer_new(void *buffer, Size newsz, bool need_lock)
-{
-	return NULL;
 }
 
 
