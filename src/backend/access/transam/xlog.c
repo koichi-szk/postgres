@@ -7419,6 +7419,8 @@ StartupXLOG(void)
 				 * the records.
 				 */
 #ifdef WAL_DEBUG
+				xlog_string = NULL;
+
 				if (XLOG_DEBUG ||
 					(rmid == RM_XACT_ID && trace_recovery_messages <= DEBUG2) ||
 					(rmid != RM_XACT_ID && trace_recovery_messages <= DEBUG3))
@@ -7434,6 +7436,11 @@ StartupXLOG(void)
 					xlog_outdesc(&buf, xlogreader);
 					elog(LOG, "%s", buf.data);
 					if (PR_isInParallelRecovery())
+					{
+						xlog_string = PR_allocBuffer(buf.len, true);
+						memcpy(xlog_string, buf.data, buf.len);
+					}
+					if (PR_needTestSync())
 					{
 						xlog_string = PR_allocBuffer(buf.len, true);
 						memcpy(xlog_string, buf.data, buf.len);

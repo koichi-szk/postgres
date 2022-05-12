@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * parallel_replay_util.c
+ * parallel_replay.c
  *      PostgreSQL write-ahead log manager
  *
  *
