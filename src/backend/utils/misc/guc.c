@@ -3565,7 +3565,7 @@ static struct config_int ConfigureNamesInt[] =
 			NULL
 		},
 		&num_preplay_workers,
-		4, 4, MAX_PR_NUM_WORKERS,
+		5, 5, MAX_PR_NUM_WORKERS,
 		NULL, NULL, NULL
 	},
 
@@ -3593,10 +3593,10 @@ static struct config_int ConfigureNamesInt[] =
 		{"preplay_buffers", PGC_POSTMASTER, WAL_ARCHIVE_RECOVERY,
 			gettext_noop("Specifies amount of parallel reply shared memroy buffer."),
 			NULL,
-			GUC_UNIT_BLOCKS
+			GUC_UNIT_BYTE
 		},
 		&PR_buf_size_mb,
-		1024, 16, INT_MAX / 2,
+		BLCKSZ * XLR_MAX_BLOCK_ID * 6, BLCKSZ * XLR_MAX_BLOCK_ID * 6, INT_MAX / 2,
 		NULL, NULL, NULL
 	},
 

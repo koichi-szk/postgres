@@ -3,6 +3,7 @@
  *
  * Postgres parallel recovery struct and function definitions
  *
+ * Portions Copyright (c) 2022 EDB
  * Portions Copyright (c) 2021 PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -154,12 +155,21 @@ typedef struct PR_worker
  */
 /*
  * Following flags work as follows:
- *	When each worker handles all the assigned queues and no queue is assigned,
+ *	When each worker handles all the assigned queues and no queue elelemt is found in the queue,
  *	each worker checks flags.
- *  If PR_WK_TERMINATE is set, then the worker terminates.
- *  If PR_WK_SYNC_READER is set, then the worker writes sync message to READER worker.
- *  If PR_WK_SYNC_DISPATCHER is set, then the worker writes sync message to DISPATCHER worker.
- *  If PR_WK_SYNC_TXN is set, then the worker writes sync message to TXN worker.
+ *  1. If PR_WK_TERMINATE is set, then the worker terminates.
+ *  2. If PR_WK_SYNC_READER is set, then the worker writes sync message to READER worker.
+ *  3. If PR_WK_SYNC_DISPATCHER is set, then the worker writes sync message to DISPATCHER worker.
+ *  4. If PR_WK_SYNC_TXN is set, then the worker writes sync message to TXN worker.
+ *
+ *  If the worker finishes all the assigned queue, the worker sets wait_dispatch flag and wait for
+ *  sync() from dispatching worker (READER, DISPATCHER and other worker in the case of 
+ *  INVALID PAGE worker.
+ *
+ *  When dispatching queue element to a worker, dispatching worker shoud:
+ *
+ *  1. Simply and queue element to worker's queue,
+ *  2. If this worker sets wait_dispatch, then clear them and write sync to the target worker.
  */
 
 #define PR_WK_TERMINATE			0x00000001	/* Instruction to terminate the worker process */
@@ -193,8 +203,9 @@ typedef struct PR_worker
 
 struct txn_wal_info_PR
 {
-	txn_hash_el_PR		*txn_hash;		/* Hash */
-	txn_cell_pool_PR	*cell_pool;		/* Cell pool */
+	txn_hash_el_PR	*txn_hash;		/* Hash */
+	txn_cell_PR		*cell_pool;		/* Cell pool */
+	slock_t			 cell_slock;	/* Slock for cell pool */
 };
 
 /*
@@ -212,17 +223,11 @@ struct txn_hash_el_PR
  */
 struct txn_cell_PR
 {
-	TransactionId		 xid;
 	txn_cell_PR			*next;
+	TransactionId		 xid;
+	bool				 txn_worker_waiting;	/* if true, last replayed worker should sync with txn worker */
 	XLogDispatchData_PR *head;
 	XLogDispatchData_PR *tail;
-	bool txn_worker_waiting;	/* if true, last replayed worker should sync with txn worker */
-};
-
-struct txn_cell_pool_PR
-{
-	slock_t		 slock;
-	txn_cell_PR	*next;
 };
 
 /*
@@ -384,9 +389,7 @@ struct PR_buffer
 	void		*tail;				/* Next of the end of the area: Initialized and then static */
 	void		*alloc_start;		/* Can allocate from here. */
 	void		*alloc_end;			/* Can allocate up to here. */
-	Size		 needed_by_reader;	/* Size of the buffer (not chunk) required by reader worker. */
-	Size		 needed_by_dispatcher;	/* Size of the buffer (not chunk) required by dispatcher worker. */
-	char		 data[0];			/* Assiciated data */
+	Size		*needed_by_worker;	/* Size of the buffer needed by each worker */
 };
 
 struct PR_BufChunk
@@ -426,6 +429,8 @@ extern void PRDebug_attach(void);
 extern void PRDebug_sync(void);
 extern void PRDebug_log(char *fmt, ...) __attribute__ ((format (printf, 1, 2)));
 extern void PRDebug_finish(void);
+extern void PR_debug_buffer(void);
+extern void PR_debug_analyzeState(XLogReaderState *state, XLogRecord *record);
 
 /*
  ****************************************************************************
@@ -478,7 +483,6 @@ extern void	 PR_syncFinish(void);
 
 /* Buffer functions */
 extern void	*PR_allocBuffer(Size sz, bool need_lock);
-extern void	*PR_expandBuffer(void *buffer, Size newsz, bool need_lock);
 extern void	 PR_freeBuffer(void *buffer, bool need_lock);
 
 /* Queue functions */

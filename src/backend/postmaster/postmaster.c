@@ -93,6 +93,9 @@
 #include <pthread.h>
 #endif
 
+#ifdef WAL_DEBUG
+#include "access/parallel_replay.h"
+#endif
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "bootstrap/bootstrap.h"
@@ -1407,6 +1410,13 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * We're ready to rock and roll...
 	 */
+#ifdef WAL_DEBUG
+	if (PR_needTestSync())
+	{
+		elog(DEBUG3, "%s: %s: Starting parallel replay debug. Pid = %d.", __func__, __FILE__, getpid());
+		PRDebug_init(true);
+	}
+#endif
 	StartupPID = StartupDataBase();
 	Assert(StartupPID != 0);
 	StartupStatus = STARTUP_RUNNING;

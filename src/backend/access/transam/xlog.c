@@ -7352,13 +7352,15 @@ StartupXLOG(void)
 					(errmsg("redo in parallel.   Number of worker: %d",
 							num_preplay_workers)));
 			PR_syncInitSockDir();
+#ifdef WEB_DEBUG
 			if (PR_needTestSync())	/* Do tiny things for gdb to attach this process */
-			{
-				PRDebug_init(true);
 				PRDebug_start(PR_READER_WORKER_IDX);
-			}
+#endif
 			PR_initShm();
 			PR_atStartWorker(PR_READER_WORKER_IDX);
+#ifdef WEB_DEBUG
+			PR_debug_buffer();
+#endif
 			PR_WorkerStartup();
 		}
 
@@ -7583,8 +7585,10 @@ StartupXLOG(void)
 					xlogreader_PR->record = record;
 #ifdef WAL_DEBUG
 					xlogreader_PR->xlog_string = xlog_string;
-#endif
+					PR_debug_analyzeState(xlogreader_PR, record);
+#else
 					PR_enqueue(xlogreader_PR, ReaderState, PR_DISPATCHER_WORKER_IDX);
+#endif
 				}
 				else
 				{

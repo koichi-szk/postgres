@@ -202,6 +202,7 @@ AuxiliaryProcessMain(int argc, char *argv[])
 	int			flag;
 	char	   *userDoption = NULL;
 
+	elog(DEBUG3, "%s:%s called.", __func__, __FILE__);
 	/*
 	 * Initialize process environment (already done if under postmaster, but
 	 * not if standalone).
@@ -322,6 +323,13 @@ AuxiliaryProcessMain(int argc, char *argv[])
 	{
 		case StartupProcess:
 			MyBackendType = B_STARTUP;
+#ifdef WAL_DEBUG
+			if (PR_needTestSync())
+			{
+				elog(DEBUG3, "%s: %s: Starting parallel replay debug. Pid = %d.", __func__, __FILE__, getpid());
+				PRDebug_start(0);
+			}
+#endif
 			break;
 		case ArchiverProcess:
 			MyBackendType = B_ARCHIVER;
@@ -339,6 +347,13 @@ AuxiliaryProcessMain(int argc, char *argv[])
 			MyBackendType = B_WAL_RECEIVER;
 			break;
 		case ParallelRedoProcess:
+#ifdef WAL_DEBUG
+			if (PR_needTestSync())
+			{
+				elog(DEBUG3, "%s: %s: Starting parallel replay debug. Pid = %d.", __func__, __FILE__, getpid());
+				PRDebug_start(MyAuxProcIdx);
+			}
+#endif
 			MyBackendType = B_PARALLEL_REPLAY;
 			break;
 		default:
@@ -452,6 +467,10 @@ AuxiliaryProcessMain(int argc, char *argv[])
 			proc_exit(1);		/* should never return */
 
 		case StartupProcess:
+#ifdef WAL_DEBUG
+			if (PR_needTestSync())
+				elog(DEBUG3, "%s: %s: Starting Startup Process. Pid = %d.", __func__, __FILE__, getpid());
+#endif
 			StartupProcessMain();
 			proc_exit(1);
 
