@@ -2152,8 +2152,15 @@ PRDebug_start(int worker_idx)
 	PRDebug_log("Now ready to attach the debugger to pid %d.  "
 				"Set the break point to PRDebug_sync()\n"
 			    "My worker idx is %d.\nPlease touch %s to begin.  "
-				"I'm waiting for it.\n",
-			getpid(), worker_idx, pr_debug_signal_file);
+				"I'm waiting for it.\n\n"
+				"Do following from another shell:\n"
+				"sudo gdb\n"
+				"attach %d\n"
+				"b PRDebug_sync\n"
+				"shell touch  %s\n"
+				"c\n",
+			getpid(), worker_idx, pr_debug_signal_file,
+			getpid(), pr_debug_signal_file);
 	while((found_debug_file == false) && (time_waiting < start_timeout))
 	{
 		rv = stat(pr_debug_signal_file, &statbuf);
