@@ -228,7 +228,7 @@ AuxiliaryProcessMain(int argc, char *argv[])
 	/* If no -x argument, we are a CheckerProcess */
 	MyAuxProcType = CheckerProcess;
 
-	while ((flag = getopt(argc, argv, "B:c:d:D:Fkr:x:X:I:-:")) != -1)
+	while ((flag = getopt(argc, argv, "B:c:d:D:FkPr:x:X:I:-:")) != -1)
 	{
 		switch (flag)
 		{
@@ -256,6 +256,9 @@ AuxiliaryProcessMain(int argc, char *argv[])
 				break;
 			case 'k':
 				bootstrap_data_checksum_version = PG_DATA_CHECKSUM_VERSION;
+				break;
+			case 'P':
+				MyAuxProcType = ParallelRedoProcess;
 				break;
 			case 'r':
 				strlcpy(OutputFileName, optarg, MAXPGPATH);
@@ -347,13 +350,6 @@ AuxiliaryProcessMain(int argc, char *argv[])
 			MyBackendType = B_WAL_RECEIVER;
 			break;
 		case ParallelRedoProcess:
-#ifdef WAL_DEBUG
-			if (PR_needTestSync())
-			{
-				elog(DEBUG3, "%s: %s: Starting parallel replay debug. Pid = %d.", __func__, __FILE__, getpid());
-				PRDebug_start(MyAuxProcIdx);
-			}
-#endif
 			MyBackendType = B_PARALLEL_REPLAY;
 			break;
 		default:

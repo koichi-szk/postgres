@@ -107,7 +107,9 @@ static int          *worker_socket = NULL;
 #define MemBoundary         (sizeof(void *))
 #define addr_forward(p, s)  ((void *)((uint64)(p) + (Size)(s)))
 #define addr_backward(p, s) ((void *)((uint64)(p) - (Size)(s)))
-#define addr_subtract(a, b) ((Size)((uint64)(b) - (uint64)(a)))
+#if 0
+#define addr_subtract(a, b) ((Size)((b) - (a)))
+#endif
 #define size_boundary(s)    ((((s) + MemBoundary - 1) / MemBoundary) * MemBoundary)
 #define address_boundary(s) (((((uint64)(s)) + MemBoundary - 1) / MemBoundary) * MemBoundary)
 #define addr_after(a, b)    ((uint64)(a) > (uint64)(b))
@@ -116,6 +118,17 @@ static int          *worker_socket = NULL;
 #define addr_before_eq(a, b)    ((uint64)(a) <= (uint64)(b))
 #define Sizeof(s)           size_boundary(sizeof(s))
 
+static Size
+addr_difference(void *start, void * end)
+{
+	uint64 ustart = (uint64)start;
+	uint64 uend = (uint64)end;
+
+	if (ustart > uend)
+		return (Size)(ustart - uend);
+	else
+		return (Size)(uend - ustart);
+}
 /* Macros */
 #define PR_SOCKNAME_LEN 127
 #define PR_SYNCSOCKDIR  "pr_syncsock"
@@ -1017,14 +1030,13 @@ PR_atStartWorker(int idx)
 
 	PR_syncInit();	/* Initialize synchronization sockets */
 
-	if (idx == PR_READER_WORKER_IDX)
-		return;
 	SpinLockAcquire(&my_worker->slock);
 	if (my_worker_idx == PR_READER_WORKER_IDX)
 		my_worker->wait_dispatch = false;
 	else
 		my_worker->wait_dispatch = true;
 	my_worker->flags = 0;
+	my_worker->worker_pid = getpid();
 	SpinLockRelease(&my_worker->slock);
 
 	/* Tell the READER worker that I'm ready */
@@ -1599,6 +1611,12 @@ PR_allocBuffer(Size sz, bool need_lock)
 				SpinLockRelease(&pr_buffer->slock);
 			return retry_allocBuffer(sz, need_lock);
 		}
+		else
+		{
+			if (need_lock)
+				SpinLockRelease(&pr_buffer->slock);
+			return addr_forward(new, Sizeof(PR_BufChunk));
+		}
 	}
 	else
 	{
@@ -1619,8 +1637,15 @@ PR_allocBuffer(Size sz, bool need_lock)
 			pr_buffer->alloc_start = wk;
 			return retry_allocBuffer(sz, need_lock);
 		}
-		return addr_forward(new, Sizeof(PR_BufChunk));
+		else
+		{
+			if (need_lock)
+				SpinLockRelease(&pr_buffer->slock);
+			return addr_forward(new, Sizeof(PR_BufChunk));
+		}
 	}
+	if (need_lock)
+		SpinLockRelease(&pr_buffer->slock);
 	return NULL;
 }
 
@@ -1767,7 +1792,7 @@ PR_freeBuffer(void *buffer, bool need_lock)
 		if (pr_buffer->needed_by_worker[ii] != 0)
 		{
 			needed_by_lower_worker = true;
-			if (pr_buffer->needed_by_worker[ii] <= available)
+			if ((pr_buffer->needed_by_worker[ii] <= available) && (ii != my_worker_idx))
 			{
 				if (need_lock)
 					SpinLockRelease(&pr_buffer->slock);
@@ -1788,7 +1813,7 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	{
 		if (pr_buffer->needed_by_worker[ii] != 0)
 		{
-			if (pr_buffer->needed_by_worker[ii] <= available)
+			if ((pr_buffer->needed_by_worker[ii] <= available) && (ii != my_worker_idx))
 			{
 				if (need_lock)
 					SpinLockRelease(&pr_buffer->slock);
@@ -1814,8 +1839,8 @@ available_size(PR_buffer *buffer)
 	if (addr_before(buffer->alloc_start, buffer->alloc_end))
 		return ((PR_BufChunk *)buffer)->size - Sizeof(PR_BufChunk) - Sizeof(Size);
 
-	sz1 = addr_subtract(buffer->tail, buffer->alloc_start) - Sizeof(PR_BufChunk) - Sizeof(Size);
-	sz2 = addr_subtract(buffer->alloc_end, buffer->head) - Sizeof(PR_BufChunk) - Sizeof(Size);
+	sz1 = addr_difference(buffer->tail, buffer->alloc_start) - Sizeof(PR_BufChunk) - Sizeof(Size);
+	sz2 = addr_difference(buffer->alloc_end, buffer->head) - Sizeof(PR_BufChunk) - Sizeof(Size);
 
 	if (sz1 > sz2)
 		return sz1;
@@ -1839,11 +1864,12 @@ initBuffer(void)
 
 	Assert(pr_buffer);
 
-	pr_buffer->area_size = buffer_size() - (Sizeof(Size *) * num_preplay_workers) - Sizeof(PR_buffer);
+	pr_buffer->area_size = buffer_size() - (Sizeof(Size) * num_preplay_workers) - Sizeof(PR_buffer);
 	pr_buffer->needed_by_worker = (Size *)addr_forward(pr_buffer, Sizeof(PR_buffer));
-	for(needed_by_worker = pr_buffer->needed_by_worker, ii = 0; ii < num_preplay_workers; ii++)
+	needed_by_worker = &pr_buffer->needed_by_worker[0];
+	for(ii = 0; ii < num_preplay_workers; ii++)
 		needed_by_worker[ii] = 0;
-	pr_buffer->head = addr_forward(pr_buffer, Sizeof(PR_buffer));
+	pr_buffer->head = addr_forward(needed_by_worker, (Sizeof(Size) * num_preplay_workers));
 	pr_buffer->tail = addr_forward(pr_buffer, buffer_size());
 	pr_buffer->alloc_start = pr_buffer->head;
 	pr_buffer->alloc_end = pr_buffer->tail;
@@ -1957,7 +1983,7 @@ alloc_chunk(Size sz, void *start, void *end)
 
 	Assert(addr_before(start, end));
 
-	available = addr_subtract(end, start);
+	available = addr_difference(end, start);
 	if (available < sz)
 		return NULL;
 	if ((available - sz) <= Sizeof(PR_BufChunk) + Sizeof(Size))
@@ -2149,14 +2175,15 @@ PRDebug_start(int worker_idx)
 	pr_debug_signal_file = (char *)malloc(DEBUG_LOG_FILENAME_LEN);
 	sprintf(pr_debug_signal_file, "%s/%s/%d.signal", DataDir, DEBUG_LOG_DIRNAME, my_worker_idx);
 	unlink(pr_debug_signal_file);
-	PRDebug_log("Now ready to attach the debugger to pid %d.  "
+	PRDebug_log("\n-------------------------------------------\n"
+				"Now ready to attach the debugger to pid %d.  "
 				"Set the break point to PRDebug_sync()\n"
 			    "My worker idx is %d.\nPlease touch %s to begin.  "
 				"I'm waiting for it.\n\n"
 				"Do following from another shell:\n"
 				"sudo gdb\n"
 				"attach %d\n"
-				"b PRDebug_sync\n"
+				"tb PRDebug_sync\n"
 				"shell touch  %s\n"
 				"c\n",
 			getpid(), worker_idx, pr_debug_signal_file,
@@ -2295,6 +2322,14 @@ PR_debug_buffer(void)
 	for (buff_test_size = 0; testsize[buff_test_size] > 0; buff_test_size++);
 
 	buff_test = (Buff_test *)palloc(sizeof(Buff_test) * buff_test_size);
+	for (ii = 0; ii < buff_test_size; ii++)
+	{
+		curr = &buff_test[ii];
+		curr->buff = NULL;
+		curr->chunk = NULL;
+		curr->size = testsize[ii];
+	}
+
 	for (ii = 0; ii < buff_test_size; ii++)
 	{
 		curr = &buff_test[ii];

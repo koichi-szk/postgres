@@ -5466,15 +5466,19 @@ StartChildProcess(AuxProcType type, int idx)
 	av[ac++] = NULL;			/* filled in by postmaster_forkexec */
 #endif
 
-	if (idx < 0)
-		snprintf(typebuf, sizeof(typebuf), "-x%d", type);
-	else
+	snprintf(typebuf, sizeof(typebuf), "-x%d", type);
+	av[ac++] = strdup(typebuf);
+	if (type == ParallelRedoProcess)
+		av[ac++] = "-P";
+	if (idx > 0)
+	{
 		/*
 		 * For parallel recovery worker processes.  Need additional worker
 		 * process identifier.
 		 */
-		snprintf(typebuf, sizeof(typebuf), "-x%d -I%d", type, idx);
-	av[ac++] = typebuf;
+		snprintf(typebuf, sizeof(typebuf), "-I%d", idx);
+		av[ac++] = strdup(typebuf);
+	}
 
 	av[ac] = NULL;
 	Assert(ac < lengthof(av));
@@ -5486,15 +5490,34 @@ StartChildProcess(AuxProcType type, int idx)
 
 	if (pid == 0)				/* child */
 	{
+#ifdef WAL_DEBUG
+		if (PR_needTestSync() && type == ParallelRedoProcess)
+		{
+			elog(DEBUG3, "%s: %s: Starting parallel replay debug. Pid = %d.", __func__, __FILE__, getpid());
+			PRDebug_start(idx);
+		}
+#endif
 		InitPostmasterChild();
 
 		/* Close the postmaster's sockets */
-		ClosePostmasterPorts(false);
+		/*
+		 * In the case of ParallelRedoProcess, it was folked from Startup
+		 * process and all these files have already been closed.
+		 */
+		if (type != ParallelRedoProcess)
+			ClosePostmasterPorts(false);
 
 		/* Release postmaster's working memory context */
 		MemoryContextSwitchTo(TopMemoryContext);
-		MemoryContextDelete(PostmasterContext);
-		PostmasterContext = NULL;
+		/*
+		 * In the case of Parallel Replay workers, this context has already been
+		 * deleted.
+		 */
+		if (PostmasterContext)
+		{
+			MemoryContextDelete(PostmasterContext);
+			PostmasterContext = NULL;
+		}
 
 		AuxiliaryProcessMain(ac, av);	/* does not return */
 	}
