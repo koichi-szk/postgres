@@ -351,6 +351,7 @@ AuxiliaryProcessMain(int argc, char *argv[])
 			break;
 		case ParallelRedoProcess:
 			MyBackendType = B_PARALLEL_REPLAY;
+			MyProc = NULL;
 			break;
 		default:
 			MyBackendType = B_INVALID;
