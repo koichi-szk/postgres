@@ -159,6 +159,11 @@ ProcGlobalSemas(void)
  * not even in the EXEC_BACKEND case.  The ProcGlobal and AuxiliaryProcs
  * pointers must be propagated specially for EXEC_BACKEND operation.
  */
+
+#ifdef WAL_DEBUG
+uint32 aux_proc_num = 0;
+#endif
+
 void
 InitProcGlobal(void)
 {
@@ -169,7 +174,17 @@ InitProcGlobal(void)
 	uint32		TotalProcs = MaxBackends + NUM_AUXILIARY_PROCS + max_prepared_xacts;
 
 	if (parallel_replay == true)
+	{
 		TotalProcs += num_preplay_workers - 1;	/* Exclude READER WORKER */
+#ifdef WAL_DEBUG
+		aux_proc_num = NUM_AUXILIARY_PROCS + num_preplay_workers - 1;
+#endif
+	}
+#ifdef WAL_DEBUG
+	else
+		aux_proc_num = NUM_AUXILIARY_PROCS;
+#endif
+
 	/* Create the ProcGlobal shared structure */
 	ProcGlobal = (PROC_HDR *)
 		ShmemInitStruct("Proc Header", sizeof(PROC_HDR), &found);
