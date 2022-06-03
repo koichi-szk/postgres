@@ -385,6 +385,9 @@ struct PR_buffer
 {
 	Size		 area_size;			/* Exluding this buffer */
 	slock_t		 slock;				/* For allocation/free operation */
+#ifdef WAL_DEBUG
+	uint64		 updated;
+#endif
 	void		*head;				/* Start of the area: Initialized and then static */
 	void		*tail;				/* Next of the end of the area: Initialized and then static */
 	void		*alloc_start;		/* Can allocate from here. */
