@@ -92,9 +92,6 @@ static PR_buffer	*pr_buffer = NULL;
 static int           my_worker_idx = 0;         /* Index of the worker.  Set when the worker starts. */
 static PR_worker    *my_worker = NULL;      /* My worker structure */
 
-/* Socket for sync among workers */
-static int          *worker_socket = NULL;
-
 /* Module-global definition */
 #define PR_MAXPATHLEN	512
 
@@ -266,46 +263,61 @@ PR_syncInitSockDir(void)
 	rmtree(sync_sock_dir, false);
 }
 
-#define PR_SOCKF_LEN 128
 void
 PR_syncFinishSockDir(void)
 {
-	char	sockdir[PR_SOCKF_LEN];
-
-	snprintf(sockdir, PR_SOCKF_LEN, "%s/%s", Unix_socket_directories, PR_SYNCSOCKDIR);
-	rmtree(sockdir, true);
+	rmtree(sync_sock_dir, true);
 }
-#undef PR_SOCKF_LEN
 
 /*
  * Create socket and bind to the sync socket for the local worker process.
  * This should be called inside each worker process.
  */
+
+/*
+ * Structure for synchronization sockets and addresses.
+ */
+typedef struct syncSockInfo syncSockInfo;
+
+struct syncSockInfo
+{
+	int					syncsock;
+	struct sockaddr_un	sockaddr;
+};
+
+static syncSockInfo	*sync_sock_info = NULL;
+
 void
 PR_syncInit(void)
 {
     int     rc;
     int     ii;
-    struct sockaddr_un  sockaddr;
 
     Assert(pr_shm && sync_sock_dir);
 
-    worker_socket = (int *)palloc(sizeof(int) * num_preplay_workers);
+    sync_sock_info = (syncSockInfo *)palloc(sizeof(syncSockInfo) * num_preplay_workers);
 
     for (ii = 0; ii < num_preplay_workers; ii++)
     {
-        worker_socket[ii] = socket(AF_UNIX, SOCK_DGRAM, 0);
-        if (worker_socket[ii] < 0)
-            ereport(FATAL,
-                    (errcode_for_socket_access(),
-                     errmsg("Could not create the socket: %m")));
-        sprintf(sockaddr.sun_path, PR_SYNCSOCKFMT, Unix_socket_directories, PR_SYNCSOCKDIR, ii);
-        sockaddr.sun_family = AF_UNIX;
-        rc = bind(worker_socket[ii], &sockaddr, sizeof(sockaddr));
-        if (rc < 0)
-            ereport(FATAL,
-                    (errcode_for_socket_access(),
-                     errmsg("Could not bind the socket to \"%s\": %m", sockaddr.sun_path)));
+        sprintf(sync_sock_info[ii].sockaddr.sun_path,
+				PR_SYNCSOCKFMT, Unix_socket_directories, PR_SYNCSOCKDIR, ii);
+        sync_sock_info[ii].sockaddr.sun_family = AF_UNIX;
+
+		sync_sock_info[ii].syncsock = socket(AF_UNIX, SOCK_DGRAM, 0);
+		if (sync_sock_info[ii].syncsock < 0)
+			ereport(FATAL,
+					(errcode_for_socket_access(),
+					 errmsg("Could not create the socket: %m")));
+
+		if (ii == my_worker_idx)
+		{
+			rc = bind(sync_sock_info[ii].syncsock, &sync_sock_info[ii].sockaddr, sizeof(struct sockaddr_un));
+			if (rc < 0)
+				ereport(FATAL,
+						(errcode_for_socket_access(),
+						 errmsg("Could not bind the socket to \"%s\": %m",
+							 sync_sock_info[ii].sockaddr.sun_path)));
+		}
     }
     snprintf(my_worker_msg, PR_SYNC_MSG_SZ, "%04d\n", my_worker_idx);
     my_worker_msg_sz = strlen(my_worker_msg);
@@ -319,7 +331,9 @@ PR_syncFinish(void)
 	Assert (pr_shm && sync_sock_dir);
 
 	for (ii = 0; ii < num_preplay_workers; ii++)
-		close(worker_socket[ii]);
+		close(sync_sock_info[ii].syncsock);
+	pfree(sync_sock_info);
+	sync_sock_info = NULL;
 }
 
 void
@@ -329,11 +343,13 @@ PR_sendSync(int worker_idx)
 
     Assert(pr_shm && worker_idx != my_worker_idx);
 
-    ll = send(worker_socket[worker_idx], my_worker_msg, my_worker_msg_sz, 0);
+    ll = sendto(sync_sock_info[worker_idx].syncsock, my_worker_msg, my_worker_msg_sz, 0,
+			&sync_sock_info[worker_idx].sockaddr, sizeof(struct sockaddr_un));
     if (ll != my_worker_msg_sz)
         ereport(ERROR,
                 (errcode_for_socket_access(),
-                 errmsg("Could not send whole message from worker %d to %d: %m", my_worker_idx, worker_idx)));
+                 errmsg("Could not send whole message from worker %d to %d: %m",
+					 my_worker_idx, worker_idx)));
 }
 
 int
@@ -345,7 +361,7 @@ PR_recvSync(void)
 
     Assert (pr_shm);
 
-    sz = recv(worker_socket[my_worker_idx], recv_buf, SYNC_RECV_BUF_SZ, 0);
+    sz = recv(sync_sock_info[my_worker_idx].syncsock, recv_buf, SYNC_RECV_BUF_SZ, 0);
     if (sz < 0)
         ereport(ERROR,
                 (errcode_for_socket_access(),
@@ -1573,6 +1589,13 @@ fold_int2int8(int val)
  *
  ****************************************************************************
  */
+/*
+ * Koichi:
+ *	バッファの管理の試験のため、現在のバッファエリアの CHUNK をダンプする
+ *	関数を実装して、これを呼べるようにすること。
+ *	これで、buffer allocation/free のたびにグローバルなバッファエリアの確認
+ *	が可能となるようにする。
+ */
 
 #define SizeAtTail(chunk)   (Size *)(addr_backward(addr_forward((chunk), (chunk)->size), Sizeof(Size)))
 #define Chunk(buffer)		(PR_BufChunk *)(addr_backward((buffer), Sizeof(PR_BufChunk)))
@@ -1783,7 +1806,15 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	}
 	free_chunk(chunk);
 
-	/* Check the available chunk size */
+	/*
+	 * Check the available chunk size
+	 *
+	 * If we have sufficient space avaiable for request from another worker,
+	 * which should be waiting with Sync socket, we send sync so that the
+	 * worker can get buffer allocated.   There is still small chance that
+	 * such available buffer can be stolen by another worker but the worker
+	 * can try again yet.
+	 */
 
 	available = available_size(pr_buffer);
 
@@ -1796,6 +1827,8 @@ PR_freeBuffer(void *buffer, bool need_lock)
 			{
 				if (need_lock)
 					SpinLockRelease(&pr_buffer->slock);
+				if (ii == my_worker_idx)
+					elog(PANIC, "Conflicting situation: replay worker freeing the buffer is also waiting for the buffer.");
 				PR_sendSync(ii);
 				return;
 			}
@@ -1817,6 +1850,8 @@ PR_freeBuffer(void *buffer, bool need_lock)
 			{
 				if (need_lock)
 					SpinLockRelease(&pr_buffer->slock);
+				if (ii == my_worker_idx)
+					elog(PANIC, "Conflicting situation: replay worker freeing the buffer is also waiting for the buffer.");
 				PR_sendSync(ii);
 				return;
 			}
