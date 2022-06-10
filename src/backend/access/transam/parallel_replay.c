@@ -2154,6 +2154,7 @@ static void
 concat_prev_chunk(PR_BufChunk *chunk)
 {
 	PR_BufChunk *prev;
+	PR_BufChunk *new_end;
 	Size	*size_at_tail;
 
 	Assert(pr_buffer && (chunk->magic == PR_BufChunk_Free));
@@ -2165,10 +2166,13 @@ concat_prev_chunk(PR_BufChunk *chunk)
 	prev = prev_chunk(chunk);
 	if (prev->magic != PR_BufChunk_Free)
 		return;
+	new_end = next_chunk(chunk);
 	prev->size += chunk->size;
 	*size_at_tail = prev->size;
 	if (chunk == pr_buffer->alloc_start)
 		pr_buffer->alloc_start = prev;
+	if (addr_after(pr_buffer->alloc_end, prev) && addr_before(pr_buffer->alloc_end, new_end))
+		pr_buffer->alloc_end = new_end;
 }
 
 /* Rearrange pr_buffer->alloc_start */
