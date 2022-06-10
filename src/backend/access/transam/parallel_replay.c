@@ -1675,7 +1675,7 @@ dump_buffer(const char *funcname, bool need_lock)
 		Size *size_at_tail;
 
 		size_at_tail = SizeAtTail(curr_chunk);
-		appendStringInfo(&s, "Addr: 0x%016lx (%ld), Size: %lx, Magic: %s, Size_at_tail: %lx\n",
+		appendStringInfo(&s, "Addr: 0x%016lx (%ld), Size: %ld, Magic: %s, Size_at_tail: %ld\n",
 								(uint64)curr_chunk,
 								addr_difference(pr_buffer, curr_chunk),
 								curr_chunk->size,
@@ -2087,6 +2087,7 @@ initBuffer(void)
 	*size_at_tail = chunk->size;
 #ifdef WAL_DEBUG
 	pr_buffer->updated = 0;
+	dump_buffer(__func__, false);
 #endif
 	SpinLockInit(&pr_buffer->slock);
 }
@@ -2126,6 +2127,7 @@ static void
 concat_next_chunk(PR_BufChunk *chunk)
 {
 	PR_BufChunk *next;
+	PR_BufChunk *new_end;
 	Size	*size_at_tail;
 
 	Assert(pr_buffer && (chunk->magic == PR_BufChunk_Free));
@@ -2136,11 +2138,14 @@ concat_next_chunk(PR_BufChunk *chunk)
 		return;
 	if (next->magic != PR_BufChunk_Free)
 		return;
+	new_end = next_chunk(next);
 	chunk->size += next->size;
 	size_at_tail = SizeAtTail(chunk);
 	*size_at_tail = chunk->size;
 	if (next == pr_buffer->alloc_start)
 		pr_buffer->alloc_start = chunk;
+	if (next == pr_buffer->alloc_end)
+		pr_buffer->alloc_end = new_end;
 }
 
 /* Concatinate this free chunk with the previous one */
@@ -2190,6 +2195,7 @@ alloc_chunk(Size sz, void *start, void *end)
 	Size		 available;
 	PR_BufChunk	*chunk;
 	PR_BufChunk	*next;
+	Size *size_at_tail;
 
 	Assert(addr_before(start, end));
 
@@ -2201,11 +2207,11 @@ alloc_chunk(Size sz, void *start, void *end)
 	chunk = (PR_BufChunk *)start;
 	chunk->size = sz;
 	chunk->magic = PR_BufChunk_Allocated;
+	size_at_tail = SizeAtTail(chunk);
+	*size_at_tail = sz;
 	next = next_chunk(chunk);
 	if (available > sz)
 	{
-		Size *size_at_tail;
-
 		next->size = available - sz;
 		next->magic = PR_BufChunk_Free;
 		size_at_tail = SizeAtTail(next);
@@ -2455,6 +2461,7 @@ static void
 PRDebug_out(StringInfo s)
 {
 	fwrite(s->data, s->len, sizeof(char), pr_debug_log);
+	fflush(pr_debug_log);
 }
 
 static void
