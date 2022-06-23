@@ -7355,6 +7355,7 @@ StartupXLOG(void)
 			PR_initShm();
 #ifdef WAL_DEBUG
 			PR_debug_buffer();
+			PR_debug_buffer2();
 #endif
 			PR_WorkerStartup();
 		}

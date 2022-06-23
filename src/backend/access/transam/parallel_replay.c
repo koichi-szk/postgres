@@ -2540,6 +2540,7 @@ PR_debug_buffer(void)
 	int ii;
 	Buff_test	*curr;
 
+
 	for (buff_test_size = 0; testsize[buff_test_size] > 0; buff_test_size++);
 
 	buff_test = (Buff_test *)palloc(sizeof(Buff_test) * buff_test_size);
@@ -2570,6 +2571,63 @@ PR_debug_buffer(void)
 		curr->size = buff_test[ii+1].size;
 		curr->buff = PR_allocBuffer(curr->size, true);
 		curr->chunk = Chunk(curr->buff);
+	}
+	for (ii = 0; ii < buff_test_size; ii++)
+	{
+		curr = &buff_test[ii];
+		if (curr->buff)
+			PR_freeBuffer(curr->buff, true);
+	}
+}
+
+/*
+ * Test buffer management including wraparound
+ * Assumes the shared buffer size is around 4MG.
+ * 1. Leave three buffers allocated
+ * 2. Free the latest buffer
+ * 3. Allocate the same size of the buffer.
+ */
+void
+PR_debug_buffer2(void)
+{
+	static Size testsize[] = {512 * 1024, 512 * 1024, 512 * 1024, 512 * 1024,  0};
+	int ii, jj;
+	Buff_test	*curr;
+
+	for (buff_test_size = 0; testsize[buff_test_size] > 0; buff_test_size++);
+
+	buff_test = (Buff_test *)palloc(sizeof(Buff_test) * buff_test_size);
+	for (ii = 0; ii < buff_test_size; ii++)
+	{
+		curr = &buff_test[ii];
+		curr->buff = NULL;
+		curr->chunk = NULL;
+		curr->size = testsize[ii];
+	}
+
+	/*
+	 * Allocate initial buffer
+	 */
+	for (ii = 0; ii < buff_test_size; ii++)
+	{
+		curr = &buff_test[ii];
+		curr->buff = PR_allocBuffer(curr->size, true);
+		curr->chunk = Chunk(curr->buff);
+	}
+	/*
+	 * Itellate free and allocate
+	 */
+	for (jj = 0; jj < 10; jj++)
+	{
+		for (ii = 0; ii < buff_test_size - 1; ii+=2)
+		{
+			curr =&buff_test[ii];
+			PR_freeBuffer(curr->buff, true);
+			curr->buff = NULL;
+			curr->chunk = NULL;
+			curr->buff = PR_allocBuffer(curr->size, true);
+			curr->chunk = Chunk(curr->buff);
+		}
 	}
 	for (ii = 0; ii < buff_test_size; ii++)
 	{

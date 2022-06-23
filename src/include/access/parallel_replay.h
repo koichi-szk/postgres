@@ -433,6 +433,7 @@ extern void PRDebug_sync(void);
 extern void PRDebug_log(char *fmt, ...) __attribute__ ((format (printf, 1, 2)));
 extern void PRDebug_finish(void);
 extern void PR_debug_buffer(void);
+extern void PR_debug_buffer2(void);
 extern void PR_debug_analyzeState(XLogReaderState *state, XLogRecord *record);
 
 /*
