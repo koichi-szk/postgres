@@ -7354,8 +7354,10 @@ StartupXLOG(void)
 			PR_syncInitSockDir();
 			PR_initShm();
 #ifdef WAL_DEBUG
+#if 0
 			PR_debug_buffer();
 			PR_debug_buffer2();
+#endif
 #endif
 			PR_WorkerStartup();
 		}
@@ -7582,9 +7584,8 @@ StartupXLOG(void)
 #ifdef WAL_DEBUG
 					xlogreader_PR->xlog_string = xlog_string;
 					PR_debug_analyzeState(xlogreader_PR, record);
-#else
-					PR_enqueue(xlogreader_PR, ReaderState, PR_DISPATCHER_WORKER_IDX);
 #endif
+					PR_enqueue(xlogreader_PR, ReaderState, PR_DISPATCHER_WORKER_IDX);
 				}
 				else
 				{

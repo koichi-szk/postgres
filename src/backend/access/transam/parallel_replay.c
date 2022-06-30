@@ -1534,6 +1534,7 @@ PR_analyzeXLogReaderState(XLogReaderState *reader, XLogRecord *record)
 	int			block_hash;
 
 	dispatch_data = PR_allocXLogDispatchData();
+	dispatch_data->reader = reader;
 	dispatch_data->reader->record = record;
 
 	for (ii = 0; ii < num_preplay_workers; ii++)
@@ -2398,6 +2399,7 @@ PRDebug_start(int worker_idx)
 				"sudo gdb\n"
 				"attach %d\n"
 				"tb PRDebug_sync\n"
+				"source breaksymbol.gdb\n"
 				"shell touch  %s\n"
 				"c\n",
 			getpid(), worker_idx, pr_debug_signal_file,
@@ -2590,7 +2592,7 @@ PR_debug_buffer(void)
 void
 PR_debug_buffer2(void)
 {
-	static Size testsize[] = {512 * 1024, 512 * 1024, 512 * 1024, 512 * 1024,  0};
+	static Size testsize[] = {384 * 1024, 384 * 1024, 384 * 1024, 384 * 1024,  0};
 	int ii, jj;
 	Buff_test	*curr;
 
@@ -2619,7 +2621,7 @@ PR_debug_buffer2(void)
 	 */
 	for (jj = 0; jj < 10; jj++)
 	{
-		for (ii = 0; ii < buff_test_size - 1; ii+=2)
+		for (ii = 0; ii < buff_test_size; ii++)
 		{
 			curr =&buff_test[ii];
 			PR_freeBuffer(curr->buff, true);
@@ -2997,13 +2999,13 @@ dispatcherWorkerLoop(void)
 
 	for (;;)
 	{
+		/* Dequeue */
 		el = PR_fetchQueue();
 		if (el == NULL)
 			break;	/* Process termination request */
+		PR_freeQueueElement(el);
 		if (el->data_type != ReaderState)
 			elog(PANIC, "Invalid internal status for dispatcher worker.");
-		/* Dequeue */
-		PR_freeQueueElement(el);
 		reader = (XLogReaderState *)el->data;
 		record = reader->record;
 		dispatch_data = PR_analyzeXLogReaderState(reader, record);
