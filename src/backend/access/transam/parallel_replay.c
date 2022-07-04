@@ -3003,10 +3003,10 @@ dispatcherWorkerLoop(void)
 		el = PR_fetchQueue();
 		if (el == NULL)
 			break;	/* Process termination request */
-		PR_freeQueueElement(el);
 		if (el->data_type != ReaderState)
 			elog(PANIC, "Invalid internal status for dispatcher worker.");
 		reader = (XLogReaderState *)el->data;
+		PR_freeQueueElement(el);
 		record = reader->record;
 		dispatch_data = PR_analyzeXLogReaderState(reader, record);
 		dispatchDataToXLogHistory(dispatch_data);
