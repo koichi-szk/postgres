@@ -129,13 +129,10 @@ static int	 my_worker_idx;
 #if 0
 #define addr_subtract(a, b) ((Size)((b) - (a)))
 #endif
-#define size_boundary(s)    ((((s) + MemBoundary - 1) / MemBoundary) * MemBoundary)
-#define address_boundary(s) (((((uint64)(s)) + MemBoundary - 1) / MemBoundary) * MemBoundary)
 #define addr_after(a, b)    ((uint64)(a) > (uint64)(b))
 #define addr_after_eq(a, b) ((uint64)(a) >= (uint64)(b))
 #define addr_before(a, b)   ((uint64)(a) < (uint64)(b))
 #define addr_before_eq(a, b)    ((uint64)(a) <= (uint64)(b))
-#define Sizeof(s)           size_boundary(sizeof(s))
 
 static Size
 addr_difference(void *start, void * end)
@@ -454,9 +451,9 @@ PR_initShm(void)
 
 	Assert(my_worker_idx == PR_READER_WORKER);
 
-	my_shm_size = Sizeof(PR_shm)
+	my_shm_size = pr_sizeof(PR_shm)
 		+ (my_txn_hash_sz = pr_txn_hash_size())
-		+ (my_invalidP_sz = Sizeof(PR_invalidPages))
+		+ (my_invalidP_sz = pr_sizeof(PR_invalidPages))
 		+ (my_history_sz = xlogHistorySize())
 		+ (my_worker_sz = worker_size())
 	   	+ (my_queue_sz = queue_size())
@@ -465,9 +462,9 @@ PR_initShm(void)
 	pr_shm_seg = dsm_create(my_shm_size, 0);
 	
 	pr_shm = dsm_segment_address(pr_shm_seg);
-	pr_shm->txn_wal_info = pr_txn_wal_info = addr_forward(pr_shm, Sizeof(PR_shm));
+	pr_shm->txn_wal_info = pr_txn_wal_info = addr_forward(pr_shm, pr_sizeof(PR_shm));
 	pr_shm->invalidPages = pr_invalidPages = addr_forward(pr_txn_wal_info, my_txn_hash_sz);
-	pr_shm->history = pr_history = addr_forward(pr_invalidPages, Sizeof(PR_invalidPages));
+	pr_shm->history = pr_history = addr_forward(pr_invalidPages, pr_sizeof(PR_invalidPages));
 	pr_shm->workers = pr_worker = addr_forward(pr_history, my_history_sz);
 	pr_shm->queue = pr_queue = addr_forward(pr_worker, my_worker_sz);
 	pr_shm->buffer = pr_buffer = addr_forward(pr_queue, my_queue_sz);
@@ -521,8 +518,8 @@ pr_txn_hash_size(void)
 	if (num_preplay_max_txn < MaxConnections)
 		num_preplay_max_txn = MaxConnections;
 	txn_hash_size = num_preplay_max_txn/2;
-	return (Sizeof(txn_wal_info_PR) + (Sizeof(txn_hash_el_PR) * txn_hash_size)
-			+ (Sizeof(txn_cell_PR) * num_preplay_max_txn));
+	return (pr_sizeof(txn_wal_info_PR) + (pr_sizeof(txn_hash_el_PR) * txn_hash_size)
+			+ (pr_sizeof(txn_cell_PR) * num_preplay_max_txn));
 }
 
 static void
@@ -534,8 +531,8 @@ init_txn_hash(void)
 
 
 	pr_txn_wal_info = pr_shm->txn_wal_info;
-	pr_txn_wal_info->txn_hash = pr_txn_hash = (txn_hash_el_PR *)addr_forward(pr_txn_wal_info, Sizeof(txn_wal_info_PR));
-	pr_txn_wal_info->cell_pool = pr_txn_cell_pool = (txn_cell_PR *)addr_forward(pr_txn_wal_info->txn_hash, Sizeof(txn_hash_el_PR) * txn_hash_size);
+	pr_txn_wal_info->txn_hash = pr_txn_hash = (txn_hash_el_PR *)addr_forward(pr_txn_wal_info, pr_sizeof(txn_wal_info_PR));
+	pr_txn_wal_info->cell_pool = pr_txn_cell_pool = (txn_cell_PR *)addr_forward(pr_txn_wal_info->txn_hash, pr_sizeof(txn_hash_el_PR) * txn_hash_size);
 	for (ii = 0, txn_hash = pr_txn_wal_info->txn_hash; ii < txn_hash_size; ii++)
 	{
 		SpinLockInit(&txn_hash[ii].slock);
@@ -822,7 +819,7 @@ PR_log_invalid_page(RelFileNode node, ForkNumber forkno, BlockNumber blkno, bool
 
 	Assert(PR_isInParallelRecovery());
 
-	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(Sizeof(invalidData), true);
+	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(pr_sizeof(invalidData), true);
 	invalidData->cmd = PR_LOG;
 	invalidData->node = node;
 	invalidData->forkno = forkno;
@@ -840,7 +837,7 @@ PR_forget_invalid_pages(RelFileNode node, ForkNumber forkno, BlockNumber minblkn
 
 	Assert(PR_isInParallelRecovery());
 
-	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(Sizeof(invalidData), true);
+	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(pr_sizeof(invalidData), true);
 	invalidData->cmd = PR_FORGET_PAGES;
 	invalidData->node = node;
 	invalidData->forkno = forkno;
@@ -858,7 +855,7 @@ PR_forget_invalid_pages_db(Oid dbid)
 
 	Assert(PR_isInParallelRecovery());
 
-	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(Sizeof(invalidData), true);
+	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(pr_sizeof(invalidData), true);
 	invalidData->cmd = PR_FORGET_DB;
 	invalidData->forkno = 0;
 	invalidData->blkno = 0;
@@ -886,7 +883,7 @@ PR_XLogCheckInvalidPages(void)
 
 	Assert(PR_isInParallelRecovery());
 
-	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(Sizeof(invalidData), true);
+	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(pr_sizeof(invalidData), true);
 	invalidData->cmd = PR_CHECK_INVALID_PAGES;
 	invalidData->forkno = 0;
 	invalidData->blkno = 0;
@@ -907,7 +904,7 @@ PR_XLogCheckInvalidPages(void)
 INLINE Size
 xlogHistorySize(void)
 {
-	return (Sizeof(PR_XLogHistory) + (Sizeof(PR_XLogHistory_el) * (num_preplay_worker_queue + 2)));
+	return (pr_sizeof(PR_XLogHistory) + (pr_sizeof(PR_XLogHistory_el) * (num_preplay_worker_queue + 2)));
 }
 
 static void
@@ -918,7 +915,7 @@ initXLogHistory(void)
 
 	Assert(pr_history);
 
-	el = (PR_XLogHistory_el *)addr_forward(pr_history, Sizeof(PR_XLogHistory));
+	el = (PR_XLogHistory_el *)addr_forward(pr_history, pr_sizeof(PR_XLogHistory));
 	pr_history->hist_head = &el[0];
 	pr_history->hist_end = &el[0];
 	for (ii = 0; ii < num_preplay_worker_queue + 2; ii++)
@@ -1039,7 +1036,7 @@ PR_myWorker(void)
 INLINE Size
 worker_size(void)
 {
-	return (Sizeof(PR_worker) * num_preplay_workers);
+	return (pr_sizeof(PR_worker) * num_preplay_workers);
 }
 
 static void
@@ -1255,9 +1252,9 @@ void ParallelRedoProcessMain(int idx)
 INLINE Size
 queue_size(void)
 {
-	return (Sizeof(PR_queue)									/* Queue sructure */
-			+ (Sizeof(int) * (num_preplay_workers + 1))			/* Worker array after Queue */
-			+ (Sizeof(PR_queue_el) * num_preplay_worker_queue));/* Queue element */
+	return (pr_sizeof(PR_queue)									/* Queue sructure */
+			+ (pr_sizeof(int) * (num_preplay_workers + 1))			/* Worker array after Queue */
+			+ (pr_sizeof(PR_queue_el) * num_preplay_worker_queue));/* Queue element */
 }
 
 static void
@@ -1266,7 +1263,7 @@ initQueue(void)
 	Assert(pr_queue);
 
 	pr_queue->num_queue_element = num_preplay_worker_queue;
-	pr_queue->wait_worker_list = addr_forward(pr_queue, Sizeof(PR_queue));
+	pr_queue->wait_worker_list = addr_forward(pr_queue, pr_sizeof(PR_queue));
 	initQueueElement();
 	SpinLockInit(&pr_queue->slock);
 }
@@ -1279,7 +1276,7 @@ initQueueElement(void)
 
 	Assert(pr_queue);
 
-	pr_queue->element = addr_forward(pr_queue->wait_worker_list, Sizeof(int) * (num_preplay_workers + 1));
+	pr_queue->element = addr_forward(pr_queue->wait_worker_list, pr_sizeof(int) * (num_preplay_workers + 1));
 	for (ii = 0, el = pr_queue->element; ii < num_preplay_worker_queue; ii++, el++)
 	{
 		el->next = el + 1;
@@ -1429,6 +1426,11 @@ PR_fetchQueue(void)
 			my_worker->wait_dispatch = true;
 			SpinLockRelease(&my_worker->slock);
 
+#if 0
+			/*
+			 * Koichi: ここのコード、おかしい。ここは素直に待って、allocBuffer() で
+			 * クリンチになっていることを調べたほうがいい。
+			 */
 			/*
 			 * Check if there are at least one worker running. If not,
 			 * no worker will take care of the dispatch.
@@ -1439,7 +1441,7 @@ PR_fetchQueue(void)
 						"All workers are waiting due to small preplay_buffers value.  "
 						"Please consider to increase this configuation parameter.");
 			}
-
+#endif
 			PR_recvSync();
 			return PR_fetchQueue();
 		}
@@ -1499,7 +1501,7 @@ PR_enqueueXLogReaderState(XLogReaderState *state, XLogRecord *record, int worker
 {
 	XLogReaderState *state_shm;
 
-	state_shm = PR_allocBuffer(Sizeof(XLogReaderState), true);
+	state_shm = PR_allocBuffer(pr_sizeof(XLogReaderState), true);
 	memcpy(state_shm, state, sizeof(XLogReaderState));
 	state_shm->record = record;
 	PR_enqueue(state_shm, ReaderState, worker_idx);
@@ -1511,13 +1513,13 @@ PR_allocXLogDispatchData(void)
 	XLogDispatchData_PR *dispatch_data;
 	Size	sz;
    
-	sz = Sizeof(XLogDispatchData_PR)
-		+ Sizeof((sizeof(bool) * num_preplay_workers))
-		+ Sizeof((sizeof(int) * (num_preplay_workers + 1)));
+	sz = pr_sizeof(XLogDispatchData_PR)
+		+ size_boundary((sizeof(bool) * num_preplay_workers))
+		+ size_boundary((sizeof(int) * (num_preplay_workers + 1)));
 
 	dispatch_data = (XLogDispatchData_PR *)PR_allocBuffer(sz, true);
-	dispatch_data->worker_array = addr_forward(dispatch_data, Sizeof(XLogDispatchData_PR));
-	dispatch_data->worker_list = addr_forward(dispatch_data->worker_array, Sizeof((sizeof(bool) * num_preplay_workers)));
+	dispatch_data->worker_array = addr_forward(dispatch_data, pr_sizeof(XLogDispatchData_PR));
+	dispatch_data->worker_list = addr_forward(dispatch_data->worker_array, size_boundary((sizeof(bool) * num_preplay_workers)));
 	return dispatch_data;
 }
 
@@ -1626,10 +1628,10 @@ fold_int2int8(int val)
  *	が可能となるようにする。
  */
 
-#define SizeAtTail(chunk)   (Size *)(addr_backward(addr_forward((chunk), (chunk)->size), Sizeof(Size)))
-#define Chunk(buffer)		(PR_BufChunk *)(addr_backward((buffer), Sizeof(PR_BufChunk)))
+#define SizeAtTail(chunk)   (Size *)(addr_backward(addr_forward((chunk), (chunk)->size), pr_sizeof(Size)))
+#define Chunk(buffer)		(PR_BufChunk *)(addr_backward((buffer), pr_sizeof(PR_BufChunk)))
 #define Tail(buffer)		SizeAtTail(Chunk(buffer))
-#define Buffer(chunk)		(void *)addr_forward(chunk, Sizeof(PR_BufChunk))
+#define Buffer(chunk)		(void *)addr_forward(chunk, pr_sizeof(PR_BufChunk))
 
 INLINE PR_BufChunk *
 next_chunk(PR_BufChunk *chunk)
@@ -1651,7 +1653,7 @@ dump_buffer(const char *funcname, bool need_lock)
 	if (need_lock)
 		SpinLockAcquire(&pr_buffer->slock);
 	initStringInfo(&s);
-	appendStringInfo(&s, "\n=== Buffer area dump: func: %s =================\n", funcname);
+	appendStringInfo(&s, "\n=== Buffer area dump: func: %s, worker: %d =================\n", funcname, my_worker_idx);
 	appendStringInfo(&s, "Pr_buffer: 0x%016lx, updated: %ld,\n", (uint64)pr_buffer, pr_buffer->updated);
 	appendStringInfo(&s, "head: 0x%016lx (%ld), tail: 0x%016lx (%ld)\n",
 								(uint64)(pr_buffer->head), addr_difference(pr_buffer, pr_buffer->head),
@@ -1741,6 +1743,7 @@ PR_allocBuffer(Size sz, bool need_lock)
 	void		*rv;
 
 #ifdef WAL_DEBUG
+	PRDebug_log("--- %s: allocation size: %lu ---\n", __func__, sz);
 	dump_buffer(__func__, need_lock);
 #endif
 	if (need_lock)
@@ -1755,7 +1758,7 @@ PR_allocBuffer(Size sz, bool need_lock)
 			SpinLockRelease(&pr_buffer->slock);
 		return retry_allocBuffer(sz, need_lock);
 	}
-	chunk_sz = sz + Sizeof(PR_BufChunk) + Sizeof(Size);
+	chunk_sz = sz + pr_sizeof(PR_BufChunk) + pr_sizeof(Size);
 	if (addr_before(pr_buffer->alloc_start, pr_buffer->alloc_end))
 	{
 		new = alloc_chunk(chunk_sz, pr_buffer->alloc_start, pr_buffer->alloc_end);
@@ -1766,6 +1769,7 @@ PR_allocBuffer(Size sz, bool need_lock)
 			rv = retry_allocBuffer(sz, need_lock);
 #ifdef WAL_DEBUG
 			dump_buffer(__func__, need_lock);
+			PRDebug_log("--- %s: returning: %p ---\n", __func__, rv);
 #endif
 			return rv;
 		}
@@ -1773,9 +1777,10 @@ PR_allocBuffer(Size sz, bool need_lock)
 		{
 			if (need_lock)
 				SpinLockRelease(&pr_buffer->slock);
-			rv = addr_forward(new, Sizeof(PR_BufChunk));
+			rv = addr_forward(new, pr_sizeof(PR_BufChunk));
 #ifdef WAL_DEBUG
 			dump_buffer(__func__, need_lock);
+			PRDebug_log("--- %s: returning: %p ---\n", __func__, rv);
 #endif
 			return rv;
 		}
@@ -1787,9 +1792,10 @@ PR_allocBuffer(Size sz, bool need_lock)
 		{
 			if (need_lock)
 				SpinLockRelease(&pr_buffer->slock);
-			rv = addr_forward(new, Sizeof(PR_BufChunk));
+			rv = addr_forward(new, pr_sizeof(PR_BufChunk));
 #ifdef WAL_DEBUG
 			dump_buffer(__func__, need_lock);
+			PRDebug_log("--- %s: returning: %p ---\n", __func__, rv);
 #endif
 			return rv;
 		}
@@ -1804,6 +1810,7 @@ PR_allocBuffer(Size sz, bool need_lock)
 			rv = retry_allocBuffer(sz, need_lock);
 #ifdef WAL_DEBUG
 			dump_buffer(__func__, need_lock);
+			PRDebug_log("--- %s: returning: %p ---\n", __func__, rv);
 #endif
 			return rv;
 		}
@@ -1811,9 +1818,10 @@ PR_allocBuffer(Size sz, bool need_lock)
 		{
 			if (need_lock)
 				SpinLockRelease(&pr_buffer->slock);
-			rv = addr_forward(new, Sizeof(PR_BufChunk));
+			rv = addr_forward(new, pr_sizeof(PR_BufChunk));
 #ifdef WAL_DEBUG
 			dump_buffer(__func__, need_lock);
+			PRDebug_log("--- %s: returning: %p ---\n", __func__, rv);
 #endif
 			return rv;
 		}
@@ -1822,6 +1830,7 @@ PR_allocBuffer(Size sz, bool need_lock)
 		SpinLockRelease(&pr_buffer->slock);
 #ifdef WAL_DEBUG
 		dump_buffer(__func__, need_lock);
+		PRDebug_log("--- %s: returning: NULL ---\n", __func__);
 #endif
 	return NULL;
 }
@@ -1953,6 +1962,7 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	/* Ping the reader worker only when dispatcher does not require the buffer */
 
 #ifdef WAL_DEBUG
+	PRDebug_log("--- %s: freeing: %p ---\n", __func__, buffer);
 	dump_chunk(Chunk(buffer), __func__, need_lock);
 	dump_buffer(__func__, need_lock);
 #endif
@@ -2045,10 +2055,10 @@ available_size(PR_buffer *buffer)
 			sz2;
 
 	if (addr_before(buffer->alloc_start, buffer->alloc_end))
-		return ((PR_BufChunk *)buffer)->size - Sizeof(PR_BufChunk) - Sizeof(Size);
+		return ((PR_BufChunk *)buffer)->size - pr_sizeof(PR_BufChunk) - pr_sizeof(Size);
 
-	sz1 = addr_difference(buffer->tail, buffer->alloc_start) - Sizeof(PR_BufChunk) - Sizeof(Size);
-	sz2 = addr_difference(buffer->alloc_end, buffer->head) - Sizeof(PR_BufChunk) - Sizeof(Size);
+	sz1 = addr_difference(buffer->tail, buffer->alloc_start) - pr_sizeof(PR_BufChunk) - pr_sizeof(Size);
+	sz2 = addr_difference(buffer->alloc_end, buffer->head) - pr_sizeof(PR_BufChunk) - pr_sizeof(Size);
 
 	if (sz1 > sz2)
 		return sz1;
@@ -2072,12 +2082,12 @@ initBuffer(void)
 
 	Assert(pr_buffer);
 
-	pr_buffer->area_size = buffer_size() - (Sizeof(Size) * num_preplay_workers) - Sizeof(PR_buffer);
-	pr_buffer->needed_by_worker = (Size *)addr_forward(pr_buffer, Sizeof(PR_buffer));
+	pr_buffer->area_size = buffer_size() - (pr_sizeof(Size) * num_preplay_workers) - pr_sizeof(PR_buffer);
+	pr_buffer->needed_by_worker = (Size *)addr_forward(pr_buffer, pr_sizeof(PR_buffer));
 	needed_by_worker = &pr_buffer->needed_by_worker[0];
 	for(ii = 0; ii < num_preplay_workers; ii++)
 		needed_by_worker[ii] = 0;
-	pr_buffer->head = addr_forward(needed_by_worker, (Sizeof(Size) * num_preplay_workers));
+	pr_buffer->head = addr_forward(needed_by_worker, (pr_sizeof(Size) * num_preplay_workers));
 	pr_buffer->tail = addr_forward(pr_buffer, buffer_size());
 	pr_buffer->alloc_start = pr_buffer->head;
 	pr_buffer->alloc_end = pr_buffer->tail;
@@ -2102,7 +2112,7 @@ prev_chunk(PR_BufChunk *chunk)
 
 	if (chunk == (PR_BufChunk *)pr_buffer->head)
 		return NULL;
-	size_at_tail = addr_backward(chunk, Sizeof(Size));
+	size_at_tail = addr_backward(chunk, pr_sizeof(Size));
 	return (PR_BufChunk *)addr_backward(chunk, *size_at_tail);
 }
 
@@ -2207,7 +2217,7 @@ alloc_chunk(Size sz, void *start, void *end)
 	available = addr_difference(end, start);
 	if (available < sz)
 		return NULL;
-	if ((available - sz) <= Sizeof(PR_BufChunk) + Sizeof(Size))
+	if ((available - sz) <= pr_sizeof(PR_BufChunk) + pr_sizeof(Size))
 		sz = available;
 	chunk = (PR_BufChunk *)start;
 	chunk->size = sz;

@@ -35,6 +35,16 @@ extern bool PR_test;					/* Option to sync to the debugger */
 
 #define MAX_PR_NUM_WORKERS	127			/* Max number of replay worker */
 
+/*
+ ************************************************************************************************
+ *
+ * Fundamental Macros
+ *
+ ************************************************************************************************
+ */
+#define size_boundary(s)    ((((s) + MemBoundary - 1) / MemBoundary) * MemBoundary)
+#define address_boundary(s) (((((uint64)(s)) + MemBoundary - 1) / MemBoundary) * MemBoundary)
+#define pr_sizeof(s)           size_boundary(sizeof(s))
 
 /*
  ************************************************************************************************
@@ -145,7 +155,7 @@ typedef struct PR_worker
 	PR_queue_el	*tail;			/* Dispatched queue tail.   Append queue element after this. */
 } PR_worker;
 
-#define PR_worker_sz	(Sizeof(PR_worker) * num_preplay_workers)
+#define PR_worker_sz	(pr_sizeof(PR_worker) * num_preplay_workers)
 
 /* Flag values */
 /*
@@ -333,7 +343,7 @@ struct PR_queue_el
 	void				*data;
 };
 
-#define PR_queue_el_sz	(Sizeof(queue_el) * num_preplay_worker_queue)
+#define PR_queue_el_sz	(pr_sizeof(queue_el) * num_preplay_worker_queue)
 
 struct PR_queue
 {
@@ -343,7 +353,7 @@ struct PR_queue
 	PR_queue_el	*element;
 };
 
-#define PR_queue_sz		(PR_queue_el_sz + (Sizeof(PR_queue) * num_preplay_worker_queue))
+#define PR_queue_sz		(PR_queue_el_sz + (pr_sizeof(PR_queue) * num_preplay_worker_queue))
 
 
 

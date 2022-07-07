@@ -991,6 +991,17 @@ static void WALInsertLockAcquireExclusive(void);
 static void WALInsertLockRelease(void);
 static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
 
+/* Dummy breakpoint for GDB */
+#ifdef WAL_DEBUG
+void PR_gdb_sync(void);
+void PR_gdb_sync(void)
+{
+	return;
+}
+#endif
+
+
+
 /*
  * Insert an XLOG record represented by an already-constructed chain of data
  * chunks.  This is a low-level routine; to construct the WAL record header
@@ -7402,6 +7413,7 @@ StartupXLOG(void)
 				bool		 switchedTLI = false;
 #ifdef WAL_DEBUG
 				char		*xlog_string;
+				StringInfoData buf;
 #endif
 
 				/*
@@ -7419,34 +7431,28 @@ StartupXLOG(void)
 				 * the records.
 				 */
 #ifdef WAL_DEBUG
+				PR_gdb_sync();		/* Sync point with GDB */
+
 				xlog_string = NULL;
 
+				initStringInfo(&buf);
+				appendStringInfo(&buf, "REDO @ %X/%X; LSN %X/%X: ",
+								 LSN_FORMAT_ARGS(ReadRecPtr),
+								 LSN_FORMAT_ARGS(EndRecPtr));
+				xlog_outrec(&buf, xlogreader);
+				appendStringInfoString(&buf, " - ");
+				xlog_outdesc(&buf, xlogreader);
+				if (PR_isInParallelRecovery() && PR_needTestSync())
+				{
+					xlog_string = PR_allocBuffer(buf.len, true);
+					memcpy(xlog_string, buf.data, buf.len);
+					PRDebug_log("=== WAL record parsed ===\n%s\n--- WAL record end ---\n", xlog_string);
+				}
 				if (XLOG_DEBUG ||
 					(rmid == RM_XACT_ID && trace_recovery_messages <= DEBUG2) ||
 					(rmid != RM_XACT_ID && trace_recovery_messages <= DEBUG3))
-				{
-					StringInfoData buf;
-
-					initStringInfo(&buf);
-					appendStringInfo(&buf, "REDO @ %X/%X; LSN %X/%X: ",
-									 LSN_FORMAT_ARGS(ReadRecPtr),
-									 LSN_FORMAT_ARGS(EndRecPtr));
-					xlog_outrec(&buf, xlogreader);
-					appendStringInfoString(&buf, " - ");
-					xlog_outdesc(&buf, xlogreader);
 					elog(LOG, "%s", buf.data);
-					if (PR_isInParallelRecovery())
-					{
-						xlog_string = PR_allocBuffer(buf.len, true);
-						memcpy(xlog_string, buf.data, buf.len);
-					}
-					if (PR_needTestSync())
-					{
-						xlog_string = PR_allocBuffer(buf.len, true);
-						memcpy(xlog_string, buf.data, buf.len);
-					}
-					pfree(buf.data);
-				}
+				pfree(buf.data);
 #endif
 
 				/* Handle interrupt signals of startup process */
