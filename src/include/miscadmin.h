@@ -336,6 +336,7 @@ typedef enum BackendType
 	B_ARCHIVER,
 	B_STATS_COLLECTOR,
 	B_LOGGER,
+	B_PARALLEL_REPLAY
 } BackendType;
 
 extern BackendType MyBackendType;
@@ -435,6 +436,10 @@ typedef enum
 	CheckpointerProcess,
 	WalWriterProcess,
 	WalReceiverProcess,
+
+	/* Koichi: Additional type for parallel redo */
+	/* Reader, Dispatcher, TXN, Block: indicated by additional index. */
+	ParallelRedoProcess,
 
 	NUM_AUXPROCTYPES			/* Must be last! */
 } AuxProcType;

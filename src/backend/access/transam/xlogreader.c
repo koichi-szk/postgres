@@ -19,6 +19,9 @@
 
 #include <unistd.h>
 
+#ifndef FRONTEND
+#include "access/parallel_replay.h"
+#endif
 #include "access/transam.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -249,7 +252,7 @@ XLogBeginRead(XLogReaderState *state, XLogRecPtr RecPtr)
 }
 
 /*
- * Attempt to read an XLOG record.
+* Attempt to read an XLOG record.
  *
  * XLogBeginRead() or XLogFindNextRecord() must be called before the first call
  * to XLogReadRecord().
@@ -269,6 +272,9 @@ XLogReadRecord(XLogReaderState *state, char **errormsg)
 {
 	XLogRecPtr	RecPtr;
 	XLogRecord *record;
+#ifndef FRONTEND
+	XLogRecord *record_old;
+#endif
 	XLogRecPtr	targetPagePtr;
 	bool		randAccess;
 	uint32		len,
@@ -566,10 +572,41 @@ restart:
 		state->EndRecPtr -= XLogSegmentOffset(state->EndRecPtr, state->segcxt.ws_segsize);
 	}
 
+#ifndef FRONTEND
+	if (PR_isInParallelRecovery())
+	{
+		uint32		 tot_len;
+		/*
+		 * Koichi:
+		 *		In the case of parallel recovery, we need to copy XLogRecord to shared memory buffer
+		 */
+		record_old = record;
+		tot_len = record_old->xl_tot_len;
+		record = (XLogRecord *)PR_allocBuffer(tot_len, true);
+		memcpy(record, record_old, tot_len);
+		state->record = record;
+	}
+#endif
 	if (DecodeXLogRecord(state, record, errormsg))
 		return record;
 	else
+	{
+#ifndef FRONTEND
+		if (PR_isInParallelRecovery())
+		{
+			/*
+			 * Koichi:
+			 *	We leave another status in the reader state as is.
+			 *	Such info will not be used before set again by
+			 *	subsequent call.
+			 */
+			PR_freeBuffer(record, true);
+			state->record = NULL;
+			state->decoded_record = NULL;
+		}
+#endif
 		return NULL;
+	}
 
 err:
 	if (assembled)

@@ -93,6 +93,9 @@
 #include <pthread.h>
 #endif
 
+#ifdef WAL_DEBUG
+#include "access/parallel_replay.h"
+#endif
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "bootstrap/bootstrap.h"
@@ -433,7 +436,6 @@ static int	CountChildren(int target);
 static bool assign_backendlist_entry(RegisteredBgWorker *rw);
 static void maybe_start_bgworkers(void);
 static bool CreateOptsFile(int argc, char *argv[], char *fullprogname);
-static pid_t StartChildProcess(AuxProcType type);
 static void StartAutovacuumWorker(void);
 static void MaybeStartWalReceiver(void);
 static void InitPostmasterDeathWatchHandle(void);
@@ -551,12 +553,14 @@ static void ShmemBackendArrayAdd(Backend *bn);
 static void ShmemBackendArrayRemove(Backend *bn);
 #endif							/* EXEC_BACKEND */
 
-#define StartupDataBase()		StartChildProcess(StartupProcess)
-#define StartArchiver()			StartChildProcess(ArchiverProcess)
-#define StartBackgroundWriter() StartChildProcess(BgWriterProcess)
-#define StartCheckpointer()		StartChildProcess(CheckpointerProcess)
-#define StartWalWriter()		StartChildProcess(WalWriterProcess)
-#define StartWalReceiver()		StartChildProcess(WalReceiverProcess)
+#define StartupDataBase()		StartChildProcess(StartupProcess, -1)
+#define StartArchiver()			StartChildProcess(ArchiverProcess, -1)
+#define StartBackgroundWriter() StartChildProcess(BgWriterProcess, -1)
+#define StartCheckpointer()		StartChildProcess(CheckpointerProcess, -1)
+#define StartWalWriter()		StartChildProcess(WalWriterProcess, -1)
+#define StartWalReceiver()		StartChildProcess(WalReceiverProcess, -1)
+
+#define StartParallelRedo(idx)	StartChildProcess(ParallelRedoProcess, (idx))
 
 /* Macros to check exit status of a child process */
 #define EXIT_STATUS_0(st)  ((st) == 0)
@@ -1406,6 +1410,13 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * We're ready to rock and roll...
 	 */
+#ifdef WAL_DEBUG
+	if (PR_needTestSync())
+	{
+		elog(DEBUG3, "%s: %s: Starting parallel replay debug. Pid = %d.", __func__, __FILE__, getpid());
+		PRDebug_init(true);
+	}
+#endif
 	StartupPID = StartupDataBase();
 	Assert(StartupPID != 0);
 	StartupStatus = STARTUP_RUNNING;
@@ -5437,8 +5448,8 @@ CountChildren(int target)
  * Return value of StartChildProcess is subprocess' PID, or 0 if failed
  * to start subprocess.
  */
-static pid_t
-StartChildProcess(AuxProcType type)
+pid_t
+StartChildProcess(AuxProcType type, int idx)
 {
 	pid_t		pid;
 	char	   *av[10];
@@ -5456,7 +5467,18 @@ StartChildProcess(AuxProcType type)
 #endif
 
 	snprintf(typebuf, sizeof(typebuf), "-x%d", type);
-	av[ac++] = typebuf;
+	av[ac++] = strdup(typebuf);
+	if (type == ParallelRedoProcess)
+		av[ac++] = "-P";
+	if (idx > 0)
+	{
+		/*
+		 * For parallel recovery worker processes.  Need additional worker
+		 * process identifier.
+		 */
+		snprintf(typebuf, sizeof(typebuf), "-I%d", idx);
+		av[ac++] = strdup(typebuf);
+	}
 
 	av[ac] = NULL;
 	Assert(ac < lengthof(av));
@@ -5468,15 +5490,34 @@ StartChildProcess(AuxProcType type)
 
 	if (pid == 0)				/* child */
 	{
+#ifdef WAL_DEBUG
+		if (PR_needTestSync() && type == ParallelRedoProcess)
+		{
+			elog(DEBUG3, "%s: %s: Starting parallel replay debug. Pid = %d.", __func__, __FILE__, getpid());
+			PRDebug_start(idx);
+		}
+#endif
 		InitPostmasterChild();
 
 		/* Close the postmaster's sockets */
-		ClosePostmasterPorts(false);
+		/*
+		 * In the case of ParallelRedoProcess, it was folked from Startup
+		 * process and all these files have already been closed.
+		 */
+		if (type != ParallelRedoProcess)
+			ClosePostmasterPorts(false);
 
 		/* Release postmaster's working memory context */
 		MemoryContextSwitchTo(TopMemoryContext);
-		MemoryContextDelete(PostmasterContext);
-		PostmasterContext = NULL;
+		/*
+		 * In the case of Parallel Replay workers, this context has already been
+		 * deleted.
+		 */
+		if (PostmasterContext)
+		{
+			MemoryContextDelete(PostmasterContext);
+			PostmasterContext = NULL;
+		}
 
 		AuxiliaryProcessMain(ac, av);	/* does not return */
 	}
@@ -5513,6 +5554,10 @@ StartChildProcess(AuxProcType type)
 			case WalReceiverProcess:
 				ereport(LOG,
 						(errmsg("could not fork WAL receiver process: %m")));
+				break;
+			case ParallelRedoProcess:
+				ereport(LOG,
+						(errmsg("could not fork parallel redo process: %m")));
 				break;
 			default:
 				ereport(LOG,

@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 
+#include "access/parallel_replay.h"
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/xact.h"
@@ -104,6 +105,9 @@ ProcGlobalShmemSize(void)
 	Size		size = 0;
 	Size		TotalProcs =
 	add_size(MaxBackends, add_size(NUM_AUXILIARY_PROCS, max_prepared_xacts));
+	
+	if (parallel_replay == true)
+		TotalProcs = add_size(TotalProcs, (num_preplay_workers - 1));
 
 	/* ProcGlobal */
 	size = add_size(size, sizeof(PROC_HDR));
@@ -155,6 +159,11 @@ ProcGlobalSemas(void)
  * not even in the EXEC_BACKEND case.  The ProcGlobal and AuxiliaryProcs
  * pointers must be propagated specially for EXEC_BACKEND operation.
  */
+
+#ifdef WAL_DEBUG
+uint32 aux_proc_num = 0;
+#endif
+
 void
 InitProcGlobal(void)
 {
@@ -163,6 +172,18 @@ InitProcGlobal(void)
 				j;
 	bool		found;
 	uint32		TotalProcs = MaxBackends + NUM_AUXILIARY_PROCS + max_prepared_xacts;
+
+	if (parallel_replay == true)
+	{
+		TotalProcs += num_preplay_workers - 1;	/* Exclude READER WORKER */
+#ifdef WAL_DEBUG
+		aux_proc_num = NUM_AUXILIARY_PROCS + num_preplay_workers - 1;
+#endif
+	}
+#ifdef WAL_DEBUG
+	else
+		aux_proc_num = NUM_AUXILIARY_PROCS;
+#endif
 
 	/* Create the ProcGlobal shared structure */
 	ProcGlobal = (PROC_HDR *)
@@ -289,7 +310,11 @@ InitProcGlobal(void)
 	 * processes and prepared transactions.
 	 */
 	AuxiliaryProcs = &procs[MaxBackends];
-	PreparedXactProcs = &procs[MaxBackends + NUM_AUXILIARY_PROCS];
+	if (parallel_replay == false)
+		PreparedXactProcs = &procs[MaxBackends + NUM_AUXILIARY_PROCS];
+	else
+		PreparedXactProcs = &procs[MaxBackends + NUM_AUXILIARY_PROCS + num_preplay_workers];
+
 
 	/* Create ProcStructLock spinlock, too */
 	ProcStructLock = (slock_t *) ShmemAlloc(sizeof(slock_t));
@@ -518,6 +543,10 @@ InitAuxiliaryProcess(void)
 {
 	PGPROC	   *auxproc;
 	int			proctype;
+	int			optional_aux_procs = 0;
+
+	if (parallel_replay == true)
+		optional_aux_procs = num_preplay_workers - 1;
 
 	/*
 	 * ProcGlobal should be set up already (if we are a backend, we inherit
@@ -543,13 +572,13 @@ InitAuxiliaryProcess(void)
 	/*
 	 * Find a free auxproc ... *big* trouble if there isn't one ...
 	 */
-	for (proctype = 0; proctype < NUM_AUXILIARY_PROCS; proctype++)
+	for (proctype = 0; proctype < (NUM_AUXILIARY_PROCS + optional_aux_procs); proctype++)
 	{
 		auxproc = &AuxiliaryProcs[proctype];
 		if (auxproc->pid == 0)
 			break;
 	}
-	if (proctype >= NUM_AUXILIARY_PROCS)
+	if (proctype >= (NUM_AUXILIARY_PROCS + optional_aux_procs))
 	{
 		SpinLockRelease(ProcStructLock);
 		elog(FATAL, "all AuxiliaryProcs are in use");

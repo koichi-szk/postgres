@@ -175,6 +175,11 @@ struct XLogReaderState
 	XLogRecPtr	ReadRecPtr;		/* start of last record read */
 	XLogRecPtr	EndRecPtr;		/* end+1 of last record read */
 
+	/*
+	 * Timeline ID for this state
+	 */
+	TimeLineID	timeline;
+
 
 	/* ----------------------------------------
 	 * Decoded representation of current record
@@ -183,6 +188,7 @@ struct XLogReaderState
 	 * should not be accessed directly.
 	 * ----------------------------------------
 	 */
+	XLogRecord *record; 		/* XLog record used in parallel replay */
 	XLogRecord *decoded_record; /* currently decoded record */
 
 	char	   *main_data;		/* record's main data portion */
@@ -262,6 +268,9 @@ struct XLogReaderState
 	XLogRecPtr	missingContrecPtr;
 	/* Set when XLP_FIRST_IS_OVERWRITE_CONTRECORD is found */
 	XLogRecPtr	overwrittenRecPtr;
+#ifdef WAL_DEBUG
+	char	*xlog_string;		/* String representation of the WAL record */
+#endif
 };
 
 /* Get a new XLogReader */
