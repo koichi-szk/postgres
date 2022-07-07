@@ -34,6 +34,7 @@
 
 #include "access/commit_ts.h"
 #include "access/gin.h"
+#include "access/parallel_replay.h"
 #include "access/rmgr.h"
 #include "access/tableam.h"
 #include "access/toast_compression.h"
@@ -2111,6 +2112,24 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"parallel_replay", PGC_POSTMASTER, WAL_ARCHIVE_RECOVERY,
+			gettext_noop("Setis to enable parallel recovery."),
+		},
+		&parallel_replay,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"parallel_replay_test", PGC_POSTMASTER, WAL_ARCHIVE_RECOVERY,
+			gettext_noop("Switch to enable sync with debugger."),
+		},
+		&PR_test,
+		false,
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL
@@ -3540,6 +3559,48 @@ static struct config_int ConfigureNamesInt[] =
 		0, 0, INT_MAX,
 		check_client_connection_check_interval, NULL, NULL
 	},
+
+	{
+		{"num_preplay_workers", PGC_POSTMASTER, WAL_ARCHIVE_RECOVERY,
+			gettext_noop("Specifies number of parallel reply workers."),
+			NULL
+		},
+		&num_preplay_workers,
+		5, 5, MAX_PR_NUM_WORKERS,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"num_preplay_queues", PGC_POSTMASTER, WAL_ARCHIVE_RECOVERY,
+			gettext_noop("Specifies number of queue elements used by parallel reply workers."),
+			NULL
+		},
+		&num_preplay_worker_queue,
+		128, 16, INT_MAX / 2,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"num_preplay_max_txn", PGC_POSTMASTER, WAL_ARCHIVE_RECOVERY,
+			gettext_noop("Specifies maximum number of transactions from WAL active in parallel recovery."),
+			NULL
+		},
+		&num_preplay_max_txn,
+		0, 0, INT_MAX / 2,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"preplay_buffers", PGC_POSTMASTER, WAL_ARCHIVE_RECOVERY,
+			gettext_noop("Specifies amount of parallel reply shared memroy buffer."),
+			NULL,
+			GUC_UNIT_BYTE
+		},
+		&PR_buf_size_mb,
+		BLCKSZ * XLR_MAX_BLOCK_ID * 6, BLCKSZ * XLR_MAX_BLOCK_ID * 6, INT_MAX / 2,
+		NULL, NULL, NULL
+	},
+
 
 	/* End-of-list marker */
 	{

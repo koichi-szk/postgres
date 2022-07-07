@@ -276,6 +276,9 @@ GetBackendTypeDesc(BackendType backendType)
 		case B_LOGGER:
 			backendDesc = "logger";
 			break;
+		case B_PARALLEL_REPLAY:
+			backendDesc = "parallel_replay";
+			break;
 	}
 
 	return backendDesc;
