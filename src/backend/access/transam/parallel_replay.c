@@ -1075,7 +1075,16 @@ PR_atStartWorker(int idx)
 	if (my_worker_idx == PR_READER_WORKER_IDX)
 		my_worker->wait_dispatch = false;
 	else
+	{
 		my_worker->wait_dispatch = true;
+		/*
+		 * Other workers need to disable this because
+		 * the current callback depends on record in
+		 * xlogreader and can conflict with workers
+		 * other than READER.
+		 */
+		error_context_stack = NULL;
+	}
 	my_worker->flags = 0;
 	my_worker->worker_pid = getpid();
 	SpinLockRelease(&my_worker->slock);
@@ -2465,12 +2474,23 @@ PRDebug_log(char *fmt, ...)
 {
 	char buf[PRDEBUG_BUFSZ];
 	va_list	arg_ptr;
+	ErrorContextCallback *error_context_stack_backup;
+
+	/*
+	 * xlog.c sets up error_context_stack for writing
+	 * XLogRecord info to the log using error_context_stack.
+	 * This conflicts here so we disable this and the restore
+	 */
+	error_context_stack_backup = error_context_stack;
+	error_context_stack = NULL;
 
 	va_start(arg_ptr, fmt);
 	vsprintf(buf, fmt, arg_ptr);
 	elog(LOG, "%s%s", pr_debug_log_hdr, buf);
 	fprintf(pr_debug_log, "%s%s", pr_debug_log_hdr, buf);
 	fflush(pr_debug_log);
+
+	error_context_stack = error_context_stack_backup;
 }
 
 static void
