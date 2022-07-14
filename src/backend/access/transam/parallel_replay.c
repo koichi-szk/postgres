@@ -1,4 +1,4 @@
-/*-------------------------------------------------------------------------
+#/*-------------------------------------------------------------------------
  *
  * parallel_replay.c
  *      PostgreSQL write-ahead log manager
@@ -1072,11 +1072,17 @@ PR_atStartWorker(int idx)
 	PR_syncInit();	/* Initialize synchronization sockets */
 
 	SpinLockAcquire(&my_worker->slock);
-	if (my_worker_idx == PR_READER_WORKER_IDX)
-		my_worker->wait_dispatch = false;
-	else
+	/*
+	 * wait_dispatch will be turned on only when PR_fetchqueue() is
+	 * called and finds queue is empty.
+	 *
+	 * Once READER receives first response from other workers,
+	 * worker queue is ready and READER or DISPATCHER can
+	 * add dispatch to the queue.
+	 */
+	my_worker->wait_dispatch = false;
+	if (my_worker_idx != PR_READER_WORKER_IDX)
 	{
-		my_worker->wait_dispatch = true;
 		/*
 		 * Other workers need to disable this because
 		 * the current callback depends on record in
@@ -1598,6 +1604,12 @@ blockHash(int spc, int db, int rel, int blk, int n_max)
 	wk_all = fold_int2int8(spc) + fold_int2int8(db) + fold_int2int8(rel) + fold_int2int8(blk);
 	wk_all = fold_int2int8(wk_all);
 
+	if (n_max == 1)
+		/*
+		 * If we have only one block worker, always return zero.
+		 * Otherwise, the next loop does not finish.
+		 */
+		return 0;
 	while(wk_all >= n_max)
 		wk_all = wk_all/n_max + wk_all%n_max;
 	return wk_all;
