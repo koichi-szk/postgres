@@ -1,4 +1,4 @@
-#/*-------------------------------------------------------------------------
+/*-------------------------------------------------------------------------
  *
  * parallel_replay.c
  *      PostgreSQL write-ahead log manager
@@ -221,7 +221,9 @@ static void			 free_txn_cell(txn_cell_PR *txn_cell, bool need_lock);
 static txn_cell_PR	*find_txn_cell(TransactionId xid, bool create, bool need_lock);
 static void			 addDispatchDataToTxn(XLogDispatchData_PR *dispatch_data, bool need_lock);
 static bool			 removeDispatchDataFromTxn(XLogDispatchData_PR *dispatch_data, bool need_lock);
+#if 0
 static bool			 removeTxnCell(txn_cell_PR *txn_cell);
+#endif
 static txn_cell_PR	*isTxnSyncNeeded(XLogDispatchData_PR *dispatch_data, XLogRecord *record, TransactionId *xid, bool remove_myself);
 static void			 syncTxn(txn_cell_PR *txn_cell);
 static void			 dispatchDataToXLogHistory(XLogDispatchData_PR *dispatch_data);
@@ -746,13 +748,19 @@ removeDispatchDataFromTxn(XLogDispatchData_PR *dispatch_data, bool need_lock)
 	return false;	/* Still another dispatch data in this txn */
 }
 
+#if 0
+/*
+ * Koichi:
+ *		ここ、なんかおかしい。Dispatcher で、当該 TxnCell を設定していないように
+ *		見える
+ */
 static bool
 removeTxnCell(txn_cell_PR *txn_cell)
 {
 	txn_hash_el_PR	*hash_el;
 	txn_cell_PR		*cell, *prev;
 
-	Assert(txn_cell->head == NULL && txn_cell->tail == NULL);
+	Assert(txn_cell->head != NULL && txn_cell->tail != NULL);
 
 	hash_el = get_txn_hash(txn_cell->xid);
 	SpinLockAcquire(&hash_el->slock);
@@ -796,6 +804,7 @@ removeTxnCell(txn_cell_PR *txn_cell)
 	}
 	return false;		/* Never comems here */
 }
+#endif
 
 
 /*
@@ -1601,15 +1610,13 @@ blockHash(int spc, int db, int rel, int blk, int n_max)
 {
 	int wk_all;
 
+	/* Following code does not finish if (n_max == 1) */
+	if (n_max == 1)
+		return 1;
+
 	wk_all = fold_int2int8(spc) + fold_int2int8(db) + fold_int2int8(rel) + fold_int2int8(blk);
 	wk_all = fold_int2int8(wk_all);
 
-	if (n_max == 1)
-		/*
-		 * If we have only one block worker, always return zero.
-		 * Otherwise, the next loop does not finish.
-		 */
-		return 0;
 	while(wk_all >= n_max)
 		wk_all = wk_all/n_max + wk_all%n_max;
 	return wk_all;
@@ -2907,7 +2914,13 @@ txnWorkerLoop(void)
 			 * are handled by block workers.
 			 */
 			syncTxn(txn_cell);
+
+			/* Deallocate the trancaction cell */
+			free_txn_cell(txn_cell, true);
+#if 0
+			/* txn_cell is removed within syncTxn() */
 			removeTxnCell(txn_cell);
+#endif
 		}
 		/*
 		 * Koichi: TBD
@@ -3020,14 +3033,12 @@ syncTxn(txn_cell_PR *txn_cell)
 		/* All the preceding WALs have already been replayed */
 		SpinLockRelease(&txn_hash->slock);
 
-	/* Deallocate the trancaction cell */
-	free_txn_cell(txn_cell, true);
 }
 
 /*
- *******************************************************************************************************************************
+ *************************************************************************************************************
  * Dispatcher worker
- *******************************************************************************************************************************
+ *************************************************************************************************************
  */
 
 static void
