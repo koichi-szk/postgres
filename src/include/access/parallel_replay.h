@@ -151,7 +151,7 @@ typedef struct PR_worker
 	bool	 	wait_dispatch;	/* Flag to indicate the worker is waiting for xlogrec to handle */
 								/* Dispatcher check this and sync. */
 	unsigned	flags;			/* Indicates instructions from outside */
-	XLogRedPtr	assignedRecPtr;	/* Latest assigned XLOG record ptr to this worker. */
+	XLogRecPtr	assignedRecPtr;	/* Latest assigned XLOG record ptr to this worker. */
 	XLogRecPtr	handledRecPtr;	/* Last andled XLOG record ptr by this worker. */
 	PR_queue_el	*head;			/* Dispatched queue head.   Pick queue element from here. */
 	PR_queue_el	*tail;			/* Dispatched queue tail.   Append queue element after this. */
