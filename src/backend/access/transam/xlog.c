@@ -7584,6 +7584,7 @@ StartupXLOG(void)
 					 * chain record, and dispatch to DISPATCHER WORKER
 					 */
 					XLogReaderState *xlogreader_PR;
+
 					xlogreader_PR = (XLogReaderState *)PR_allocBuffer(sizeof(XLogReaderState), true);
 					memcpy(xlogreader_PR, xlogreader, sizeof(XLogReaderState));
 					xlogreader_PR->record = record;

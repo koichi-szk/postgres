@@ -1583,7 +1583,8 @@ PR_analyzeXLogReaderState(XLogReaderState *reader, XLogRecord *record)
 		rstate = XLogRecGetBlockTag((XLogReaderState *)reader, block_id, &rnode, &forknum, &blk);
 		if (rstate == false)
 			continue;
-		block_hash = blockHash(rnode.spcNode, rnode.dbNode, rnode.relNode, blk, num_preplay_workers - PR_BLK_WORKER_MIN_IDX);
+		block_hash = blockHash(rnode.spcNode, rnode.dbNode, rnode.relNode,
+				blk, num_preplay_workers - PR_BLK_WORKER_MIN_IDX);
 		block_hash += PR_BLK_WORKER_MIN_IDX;
 		if (dispatch_data->worker_array[block_hash] == false)
 		{
@@ -1610,9 +1611,11 @@ blockHash(int spc, int db, int rel, int blk, int n_max)
 {
 	int wk_all;
 
+	Assert(n_max > 0);
+
 	/* Following code does not finish if (n_max == 1) */
-	if (n_max == 1)
-		return 1;
+	if (n_max <= 1)
+		return 0;
 
 	wk_all = fold_int2int8(spc) + fold_int2int8(db) + fold_int2int8(rel) + fold_int2int8(blk);
 	wk_all = fold_int2int8(wk_all);
@@ -1690,7 +1693,8 @@ dump_buffer(const char *funcname, bool need_lock)
 								(uint64)(pr_buffer->alloc_start), addr_difference(pr_buffer, pr_buffer->alloc_start),
 								(uint64)(pr_buffer->alloc_end), addr_difference(pr_buffer, pr_buffer->alloc_end));
 	appendStringInfo(&s, "needed_by_worker: 0x%016lx (%ld) (n_worker: %d)\n    ", 
-								(uint64)(pr_buffer->needed_by_worker), addr_difference(pr_buffer, pr_buffer->needed_by_worker),
+								(uint64)(pr_buffer->needed_by_worker),
+								addr_difference(pr_buffer, pr_buffer->needed_by_worker),
 								num_preplay_workers);
 	for (ii = 0; ii < num_preplay_workers; ii++)
 	{
@@ -1701,7 +1705,9 @@ dump_buffer(const char *funcname, bool need_lock)
 	}
 	appendStringInfoString(&s, "\n");
 	appendStringInfoString(&s, "---Chunk---\n");
-	for(curr_chunk = (PR_BufChunk *)(pr_buffer->head); addr_before(curr_chunk, pr_buffer->tail); curr_chunk = next_chunk(curr_chunk))
+	for(curr_chunk = (PR_BufChunk *)(pr_buffer->head);
+			addr_before(curr_chunk, pr_buffer->tail);
+			curr_chunk = next_chunk(curr_chunk))
 	{
 		Size *size_at_tail;
 
@@ -2701,17 +2707,17 @@ PR_debug_analyzeState(XLogReaderState *state, XLogRecord *record)
 
 
 /*
- *******************************************************************************************************************************
+ ******************************************************************************************************************
  *
  * Parallel worker functions
  *
- *******************************************************************************************************************************
+ ******************************************************************************************************************
  */
 
 /*
- *******************************************************************************************************************************
+ ******************************************************************************************************************
  * Invalid Page Worker
- *******************************************************************************************************************************
+ ******************************************************************************************************************
  */
 
 /*
@@ -2767,9 +2773,9 @@ invalidPageWorkerLoop(void)
 
 
 /*
- *******************************************************************************************************************************
+ *****************************************************************************************************************
  * Block Worker
- *******************************************************************************************************************************
+ *****************************************************************************************************************
  */
 
 static void
@@ -2870,9 +2876,9 @@ blockWorkerLoop(void)
 }
 
 /*
- *******************************************************************************************************************************
+ ****************************************************************************************************************
  * Transaction Worker
- *******************************************************************************************************************************
+ ****************************************************************************************************************
  */
 
 /*
