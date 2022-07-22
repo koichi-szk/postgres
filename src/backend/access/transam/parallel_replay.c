@@ -1485,13 +1485,26 @@ PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx)
 {
 	PR_queue_el	*el;
 	PR_worker	*target_worker;
+	XLogRecPtr	 currRecPtr;
 
 	target_worker = &pr_worker[worker_idx];
 	el = getQueueElement();
 	el->next = NULL;
 	el->data_type = type;
 	el->data = data;
+	switch(type)
+	{
+		case ReaderState:
+			currRecPtr = ((XLogReaderState *)data)->ReadRecPtr;
+			break;
+		case XLogDispatchData:
+			currRecPtr = ((XLogDispatchData_PR *)data)->reader->ReadRecPtr;
+			break;
+		default:
+			currRecPtr = 0;
+	}
 	SpinLockAcquire(&target_worker->slock);
+	target_worker->assignedRecPtr = currRecPtr;
 	if (target_worker->head == NULL)
 		target_worker->head = target_worker->tail = el;
 	else
@@ -2731,6 +2744,10 @@ invalidPageWorkerLoop(void)
 	PR_queue_el	*el;
 	XLogInvalidPageData_PR	*page;
 	bool invalidPageFound;
+
+	SpinLockAcquire(&my_worker->slock);
+	my_worker->handledRecPtr = 0;
+	SpinLockRelease(&my_worker->slock);
 	
 	for (;;)
 	{
@@ -2788,6 +2805,8 @@ blockWorkerLoop(void)
 	
 	for (;;)
 	{
+		XLogRecPtr	currRecPtr;
+
 		el = PR_fetchQueue();
 		if (el == NULL)
 			break;	/* Process termination request */
@@ -2799,13 +2818,14 @@ blockWorkerLoop(void)
 		SpinLockAcquire(&data->slock);
 
 		data->n_remaining--;
+		currRecPtr = data->reader->ReadRecPtr;
+
 		if (data->n_remaining > 0)
 		{
 			/* This worker is not eligible to handle this */
 			SpinLockRelease(&data->slock);
 			/* Wait another BLOCK worker to handle this and sync to me */
 			PR_recvSync();
-			continue;
 		}
 		else
 		{
@@ -2871,6 +2891,9 @@ blockWorkerLoop(void)
 			}
 			freeDispatchData(data);
 		}
+		SpinLockAcquire(&my_worker->slock);
+		my_worker->handledRecPtr = currRecPtr;
+		SpinLockRelease(&my_worker->slock);
 	}
 	return;
 }
@@ -2904,6 +2927,8 @@ txnWorkerLoop(void)
 
 	for (;;)
 	{
+		XLogRecPtr currRecPtr;
+
 		el = PR_fetchQueue();
 		if (el == NULL)
 			break;	/* Process termination request */
@@ -2912,6 +2937,7 @@ txnWorkerLoop(void)
 		dispatch_data = (XLogDispatchData_PR *)(el->data);
 		record = dispatch_data->reader->record;
 		xlogreader = dispatch_data->reader;
+		currRecPtr = xlogreader->ReadRecPtr;
 		txn_cell = isTxnSyncNeeded(dispatch_data, record, &xid, true);
 		if (txn_cell)
 		{
@@ -2934,6 +2960,10 @@ txnWorkerLoop(void)
 		 */
 		/* Now apply the WAL record itself */
 		RmgrTable[record->xl_rmid].rm_redo(xlogreader);
+
+		SpinLockAcquire(&my_worker->slock);
+		my_worker->handledRecPtr = currRecPtr;
+		SpinLockRelease(&my_worker->slock);
 		
 		/* ここで redo 終わったので、終了した LSN の更新を行う */
 		/*
@@ -3058,6 +3088,8 @@ dispatcherWorkerLoop(void)
 
 	for (;;)
 	{
+		XLogRecPtr currRecPtr;
+
 		/* Dequeue */
 		el = PR_fetchQueue();
 		if (el == NULL)
@@ -3065,6 +3097,7 @@ dispatcherWorkerLoop(void)
 		if (el->data_type != ReaderState)
 			elog(PANIC, "Invalid internal status for dispatcher worker.");
 		reader = (XLogReaderState *)el->data;
+		currRecPtr = reader->ReadRecPtr;
 		PR_freeQueueElement(el);
 		record = reader->record;
 		dispatch_data = PR_analyzeXLogReaderState(reader, record);
@@ -3072,6 +3105,10 @@ dispatcherWorkerLoop(void)
 		addDispatchDataToTxn(dispatch_data, false);
 		for (worker_list = dispatch_data->worker_list; *worker_list > PR_DISPATCHER_WORKER_IDX; worker_list++)
 			PR_enqueue(dispatch_data, XLogDispatchData, *worker_list);
+
+		SpinLockAcquire(&my_worker->slock);
+		my_worker->handledRecPtr = currRecPtr;
+		SpinLockRelease(&my_worker->slock);
 	}
 	return;
 }
