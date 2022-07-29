@@ -3001,7 +3001,7 @@ blockWorkerLoop(void)
 	PR_queue_el	*el;
 	XLogDispatchData_PR	*data;
 	XLogRecord	*record;
-	bool	*worker_array;
+	int		*worker_list;
 	
 	for (;;)
 	{
@@ -3070,11 +3070,11 @@ blockWorkerLoop(void)
 			}
 
 			/* Sync with other workers */
-			for (worker_array = data->worker_array; *worker_array > PR_READER_WORKER_IDX; worker_array++)
+			for (worker_list = data->worker_list; *worker_list > 0; worker_list++)
 			{
-				if (*worker_array != my_worker_idx)
+				if (*worker_list != my_worker_idx)
 				{
-					PR_sendSync(*worker_array);
+					PR_sendSync(*worker_list);
 				}
 			}
 
