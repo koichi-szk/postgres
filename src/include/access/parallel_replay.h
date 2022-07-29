@@ -291,6 +291,9 @@ struct XLogDispatchData_PR
 {
 	slock_t	 	 slock;
 	XLogReaderState		*reader;	/* Allocated in the separated buffer area */
+	RmgrId				 rmid;
+	uint8				 info;
+	uint8				 rminfo;
 	PR_XLogHistory_el	*xlog_history_el;	/* PTR to history data */
 	XLogDispatchData_PR	*next;		/* Chain in txn_cell_PR, use txn_hash_el_PR->slock for this */
 	XLogDispatchData_PR	*prev;		/* Chain in txn_cell_PR, use txn_hash_el_PR->slock for this */

@@ -35,6 +35,7 @@
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
 #include "access/xlogutils.h"
+#include "catalog/pg_control.h"
 #include "miscadmin.h"
 #include "pg_config.h"
 #include "postmaster/postmaster.h"
@@ -178,6 +179,10 @@ static Size	 my_worker_msg_sz = 0;
 /* Invalid Page info */
 static void initInvalidPages(void);
 
+/* Synch functions */
+static void set_syncFlag(int worker_id, uint32 flag_to_set);
+static void PR_syncBeforeDispatch(void);
+
 /* History info functions */
 INLINE Size xlogHistorySize(void);
 static void initXLogHistory(void);
@@ -210,6 +215,9 @@ static bool			 isOtherWorkersRunning(void);
  * Dispatch Data function
  */
 static void	freeDispatchData(XLogDispatchData_PR *dispatch_data);
+static bool checkRmgrTxnSync(RmgrId rmgrid, uint8 info);
+static bool checkSyncBeforeDispatch(RmgrId rmgrid, uint8 info);
+static bool isSyncBeforeDispatchNeeded(XLogReaderState *reader);
 
 /*
  * Transaction WAL info function
@@ -232,6 +240,8 @@ static void			 dispatchDataToXLogHistory(XLogDispatchData_PR *dispatch_data);
 /* XLogReaderState/XLogRecord functions */
 static int	blockHash(int spc, int db, int rel, int blk, int n_max);
 INLINE int	fold_int2int8(int val);
+static void getXLogRecordRmgrInfo(XLogReaderState *reader, RmgrId *rmgrid, uint8 *info);
+
 
 /* Workerr Loop */
 static void dispatcherWorkerLoop(void);
@@ -397,6 +407,22 @@ PR_recvSync(void)
 #undef SYNC_RECV_BUF_SZ
 }
 
+static void
+set_syncFlag(int worker_id, uint32 flag_to_set)
+{
+	Assert (worker_id != my_worker_id);
+
+	SpinLockAcquire(&pr_worker[worker_id].slock);
+	pr_worker[worker_id].flags |= flag_to_set;
+	if (pr_worker[worker_id].wait_dispatch)
+	{
+		pr_worker[worker_id].wait_dispatch = false;
+		SpinLockRelease(&pr_worker[worker_id].slock);
+		PR_sendSync(worker_id);
+	}
+	else
+		SpinLockRelease(&pr_worker[worker_id].slock);
+}
 /*
  * This is called only by the READER worker
  *
@@ -408,27 +434,147 @@ PR_syncAll(void)
 {
 	int	ii;
 
+	Assert(my_worker_idx == PR_READER_WORKER_IDX);
+
 	for (ii = 1; ii < num_preplay_workers; ii++)
 	{
-		SpinLockAcquire(&pr_worker[ii].slock);
-		pr_worker[ii].flags |= PR_WK_SYNC_READER;
-		if (pr_worker[ii].wait_dispatch)
-		{
-			/*
-			 * Be careful.  If there are no dispatched queue for the worker,
-			 * worker might have asked for new queue.  In this case,
-			 * sync the worker to move forward.
-			 */
-			pr_worker[ii].wait_dispatch = false;
-			SpinLockRelease(&pr_worker[ii].slock);
-			PR_sendSync(ii);
-		}
-		else
-			SpinLockRelease(&pr_worker[ii].slock);
+		if (ii == PR_INVALID_PAGE_WORKER_IDX)
+			continue;
+		set_syncFlag(ii, PR_WK_SYNC_READER);
 	}
-	for (ii = 1; ii < num_preplay_workers; ii++)
+	for (ii = 1; ii < (num_preplay_workers - 1); ii++)
 		PR_recvSync();
+	/*
+	 * Finaly Invalid Block Worker
+	 */
+	set_syncFlag(PR_INVALID_PAGE_WORKER_IDX, PR_WK_SYNC_READER);
+
+	PR_recvSync();
 }
+
+static void
+PR_syncBeforeDispatch(void)
+{
+	int ii;
+
+	Assert(my_worker_idx == PR_DISPATCHER_WORKER_IDX);
+
+	for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers; ii++)
+	{
+		if (ii == PR_INVALID_PAGE_WORKER_IDX)
+			continue;
+		set_syncFlag(ii, PR_WK_SYNC_DISPATCHER);
+	}
+	for (ii = PR_TXN_WORKER_IDX; ii < (num_preplay_workers -1); ii++)
+		PR_recvSync();
+
+	set_syncFlag(PR_INVALID_PAGE_WORKER_IDX, PR_WK_SYNC_DISPATCHER);
+	PR_recvSync();
+}
+
+static bool
+checkRmgrTxnSync(RmgrId rmgrid, uint8 info)
+{
+	if (rmgrid != RM_XACT_ID)
+		return false;
+	switch(info)
+	{
+		case XLOG_XACT_COMMIT:
+		case XLOG_XACT_PREPARE:
+		case XLOG_XACT_ABORT:
+			return true;
+		default:
+			return false;
+	}
+	return false;
+}
+
+static bool
+checkSyncBeforeDispatch(RmgrId rmgrid, uint8 info)
+{
+	switch(rmgrid)
+	{
+		case RM_XLOG_ID:
+			switch(info)
+			{
+				case XLOG_CHECKPOINT_ONLINE:
+					return true;
+				case XLOG_NOOP:
+				case XLOG_NEXTOID:
+					return false;
+				case XLOG_SWITCH:
+				case XLOG_BACKUP_END:
+				case XLOG_PARAMETER_CHANGE:
+				case XLOG_RESTORE_POINT:
+					return true;
+				case XLOG_FPW_CHANGE:
+					return false;
+				case XLOG_END_OF_RECOVERY:
+					return true;
+				case XLOG_FPI_FOR_HINT:
+				case XLOG_FPI:
+				case XLOG_OVERWRITE_CONTRECORD:
+					return false;
+				default:
+					return false;
+			}
+		case RM_XACT_ID:
+			switch (info)
+			{
+				case XLOG_XACT_COMMIT:
+				case XLOG_XACT_PREPARE:
+				case XLOG_XACT_ABORT:
+				case XLOG_XACT_COMMIT_PREPARED:
+				case XLOG_XACT_ABORT_PREPARED:
+					return false;
+				case XLOG_XACT_ASSIGNMENT:
+					return true;
+				case XLOG_XACT_INVALIDATIONS	:
+					return false;
+				default:
+					return false;
+			}
+		case RM_SMGR_ID:
+			return false;
+		case RM_CLOG_ID:
+		case RM_DBASE_ID:
+		case RM_TBLSPC_ID:
+		case RM_MULTIXACT_ID:
+		case RM_RELMAP_ID:
+		case RM_STANDBY_ID:
+			return true;
+		case RM_HEAP2_ID:
+		case RM_HEAP_ID:
+		case RM_BTREE_ID:
+		case RM_HASH_ID:
+		case RM_GIN_ID:
+		case RM_GIST_ID:
+		case RM_SEQ_ID:
+		case RM_SPGIST_ID:
+		case RM_BRIN_ID:
+		case RM_COMMIT_TS_ID:
+			return false;
+		case RM_REPLORIGIN_ID:
+			return true;
+		case RM_GENERIC_ID:
+		case RM_LOGICALMSG_ID:
+			return false;
+		default:
+			return false;
+	}
+	return false;
+}
+
+static bool
+isSyncBeforeDispatchNeeded(XLogReaderState *reader)
+{
+	RmgrId	rmgr_id;
+	uint8	info;
+
+	getXLogRecordRmgrInfo(reader, &rmgr_id, &info);
+	return checkSyncBeforeDispatch(rmgr_id, info);
+}
+
 
 /*
  ****************************************************************************
@@ -1157,6 +1303,13 @@ PR_WorkerFinish(void)
 
 	/* First, need to terminate DISPATCHER worker */
 	SpinLockAcquire(&pr_worker[PR_DISPATCHER_WORKER_IDX].slock);
+	if (pr_worker[PR_DISPATCHER_WORKER_IDX].wait_dispatch == true)
+	{
+		pr_worker[PR_DISPATCHER_WORKER_IDX].wait_dispatch = false;
+		SpinLockRelease(&pr_worker[PR_DISPATCHER_WORKER_IDX].slock);
+		PR_sendSync(PR_DISPATCHER_WORKER_IDX);
+		SpinLockAcquire(&pr_worker[PR_DISPATCHER_WORKER_IDX].slock);
+	}
 	pr_worker[PR_DISPATCHER_WORKER_IDX].flags |= PR_WK_TERMINATE;
 	SpinLockRelease(&pr_worker[PR_DISPATCHER_WORKER_IDX].slock);
 
@@ -1180,6 +1333,13 @@ PR_WorkerFinish(void)
 	 * has been dispatched to the invalid block worker.
 	 */
 	SpinLockAcquire(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
+	if (pr_worker[PR_INVALID_PAGE_WORKER_IDX].wait_dispatch == true)
+	{
+		pr_worker[PR_INVALID_PAGE_WORKER_IDX].wait_dispatch = false;
+		SpinLockRelease(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
+		PR_sendSync(PR_INVALID_PAGE_WORKER_IDX);
+		SpinLockAcquire(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
+	}
 	pr_worker[PR_INVALID_PAGE_WORKER_IDX].flags |= PR_WK_TERMINATE;
 	SpinLockRelease(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
 
@@ -1369,112 +1529,148 @@ PR_fetchQueue(void)
 	SpinLockAcquire(&my_worker->slock);
 	flags = my_worker->flags;
 	rv = my_worker->head;
-	if (my_worker->head == NULL)
+	if (my_worker->head)
 	{
 		/*
-		 * The following looks unnecessarily long. Needs simplification.
+		 * Available queue.
 		 */
-		if (flags & PR_WK_SYNC)
-		{
-			my_worker->flags = 0;
-			SpinLockRelease(&my_worker->slock);
-			if (flags & PR_WK_TERMINATE)
-			{
-				Assert(my_worker_idx != PR_READER_WORKER_IDX);
-				if (my_worker_idx == PR_DISPATCHER_WORKER_IDX)
-				{
-					int ii;
-					/*
-					 * First, worker terminate request is sent from READER to DISPATCHER.
-					 * So, if DISPATCHER receives this, after dispatching everything from
-					 * READER worker, it asks all the other workers to terminate.
-					 */
-					for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers; ii++)
-					{
-						if (ii != PR_INVALID_PAGE_WORKER_IDX)
-						{
-							/*
-							 * Invalid page worker can terminate after all the other
-							 * workers terminate
-							 */
-							SpinLockAcquire(&pr_worker[ii].slock);
-							pr_worker[ii].flags |= PR_WK_TERMINATE;
-							SpinLockRelease(&pr_worker[ii].slock);
-						}
-					}
-				}
-				return NULL;
-			}
-			if (flags & PR_WK_SYNC_READER)
-			{
-				Assert(my_worker_idx != PR_READER_WORKER_IDX);
-				if (my_worker_idx == PR_DISPATCHER_WORKER_IDX)
-				{
-					int ii;
-
-					/* Sync all workers but INVALID PAGE workers */
-					for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers; ii++)
-					{
-						if (ii != PR_INVALID_PAGE_WORKER_IDX)
-						{
-							SpinLockAcquire(&pr_worker[ii].slock);
-							pr_worker[ii].flags |= PR_WK_SYNC_DISPATCHER;
-							SpinLockRelease(&pr_worker[ii].slock);
-						}
-					}
-					for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers - 1; ii++)
-						PR_recvSync();
-
-					/* Finally INVALID PAGE worker */
-					SpinLockAcquire(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
-					pr_worker[PR_INVALID_PAGE_WORKER_IDX].flags |= PR_WK_SYNC_DISPATCHER;
-					SpinLockRelease(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
-					PR_recvSync();
-				}
-				PR_sendSync(PR_READER_WORKER_IDX);
-			}
-			if (flags & PR_WK_SYNC_DISPATCHER)
-			{
-				Assert(my_worker_idx != PR_DISPATCHER_WORKER_IDX);
-				PR_sendSync(PR_DISPATCHER_WORKER_IDX);
-			}
-			if (flags & PR_WK_SYNC_TXN)
-			{
-				Assert(my_worker_idx != PR_TXN_WORKER_IDX);
-				PR_sendSync(PR_TXN_WORKER_IDX);
-			}
-			return PR_fetchQueue();
-		}
-		else
-		{
-			my_worker->wait_dispatch = true;
-			SpinLockRelease(&my_worker->slock);
-
-#if 0
-			/*
-			 * Koichi: ここのコード、おかしい。ここは素直に待って、allocBuffer() で
-			 * クリンチになっていることを調べたほうがいい。
-			 */
-			/*
-			 * Check if there are at least one worker running. If not,
-			 * no worker will take care of the dispatch.
-			 */
-			if (!isOtherWorkersRunning())
-			{
-				elog(PANIC,
-						"All workers are waiting due to small preplay_buffers value.  "
-						"Please consider to increase this configuation parameter.");
-			}
-#endif
-			PR_recvSync();
-			return PR_fetchQueue();
-		}
+		my_worker->head = rv->next;
+		if (my_worker->head == NULL)
+			my_worker->tail = NULL;
+		SpinLockRelease(&my_worker->slock);
+		return rv;
 	}
-	my_worker->head = rv->next;
-	if (my_worker->head == NULL)
-		my_worker->tail = NULL;
-	SpinLockRelease(&my_worker->slock);
-	return rv;
+	/*
+	 * Following code is for the case without any available dispatch information
+	 * in the queue.
+	 */
+	if (!(flags & PR_WK_SYNC))
+	{
+		/*
+		 * No sync flag is available.
+		 *
+		 * Now setup dispatch request flag and recall myself.
+		 */
+		my_worker->wait_dispatch = true;
+		SpinLockRelease(&my_worker->slock);
+		PR_recvSync();
+		return PR_fetchQueue();
+	}
+	/*
+	 * AKO sync flag is set.
+	 */
+	if (flags & PR_WK_TERMINATE)
+	{
+		/*
+		 * TERMINATE request has been made (orignally from READER WORKER)
+		 */
+		my_worker->flags = 0;
+		SpinLockRelease(&my_worker->slock);
+
+		Assert(my_worker_idx != PR_READER_WORKER_IDX);
+
+		if (my_worker_idx == PR_DISPATCHER_WORKER_IDX)
+		{
+			int ii;
+			/*
+			 * First, worker terminate request is sent from READER to DISPATCHER.
+			 * So, if DISPATCHER receives this, after dispatching everything from
+			 * READER worker, it asks all the other workers to terminate.
+			 */
+			for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers; ii++)
+			{
+				if (ii != PR_INVALID_PAGE_WORKER_IDX)
+				{
+					/*
+					 * Bacause other workers may make a request to the invalid
+					 * page worker and the reader worker may need invalid page
+					 * information,  we do not terminate this worker here.
+					 */
+					SpinLockAcquire(&pr_worker[ii].slock);
+					pr_worker[ii].flags |= PR_WK_TERMINATE;
+					if (pr_worker[ii].wait_dispatch == true)
+					{
+						pr_worker[ii].wait_dispatch = false;
+						SpinLockRelease(&pr_worker[ii].slock);
+						PR_sendSync(ii);
+					}
+					else
+						SpinLockRelease(&pr_worker[ii].slock);
+				}
+			}
+		}
+		return NULL;
+	}
+	else if (flags & PR_WK_SYNC_READER)
+	{
+
+		/*
+		 * PR_WK_SYNC_READER is usually made only by READER WORKER
+		 * to DISPATCHER WORKER.
+		 *
+		 * DISPATCHER WORKER works as sync proxy for all the other workers.
+		 */
+		Assert(my_worker_idx != PR_READER_WORKER_IDX);
+
+		flags &= ~PR_WK_SYNC_READER;
+		SpinLockRelease(&my_worker->slock);
+
+		if (my_worker_idx == PR_DISPATCHER_WORKER_IDX)
+		{
+			int ii;
+
+			/* Sync all workers but INVALID PAGE workers */
+			for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers; ii++)
+			{
+				if (ii != PR_INVALID_PAGE_WORKER_IDX)
+				{
+					SpinLockAcquire(&pr_worker[ii].slock);
+					pr_worker[ii].flags |= PR_WK_SYNC_DISPATCHER;
+					if (pr_worker[ii].wait_dispatch == true)
+					{
+						pr_worker[ii].wait_dispatch = false;
+						SpinLockRelease(&pr_worker[ii].slock);
+						PR_sendSync(ii);
+					}
+					else
+						SpinLockRelease(&pr_worker[ii].slock);
+				}
+			}
+			for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers - 1; ii++)
+				PR_recvSync();
+
+			/* Finally INVALID PAGE worker */
+			SpinLockAcquire(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
+			pr_worker[PR_INVALID_PAGE_WORKER_IDX].flags |= PR_WK_SYNC_DISPATCHER;
+			if (pr_worker[PR_INVALID_PAGE_WORKER_IDX].wait_dispatch == true)
+			{
+				pr_worker[PR_INVALID_PAGE_WORKER_IDX].wait_dispatch = false;
+				SpinLockRelease(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
+				PR_sendSync(PR_INVALID_PAGE_WORKER_IDX);
+			}
+			else
+				SpinLockRelease(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
+			PR_recvSync();
+		}
+		PR_sendSync(PR_READER_WORKER_IDX);
+	}
+	if (flags & PR_WK_SYNC_DISPATCHER)
+	{
+		Assert(my_worker_idx != PR_DISPATCHER_WORKER_IDX);
+
+		my_worker->flags &= ~PR_WK_SYNC_DISPATCHER;
+		SpinLockRelease(&my_worker->slock);
+		PR_sendSync(PR_DISPATCHER_WORKER_IDX);
+	}
+	if (flags & PR_WK_SYNC_TXN)
+	{
+		Assert(my_worker_idx != PR_TXN_WORKER_IDX);
+
+		my_worker->flags &= ~PR_WK_SYNC_TXN;
+		SpinLockRelease(&my_worker->slock);
+		PR_sendSync(PR_TXN_WORKER_IDX);
+	}
+	return PR_fetchQueue();
 }
 
 /*
@@ -1575,6 +1771,10 @@ PR_analyzeXLogReaderState(XLogReaderState *reader, XLogRecord *record)
 	dispatch_data = PR_allocXLogDispatchData();
 	dispatch_data->reader = reader;
 	dispatch_data->reader->record = record;
+
+	dispatch_data->rmid = XLogRecGetRmid(reader);
+	dispatch_data->info = XLogRecGetInfo(reader);
+	dispatch_data->rminfo = dispatch_data->info & ~XLR_INFO_MASK;
 
 	for (ii = 0; ii < num_preplay_workers; ii++)
 	{
@@ -2996,11 +3196,55 @@ txnWorkerLoop(void)
 	return;
 }
 
+static void
+getXLogRecordRmgrInfo(XLogReaderState *reader, RmgrId *rmgrid, uint8 *info)
+{
+	*rmgrid = XLogRecGetRmid(reader);
+	switch(*rmgrid)
+	{
+		case RM_XLOG_ID:
+			*info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+			break;
+		case RM_XACT_ID:
+			*info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+			break;
+		case RM_SMGR_ID:
+		case RM_CLOG_ID:
+		case RM_DBASE_ID:
+		case RM_TBLSPC_ID:
+		case RM_MULTIXACT_ID:
+		case RM_RELMAP_ID:
+		case RM_STANDBY_ID:
+		case RM_HEAP2_ID:
+		case RM_HEAP_ID:
+		case RM_BTREE_ID:
+		case RM_HASH_ID:
+		case RM_GIN_ID:
+		case RM_GIST_ID:
+		case RM_SEQ_ID:
+		case RM_SPGIST_ID:
+		case RM_BRIN_ID:
+		case RM_COMMIT_TS_ID:
+		case RM_REPLORIGIN_ID:
+			*info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+			break;
+		case RM_GENERIC_ID:
+			*info = 0;
+			break;
+		case RM_LOGICALMSG_ID:
+			*info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+			break;
+		default:
+			*info = 0;
+			break;
+	}
+}
+
 static txn_cell_PR *
 isTxnSyncNeeded(XLogDispatchData_PR *dispatch_data, XLogRecord *record, TransactionId *xid, bool remove_myself)
 {
 	txn_cell_PR		*txn_cell;
-	RmgrIds			 rmgr_id;
+	RmgrId			 rmgr_id;
 	uint8			 xact_info;
 
 
@@ -3019,27 +3263,10 @@ isTxnSyncNeeded(XLogDispatchData_PR *dispatch_data, XLogRecord *record, Transact
 			removeDispatchDataFromTxn(dispatch_data, false);
 		SpinLockRelease(&pr_txn_hash->slock);
 	}
-	rmgr_id = XLogRecGetRmid(dispatch_data->reader);
-	/*
-	 * Koichi:
-	 *	おそらく、ここまで来る XLogRec は RM_XACT_ID しかないと思われるが、まだチョット心配
-	 */
-	if (rmgr_id != RM_XACT_ID)
+	getXLogRecordRmgrInfo(dispatch_data->reader, &rmgr_id, &xact_info);
+	if (!checkRmgrTxnSync(rmgr_id, xact_info))
 		goto return_null;
-	/*
-	 * Koichi:
-	 *	この後、command 調べて commit/abort/prepare なら txn_cellを返す
-	 *  そうでなければ、txn_cell を解放する
-	 */
-	xact_info = XLogRecGetInfo(dispatch_data->reader) & XLOG_XACT_OPMASK;
-
-	switch (xact_info)
-	{
-		case XLOG_XACT_COMMIT:
-		case XLOG_XACT_ABORT:
-		case XLOG_XACT_PREPARE:
-			return txn_cell;
-	}
+	return txn_cell;
 
 return_null:
 	free_txn_cell(txn_cell, true);
@@ -3101,6 +3328,8 @@ dispatcherWorkerLoop(void)
 		PR_freeQueueElement(el);
 		record = reader->record;
 		dispatch_data = PR_analyzeXLogReaderState(reader, record);
+		if (isSyncBeforeDispatchNeeded(reader))
+			PR_syncBeforeDispatch();
 		dispatchDataToXLogHistory(dispatch_data);
 		addDispatchDataToTxn(dispatch_data, false);
 		for (worker_list = dispatch_data->worker_list; *worker_list > PR_DISPATCHER_WORKER_IDX; worker_list++)
