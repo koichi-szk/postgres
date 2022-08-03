@@ -180,7 +180,7 @@ static Size	 my_worker_msg_sz = 0;
 static void initInvalidPages(void);
 
 /* Synch functions */
-static void set_syncFlag(int worker_id, uint32 flag_to_set);
+static bool set_syncFlag(int worker_id, uint32 flag_to_set);
 static void PR_syncBeforeDispatch(void);
 
 /* History info functions */
@@ -407,21 +407,23 @@ PR_recvSync(void)
 #undef SYNC_RECV_BUF_SZ
 }
 
-static void
+static bool
 set_syncFlag(int worker_id, uint32 flag_to_set)
 {
 	Assert (worker_id != my_worker_id);
 
 	SpinLockAcquire(&pr_worker[worker_id].slock);
-	pr_worker[worker_id].flags |= flag_to_set;
 	if (pr_worker[worker_id].wait_dispatch)
 	{
-		pr_worker[worker_id].wait_dispatch = false;
 		SpinLockRelease(&pr_worker[worker_id].slock);
-		PR_sendSync(worker_id);
+		return false;		/* Sync not needed */
 	}
 	else
+	{
+		pr_worker[worker_id].flags |= flag_to_set;
 		SpinLockRelease(&pr_worker[worker_id].slock);
+		return true;		/* Sync needed */
+	}
 }
 /*
  * This is called only by the READER worker
@@ -432,7 +434,22 @@ set_syncFlag(int worker_id, uint32 flag_to_set)
 void
 PR_syncAll(void)
 {
+	/*
+	 * ここ、まだ変。この事象の後、dispatcerr が残りのデータを
+	 * 当該worker にディスパッチすることがあるが、その場合が
+	 * 処理できていない。
+	 *
+	 * Sync_reader を dispatcherのみに課し、dispatcher が
+	 * READER から割り振られた全データを他の worker との間で
+	 * 完了同期取るのが正しいように思われる。
+	 *
+	 * 正しいやり方は、DISPATCHER に PR_WK_SYNC_READER をセット、
+	 * DISPATCHER が全キューを処理完了後、このフラグを見つけたら
+	 * PR_syncBeforeDispatcher() を行って、その後 READER に
+	 * 完了同期を取るもの。
+	 */
 	int	ii;
+	int	num_sync = 0;
 
 	Assert(my_worker_idx == PR_READER_WORKER_IDX);
 
@@ -440,22 +457,24 @@ PR_syncAll(void)
 	{
 		if (ii == PR_INVALID_PAGE_WORKER_IDX)
 			continue;
-		set_syncFlag(ii, PR_WK_SYNC_READER);
+		if (set_syncFlag(ii, PR_WK_SYNC_READER))
+			num_sync++;
 	}
-	for (ii = 1; ii < (num_preplay_workers - 1); ii++)
+	for (ii = 0; ii < num_sync; ii++)
 		PR_recvSync();
 	/*
 	 * Finaly Invalid Block Worker
 	 */
-	set_syncFlag(PR_INVALID_PAGE_WORKER_IDX, PR_WK_SYNC_READER);
-
-	PR_recvSync();
+	if (set_syncFlag(PR_INVALID_PAGE_WORKER_IDX, PR_WK_SYNC_READER))
+		PR_recvSync();
 }
+
 
 static void
 PR_syncBeforeDispatch(void)
 {
 	int ii;
+	int	num_sync = 0;
 
 	Assert(my_worker_idx == PR_DISPATCHER_WORKER_IDX);
 
@@ -463,13 +482,14 @@ PR_syncBeforeDispatch(void)
 	{
 		if (ii == PR_INVALID_PAGE_WORKER_IDX)
 			continue;
-		set_syncFlag(ii, PR_WK_SYNC_DISPATCHER);
+		if (set_syncFlag(ii, PR_WK_SYNC_DISPATCHER))
+			num_sync++;
 	}
-	for (ii = PR_TXN_WORKER_IDX; ii < (num_preplay_workers -1); ii++)
+	for (ii = 0; ii < num_sync; ii++)
 		PR_recvSync();
 
-	set_syncFlag(PR_INVALID_PAGE_WORKER_IDX, PR_WK_SYNC_DISPATCHER);
-	PR_recvSync();
+	if (set_syncFlag(PR_INVALID_PAGE_WORKER_IDX, PR_WK_SYNC_DISPATCHER))
+		PR_recvSync();
 }
 
 static bool
@@ -1616,42 +1636,7 @@ PR_fetchQueue(void)
 		SpinLockRelease(&my_worker->slock);
 
 		if (my_worker_idx == PR_DISPATCHER_WORKER_IDX)
-		{
-			int ii;
-
-			/* Sync all workers but INVALID PAGE workers */
-			for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers; ii++)
-			{
-				if (ii != PR_INVALID_PAGE_WORKER_IDX)
-				{
-					SpinLockAcquire(&pr_worker[ii].slock);
-					pr_worker[ii].flags |= PR_WK_SYNC_DISPATCHER;
-					if (pr_worker[ii].wait_dispatch == true)
-					{
-						pr_worker[ii].wait_dispatch = false;
-						SpinLockRelease(&pr_worker[ii].slock);
-						PR_sendSync(ii);
-					}
-					else
-						SpinLockRelease(&pr_worker[ii].slock);
-				}
-			}
-			for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers - 1; ii++)
-				PR_recvSync();
-
-			/* Finally INVALID PAGE worker */
-			SpinLockAcquire(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
-			pr_worker[PR_INVALID_PAGE_WORKER_IDX].flags |= PR_WK_SYNC_DISPATCHER;
-			if (pr_worker[PR_INVALID_PAGE_WORKER_IDX].wait_dispatch == true)
-			{
-				pr_worker[PR_INVALID_PAGE_WORKER_IDX].wait_dispatch = false;
-				SpinLockRelease(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
-				PR_sendSync(PR_INVALID_PAGE_WORKER_IDX);
-			}
-			else
-				SpinLockRelease(&pr_worker[PR_INVALID_PAGE_WORKER_IDX].slock);
-			PR_recvSync();
-		}
+			PR_syncBeforeDispatch();
 		PR_sendSync(PR_READER_WORKER_IDX);
 	}
 	if (flags & PR_WK_SYNC_DISPATCHER)
