@@ -289,7 +289,8 @@ struct XLogInvalidPageData_PR
  */
 struct XLogDispatchData_PR
 {
-	slock_t	 	 slock;
+	slock_t	 	 		 slock;
+	unsigned			 flags;		/* Flag,same as PR_worker->flags */
 	XLogReaderState		*reader;	/* Allocated in the separated buffer area */
 	RmgrId				 rmid;
 	uint8				 info;

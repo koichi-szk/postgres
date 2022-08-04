@@ -218,6 +218,8 @@ static void	freeDispatchData(XLogDispatchData_PR *dispatch_data);
 static bool checkRmgrTxnSync(RmgrId rmgrid, uint8 info);
 static bool checkSyncBeforeDispatch(RmgrId rmgrid, uint8 info);
 static bool isSyncBeforeDispatchNeeded(XLogReaderState *reader);
+static bool checkSyncAfterDispatch(RmgrId rmgrid);
+static bool isSyncAfterDispatchNeeded(XLogReaderState *reader);
 
 /*
  * Transaction WAL info function
@@ -595,6 +597,27 @@ isSyncBeforeDispatchNeeded(XLogReaderState *reader)
 	return checkSyncBeforeDispatch(rmgr_id, info);
 }
 
+static bool
+checkSyncAfterDispatch(RmgrId rmgrid)
+{
+	switch(rmgrid)
+	{
+		case RM_SMGR_ID:
+			return true;
+		default:
+			return false;
+	}
+	return false;
+}
+
+static bool
+isSyncAfterDispatchNeeded(XLogReaderState *reader)
+{
+	RmgrId	rmgr_id;
+
+	getXLogRecordRmgrInfo(reader, &rmgr_id, NULL);
+	return checkSyncAfterDispatch(rmgr_id);
+}
 
 /*
  ****************************************************************************
@@ -3014,6 +3037,8 @@ blockWorkerLoop(void)
 		}
 		else
 		{
+			unsigned flags;
+
 			/* Dequeue */
 
 			/* OK. I should handle this. Nobody is handling this and safe to release the lock. */
@@ -3074,6 +3099,25 @@ blockWorkerLoop(void)
 				doRequestWalReceiverReply = false;
 				WalRcvForceReply();
 			}
+
+			/*
+			 * After Dispatch Sync
+			 * We don't need slock here because this is exlusive to this worker
+			 */
+			flags = data->flags;
+			if (flags & PR_WK_SYNC)
+			{
+				if (flags & PR_WK_SYNC_READER)
+					PR_sendSync(PR_READER_WORKER_IDX);
+				if (flags & PR_WK_SYNC_DISPATCHER)
+					PR_sendSync(PR_DISPATCHER_WORKER_IDX);
+				if (flags & PR_WK_SYNC_TXN)
+					PR_sendSync(PR_TXN_WORKER_IDX);
+			}
+			SpinLockAcquire(&my_worker->slock);
+			my_worker->handledRecPtr = currRecPtr;
+			SpinLockRelease(&my_worker->slock);
+		
 			freeDispatchData(data);
 		}
 		SpinLockAcquire(&my_worker->slock);
@@ -3112,7 +3156,8 @@ txnWorkerLoop(void)
 
 	for (;;)
 	{
-		XLogRecPtr currRecPtr;
+		XLogRecPtr	currRecPtr;
+		unsigned	flags;
 
 		el = PR_fetchQueue();
 		if (el == NULL)
@@ -3146,10 +3191,6 @@ txnWorkerLoop(void)
 		/* Now apply the WAL record itself */
 		RmgrTable[record->xl_rmid].rm_redo(xlogreader);
 
-		SpinLockAcquire(&my_worker->slock);
-		my_worker->handledRecPtr = currRecPtr;
-		SpinLockRelease(&my_worker->slock);
-		
 		/* ここで redo 終わったので、終了した LSN の更新を行う */
 		/*
 		 * After redo, check whether the backup pages associated with
@@ -3176,6 +3217,25 @@ txnWorkerLoop(void)
 			doRequestWalReceiverReply = false;
 			WalRcvForceReply();
 		}
+
+		/*
+		 * After Dispatch Sync
+		 * We don't need slock here because this is exlusive to this worker
+		 */
+		flags = dispatch_data->flags;
+		if (flags & PR_WK_SYNC)
+		{
+			if (flags & PR_WK_SYNC_READER)
+				PR_sendSync(PR_READER_WORKER_IDX);
+			if (flags & PR_WK_SYNC_DISPATCHER)
+				PR_sendSync(PR_DISPATCHER_WORKER_IDX);
+			if (flags & PR_WK_SYNC_TXN)
+				PR_sendSync(PR_TXN_WORKER_IDX);
+		}
+		SpinLockAcquire(&my_worker->slock);
+		my_worker->handledRecPtr = currRecPtr;
+		SpinLockRelease(&my_worker->slock);
+		
 		freeDispatchData(dispatch_data);
 	}
 	return;
@@ -3185,43 +3245,46 @@ static void
 getXLogRecordRmgrInfo(XLogReaderState *reader, RmgrId *rmgrid, uint8 *info)
 {
 	*rmgrid = XLogRecGetRmid(reader);
-	switch(*rmgrid)
+	if (info)
 	{
-		case RM_XLOG_ID:
-			*info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
-			break;
-		case RM_XACT_ID:
-			*info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
-			break;
-		case RM_SMGR_ID:
-		case RM_CLOG_ID:
-		case RM_DBASE_ID:
-		case RM_TBLSPC_ID:
-		case RM_MULTIXACT_ID:
-		case RM_RELMAP_ID:
-		case RM_STANDBY_ID:
-		case RM_HEAP2_ID:
-		case RM_HEAP_ID:
-		case RM_BTREE_ID:
-		case RM_HASH_ID:
-		case RM_GIN_ID:
-		case RM_GIST_ID:
-		case RM_SEQ_ID:
-		case RM_SPGIST_ID:
-		case RM_BRIN_ID:
-		case RM_COMMIT_TS_ID:
-		case RM_REPLORIGIN_ID:
-			*info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
-			break;
-		case RM_GENERIC_ID:
-			*info = 0;
-			break;
-		case RM_LOGICALMSG_ID:
-			*info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
-			break;
-		default:
-			*info = 0;
-			break;
+		switch(*rmgrid)
+		{
+			case RM_XLOG_ID:
+				*info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+				break;
+			case RM_XACT_ID:
+				*info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+				break;
+			case RM_SMGR_ID:
+			case RM_CLOG_ID:
+			case RM_DBASE_ID:
+			case RM_TBLSPC_ID:
+			case RM_MULTIXACT_ID:
+			case RM_RELMAP_ID:
+			case RM_STANDBY_ID:
+			case RM_HEAP2_ID:
+			case RM_HEAP_ID:
+			case RM_BTREE_ID:
+			case RM_HASH_ID:
+			case RM_GIN_ID:
+			case RM_GIST_ID:
+			case RM_SEQ_ID:
+			case RM_SPGIST_ID:
+			case RM_BRIN_ID:
+			case RM_COMMIT_TS_ID:
+			case RM_REPLORIGIN_ID:
+				*info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+				break;
+			case RM_GENERIC_ID:
+				*info = 0;
+				break;
+			case RM_LOGICALMSG_ID:
+				*info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+				break;
+			default:
+				*info = 0;
+				break;
+		}
 	}
 }
 
@@ -3300,7 +3363,8 @@ dispatcherWorkerLoop(void)
 
 	for (;;)
 	{
-		XLogRecPtr currRecPtr;
+		XLogRecPtr	currRecPtr;
+		bool		sync_needed;
 
 		/* Dequeue */
 		el = PR_fetchQueue();
@@ -3317,8 +3381,20 @@ dispatcherWorkerLoop(void)
 			PR_syncBeforeDispatch();
 		dispatchDataToXLogHistory(dispatch_data);
 		addDispatchDataToTxn(dispatch_data, false);
+		if (isSyncAfterDispatchNeeded(reader))
+		{
+			dispatch_data->flags = PR_WK_SYNC_DISPATCHER;
+			sync_needed = true;
+		}
+		else
+		{
+			dispatch_data->flags = 0;
+			sync_needed = false;
+		}
 		for (worker_list = dispatch_data->worker_list; *worker_list > PR_DISPATCHER_WORKER_IDX; worker_list++)
 			PR_enqueue(dispatch_data, XLogDispatchData, *worker_list);
+		if (sync_needed)
+			PR_recvSync();	/* Only WORKER actually handled this data */
 
 		SpinLockAcquire(&my_worker->slock);
 		my_worker->handledRecPtr = currRecPtr;
