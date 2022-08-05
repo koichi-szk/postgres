@@ -3114,10 +3114,6 @@ blockWorkerLoop(void)
 				if (flags & PR_WK_SYNC_TXN)
 					PR_sendSync(PR_TXN_WORKER_IDX);
 			}
-			SpinLockAcquire(&my_worker->slock);
-			my_worker->handledRecPtr = currRecPtr;
-			SpinLockRelease(&my_worker->slock);
-		
 			freeDispatchData(data);
 		}
 		SpinLockAcquire(&my_worker->slock);
