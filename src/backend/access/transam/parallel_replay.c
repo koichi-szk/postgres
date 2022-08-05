@@ -36,6 +36,7 @@
 #include "access/xlogrecord.h"
 #include "access/xlogutils.h"
 #include "catalog/pg_control.h"
+#include "catalog/storage_xlog.h"
 #include "miscadmin.h"
 #include "pg_config.h"
 #include "postmaster/postmaster.h"
@@ -218,7 +219,7 @@ static void	freeDispatchData(XLogDispatchData_PR *dispatch_data);
 static bool checkRmgrTxnSync(RmgrId rmgrid, uint8 info);
 static bool checkSyncBeforeDispatch(RmgrId rmgrid, uint8 info);
 static bool isSyncBeforeDispatchNeeded(XLogReaderState *reader);
-static bool checkSyncAfterDispatch(RmgrId rmgrid);
+static bool checkSyncAfterDispatch(RmgrId rmgrid, uint8 info);
 static bool isSyncAfterDispatchNeeded(XLogReaderState *reader);
 
 /*
@@ -557,7 +558,15 @@ checkSyncBeforeDispatch(RmgrId rmgrid, uint8 info)
 					return false;
 			}
 		case RM_SMGR_ID:
-			return false;
+			switch(info)
+			{
+				case XLOG_SMGR_CREATE:
+					return false;
+				case XLOG_SMGR_TRUNCATE:
+					return true;
+				default:
+					return false;
+			}
 		case RM_CLOG_ID:
 		case RM_DBASE_ID:
 		case RM_TBLSPC_ID:
@@ -598,25 +607,31 @@ isSyncBeforeDispatchNeeded(XLogReaderState *reader)
 }
 
 static bool
-checkSyncAfterDispatch(RmgrId rmgrid)
+checkSyncAfterDispatch(RmgrId rmgrid, uint8 info)
 {
 	switch(rmgrid)
 	{
 		case RM_SMGR_ID:
-			return true;
+			switch(info)
+			{
+				case XLOG_SMGR_CREATE:
+					return true;
+				default:
+					return false;
+			}
 		default:
 			return false;
 	}
-	return false;
 }
 
 static bool
 isSyncAfterDispatchNeeded(XLogReaderState *reader)
 {
 	RmgrId	rmgr_id;
+	uint8	info;
 
-	getXLogRecordRmgrInfo(reader, &rmgr_id, NULL);
-	return checkSyncAfterDispatch(rmgr_id);
+	getXLogRecordRmgrInfo(reader, &rmgr_id, &info);
+	return checkSyncAfterDispatch(rmgr_id, info);
 }
 
 /*
