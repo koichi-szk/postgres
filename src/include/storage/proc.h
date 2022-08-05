@@ -16,6 +16,7 @@
 
 #include "access/clog.h"
 #include "access/xlogdefs.h"
+#include "access/parallel_replay.h"
 #include "lib/ilist.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
@@ -381,7 +382,9 @@ extern PGPROC *PreparedXactProcs;
  * operation.  Startup process and WAL receiver also consume 2 slots, but WAL
  * writer is launched only after startup has exited, so we only need 5 slots.
  */
-#define NUM_AUXILIARY_PROCS		5
+#define FIXED_NUM_AUXILIARY_PROCS		5
+#define NUM_PARALLEL_REPLAY_WORKERS		(parallel_replay ? num_preplay_workers - 1 : 0)
+#define NUM_AUXILIARY_PROCS (FIXED_NUM_AUXILIARY_PROCS + NUM_PARALLEL_REPLAY_WORKERS)
 
 /* configurable options */
 extern PGDLLIMPORT int DeadlockTimeout;

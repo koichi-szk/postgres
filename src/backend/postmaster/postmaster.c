@@ -5490,6 +5490,8 @@ StartChildProcess(AuxProcType type, int idx)
 
 	if (pid == 0)				/* child */
 	{
+		if (type == ParallelRedoProcess)
+			MyProcPid = getpid();
 #ifdef WAL_DEBUG
 		if (PR_needTestSync() && type == ParallelRedoProcess)
 		{

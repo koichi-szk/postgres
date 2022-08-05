@@ -3175,19 +3175,10 @@ txnWorkerLoop(void)
 
 			/* Deallocate the trancaction cell */
 			free_txn_cell(txn_cell, true);
-#if 0
-			/* txn_cell is removed within syncTxn() */
-			removeTxnCell(txn_cell);
-#endif
 		}
-		/*
-		 * Koichi: TBD
-		 *		ここで replay して、txn ヒストリや XLogCtl のアップデートを行う
-		 */
 		/* Now apply the WAL record itself */
 		RmgrTable[record->xl_rmid].rm_redo(xlogreader);
 
-		/* ここで redo 終わったので、終了した LSN の更新を行う */
 		/*
 		 * After redo, check whether the backup pages associated with
 		 * the WAL record are consistent with the existing pages. This
@@ -3390,7 +3381,7 @@ dispatcherWorkerLoop(void)
 		for (worker_list = dispatch_data->worker_list; *worker_list > PR_DISPATCHER_WORKER_IDX; worker_list++)
 			PR_enqueue(dispatch_data, XLogDispatchData, *worker_list);
 		if (sync_needed)
-			PR_recvSync();	/* Only WORKER actually handled this data */
+			PR_recvSync();	/* Only one WORKER actually handled this data sends sync. */
 
 		SpinLockAcquire(&my_worker->slock);
 		my_worker->handledRecPtr = currRecPtr;
