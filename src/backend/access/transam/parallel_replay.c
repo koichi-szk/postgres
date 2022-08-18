@@ -832,17 +832,25 @@ freeDispatchData(XLogDispatchData_PR *dispatch_data)
 {
 	Assert(dispatch_data);
 
+	/*
+	 * Now we have up to four shm area to free. 
+	 * Let's acquire the lock here to avoid the chance of lock conflict.
+	 */
+	SpinLockAcquire(&pr_buffer->slock);
 #ifdef WAL_DEBUG
 	if (dispatch_data->reader->xlog_string)
-		PR_freeBuffer(dispatch_data->reader->xlog_string, true);
+		PR_freeBuffer(dispatch_data->reader->xlog_string, false);
 #endif
 	if (dispatch_data->reader)
 	{
+		if (dispatch_data->reader->main_data)
+			PR_freeBuffer(dispatch_data->reader->main_data, false);
 		if (dispatch_data->reader->record)
-			PR_freeBuffer(dispatch_data->reader->record, true);
-		PR_freeBuffer(dispatch_data->reader, true);
+			PR_freeBuffer(dispatch_data->reader->record, false);
+		PR_freeBuffer(dispatch_data->reader, false);
 	}
-	PR_freeBuffer(dispatch_data, true);
+	PR_freeBuffer(dispatch_data, false);
+	SpinLockRelease(&pr_buffer->slock);
 }
 
 /*

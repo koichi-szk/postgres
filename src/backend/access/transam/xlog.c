@@ -7584,13 +7584,28 @@ StartupXLOG(void)
 					 * chain record, and dispatch to DISPATCHER WORKER
 					 */
 					XLogReaderState *xlogreader_PR;
+					XLogRecord *record_shm;
+					uint32		tot_len;
 
+					tot_len = record->xl_tot_len;
+					record_shm = (XLogRecord *)PR_allocBuffer(tot_len, true);
+					memcpy(record_shm, record, tot_len);
 					xlogreader_PR = (XLogReaderState *)PR_allocBuffer(sizeof(XLogReaderState), true);
 					memcpy(xlogreader_PR, xlogreader, sizeof(XLogReaderState));
-					xlogreader_PR->record = record;
+					xlogreader_PR->record = record_shm;
+					/* Need to take care of decoded record here */
+					/* From xlogreader.c, decoded_record is set to NULL or record */
+					if (xlogreader->decoded_record == record)
+						xlogreader_PR->decoded_record = record_shm;
+					/* Then the main data */
+					if (xlogreader->main_data)
+					{
+						xlogreader_PR->main_data = (char *)PR_allocBuffer(xlogreader->main_data_len, true);
+						memcpy(xlogreader_PR->main_data, xlogreader->main_data, xlogreader->main_data_len);
+					}
 #ifdef WAL_DEBUG
 					xlogreader_PR->xlog_string = xlog_string;
-					PR_debug_analyzeState(xlogreader_PR, record);
+					PR_debug_analyzeState(xlogreader_PR, record_shm);
 #endif
 					PR_enqueue(xlogreader_PR, ReaderState, PR_DISPATCHER_WORKER_IDX);
 				}
