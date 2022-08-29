@@ -4502,7 +4502,7 @@ BackendInitialize(Port *port)
 	 */
 	initStringInfo(&ps_data);
 	if (am_walsender)
-		appendStringInfo(&ps_data, "%s ", GetBackendTypeDesc(B_WAL_SENDER));
+		appendStringInfo(&ps_data, "%s ", GetBackendTypeDesc(B_WAL_SENDER, -1));
 	appendStringInfo(&ps_data, "%s ", port->user_name);
 	if (!am_walsender)
 		appendStringInfo(&ps_data, "%s ", port->database_name);

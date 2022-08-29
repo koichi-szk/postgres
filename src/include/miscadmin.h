@@ -340,8 +340,9 @@ typedef enum BackendType
 } BackendType;
 
 extern BackendType MyBackendType;
+extern int		   MyAuxProcIdx;
 
-extern const char *GetBackendTypeDesc(BackendType backendType);
+extern const char *GetBackendTypeDesc(BackendType backendType, int auxProcIdx);
 
 extern void SetDatabasePath(const char *path);
 extern void checkDataDir(void);
