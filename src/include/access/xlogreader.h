@@ -162,6 +162,11 @@ struct XLogReaderState
 	 */
 	uint64		system_identifier;
 
+#ifdef WAL_DEBUG
+	long		ser_no;			/* Serial number of the record, for parallel */
+								/* replay debug */
+#endif
+
 	/*
 	 * Opaque data for callbacks to use.  Not used by XLogReader.
 	 */

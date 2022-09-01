@@ -450,6 +450,7 @@ extern void PRDebug_finish(void);
 extern void PR_debug_buffer(void);
 extern void PR_debug_buffer2(void);
 extern void PR_debug_analyzeState(XLogReaderState *state, XLogRecord *record);
+extern void PR_breakpoint(void);
 
 /*
  ****************************************************************************

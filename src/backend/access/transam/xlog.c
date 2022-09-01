@@ -7586,12 +7586,18 @@ StartupXLOG(void)
 					XLogReaderState *xlogreader_PR;
 					XLogRecord *record_shm;
 					uint32		tot_len;
+#ifdef WAL_DEBUG
+					static long	ser_no = 0;
+#endif
 
 					tot_len = record->xl_tot_len;
 					record_shm = (XLogRecord *)PR_allocBuffer(tot_len, true);
 					memcpy(record_shm, record, tot_len);
 					xlogreader_PR = (XLogReaderState *)PR_allocBuffer(sizeof(XLogReaderState), true);
 					memcpy(xlogreader_PR, xlogreader, sizeof(XLogReaderState));
+#ifdef WAL_DEBUG
+					xlogreader_PR->ser_no = ser_no++;
+#endif
 					xlogreader_PR->record = record_shm;
 					/* Need to take care of decoded record here */
 					/* From xlogreader.c, decoded_record is set to NULL or record */

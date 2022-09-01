@@ -1040,7 +1040,7 @@ PR_log_invalid_page(RelFileNode node, ForkNumber forkno, BlockNumber blkno, bool
 
 	Assert(PR_isInParallelRecovery());
 
-	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(pr_sizeof(invalidData), true);
+	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(pr_sizeof(XLogInvalidPageData_PR), true);
 	invalidData->cmd = PR_LOG;
 	invalidData->node = node;
 	invalidData->forkno = forkno;
@@ -1058,7 +1058,7 @@ PR_forget_invalid_pages(RelFileNode node, ForkNumber forkno, BlockNumber minblkn
 
 	Assert(PR_isInParallelRecovery());
 
-	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(pr_sizeof(invalidData), true);
+	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(pr_sizeof(XLogInvalidPageData_PR), true);
 	invalidData->cmd = PR_FORGET_PAGES;
 	invalidData->node = node;
 	invalidData->forkno = forkno;
@@ -1076,7 +1076,7 @@ PR_forget_invalid_pages_db(Oid dbid)
 
 	Assert(PR_isInParallelRecovery());
 
-	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(pr_sizeof(invalidData), true);
+	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(pr_sizeof(XLogInvalidPageData_PR), true);
 	invalidData->cmd = PR_FORGET_DB;
 	invalidData->forkno = 0;
 	invalidData->blkno = 0;
@@ -1104,7 +1104,7 @@ PR_XLogCheckInvalidPages(void)
 
 	Assert(PR_isInParallelRecovery());
 
-	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(pr_sizeof(invalidData), true);
+	invalidData = (XLogInvalidPageData_PR *)PR_allocBuffer(pr_sizeof(XLogInvalidPageData_PR), true);
 	invalidData->cmd = PR_CHECK_INVALID_PAGES;
 	invalidData->forkno = 0;
 	invalidData->blkno = 0;
@@ -1967,6 +1967,7 @@ dump_buffer(const char *funcname, bool need_lock)
 				(curr_chunk->size != *size_at_tail))
 		{
 			appendStringInfoString(&s, "Error found in the chunk\n");
+			PR_breakpoint();
 			break;
 		}
 	}
@@ -2732,6 +2733,15 @@ PRDebug_start(int worker_idx)
  */
 void
 PRDebug_sync(void)
+{
+	return;
+}
+
+/*
+ * Breakpoint function to detect error with the debugger.
+ */
+void
+PR_breakpoint(void)
 {
 	return;
 }
