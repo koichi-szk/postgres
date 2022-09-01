@@ -37,6 +37,7 @@
 #include "access/xlogutils.h"
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
+#include "common/hashfn.h"
 #include "miscadmin.h"
 #include "pg_config.h"
 #include "postmaster/postmaster.h"
@@ -242,7 +243,9 @@ static void			 dispatchDataToXLogHistory(XLogDispatchData_PR *dispatch_data);
 
 /* XLogReaderState/XLogRecord functions */
 static int	blockHash(int spc, int db, int rel, int blk, int n_max);
+#if 0
 INLINE int	fold_int2int8(int val);
+#endif
 static void getXLogRecordRmgrInfo(XLogReaderState *reader, RmgrId *rmgrid, uint8 *info);
 
 
@@ -1861,14 +1864,19 @@ blockHash(int spc, int db, int rel, int blk, int n_max)
 	if (n_max <= 1)
 		return 0;
 
+	wk_all = hash_bytes_uint32(spc + db + rel + blk);
+	return(wk_all % n_max);
+#if 0
 	wk_all = fold_int2int8(spc) + fold_int2int8(db) + fold_int2int8(rel) + fold_int2int8(blk);
 	wk_all = fold_int2int8(wk_all);
 
 	while(wk_all >= n_max)
 		wk_all = wk_all/n_max + wk_all%n_max;
 	return wk_all;
+#endif
 }
 
+#if 0
 INLINE int
 fold_int2int8(int val)
 {
@@ -1884,6 +1892,7 @@ fold_int2int8(int val)
 	}
 	return rv;
 }
+#endif
 
  
 
