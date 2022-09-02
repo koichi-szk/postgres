@@ -1856,7 +1856,7 @@ PR_analyzeXLogReaderState(XLogReaderState *reader, XLogRecord *record)
 static int
 blockHash(int spc, int db, int rel, int blk, int n_max)
 {
-	int wk_all;
+	unsigned int wk_all;
 
 	Assert(n_max > 0);
 
