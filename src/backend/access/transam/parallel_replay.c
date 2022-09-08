@@ -105,6 +105,11 @@ static PR_worker	*pr_worker = NULL;
 static PR_queue		*pr_queue = NULL;
 static PR_buffer	*pr_buffer = NULL;
 
+#ifdef WAL_DEBUG
+#define BufferDumpAreaLen	8192
+static char	*buffer_dump_data;
+#endif
+
 /* My worker process info */
 static int           my_worker_idx = 0;         /* Index of the worker.  Set when the worker starts. */
 static PR_worker    *my_worker = NULL;      /* My worker structure */
@@ -258,8 +263,8 @@ static void blockWorkerLoop(void);
 /* Test code */
 #ifdef WAL_DEBUG
 static void PRDebug_out(StringInfo s);
-static void dump_buffer(const char *funcname, bool need_lock);
-static void dump_chunk(PR_BufChunk *chunk, const char *funcname, bool need_lock);
+static bool dump_buffer(const char *funcname, StringInfo s, bool need_lock);
+static void dump_chunk(PR_BufChunk *chunk, const char *funcname, StringInfo s, bool need_lock);
 #endif
 
 /*
@@ -657,10 +662,12 @@ PR_initShm(void)
 	Size	my_worker_sz;
 	Size	my_queue_sz;
 
-
 	Assert(my_worker_idx == PR_READER_WORKER);
 
 	my_shm_size = pr_sizeof(PR_shm)
+#ifdef WAL_DEBUG
+		+ BufferDumpAreaLen
+#endif
 		+ (my_txn_hash_sz = pr_txn_hash_size())
 		+ (my_invalidP_sz = pr_sizeof(PR_invalidPages))
 		+ (my_history_sz = xlogHistorySize())
@@ -671,6 +678,10 @@ PR_initShm(void)
 	pr_shm_seg = dsm_create(my_shm_size, 0);
 	
 	pr_shm = dsm_segment_address(pr_shm_seg);
+#ifdef WAL_DEBUG
+	buffer_dump_data = (char *)pr_shm;
+	pr_shm = addr_forward(pr_shm, BufferDumpAreaLen);
+#endif
 	pr_shm->txn_wal_info = pr_txn_wal_info = addr_forward(pr_shm, pr_sizeof(PR_shm));
 	pr_shm->invalidPages = pr_invalidPages = addr_forward(pr_txn_wal_info, my_txn_hash_sz);
 	pr_shm->history = pr_history = addr_forward(pr_invalidPages, pr_sizeof(PR_invalidPages));
@@ -1924,40 +1935,49 @@ next_chunk(PR_BufChunk *chunk)
 }
 
 #ifdef WAL_DEBUG
-static void
-dump_buffer(const char *funcname, bool need_lock)
+/*
+ * If s is not NULL, then all the output data will be appended to s.
+ * In this case, the caller must have initialized s.
+ * If s is NULL, then all the output data will be written to the debuf file.
+ */
+static bool
+dump_buffer(const char *funcname, StringInfo outs, bool need_lock)
 {
-	StringInfoData	s;
+	StringInfo	s;
 	int	ii;
 	PR_BufChunk	*curr_chunk;
+	bool	rv = true;
 
 	if (!PR_test)
-		return;
+		return true;
+	if (outs == NULL)
+		s = makeStringInfo();
+	else
+		s = outs;
 
 	if (need_lock)
 		SpinLockAcquire(&pr_buffer->slock);
-	initStringInfo(&s);
-	appendStringInfo(&s, "\n=== Buffer area dump: func: %s, worker: %d =================\n", funcname, my_worker_idx);
-	appendStringInfo(&s, "Pr_buffer: 0x%016lx, updated: %ld,\n", (uint64)pr_buffer, pr_buffer->updated);
-	appendStringInfo(&s, "head: 0x%016lx (%ld), tail: 0x%016lx (%ld)\n",
+	appendStringInfo(s, "\n=== Buffer area dump: func: %s, worker: %d =================\n", funcname, my_worker_idx);
+	appendStringInfo(s, "Pr_buffer: 0x%016lx, updated: %ld,\n", (uint64)pr_buffer, pr_buffer->updated);
+	appendStringInfo(s, "head: 0x%016lx (%ld), tail: 0x%016lx (%ld)\n",
 								(uint64)(pr_buffer->head), addr_difference(pr_buffer, pr_buffer->head),
 								(uint64)(pr_buffer->tail), addr_difference(pr_buffer, pr_buffer->tail));
-	appendStringInfo(&s, "alloc_start: 0x%016lx (%ld), alloc_end: 0x%016lx (%ld)\n",
+	appendStringInfo(s, "alloc_start: 0x%016lx (%ld), alloc_end: 0x%016lx (%ld)\n",
 								(uint64)(pr_buffer->alloc_start), addr_difference(pr_buffer, pr_buffer->alloc_start),
 								(uint64)(pr_buffer->alloc_end), addr_difference(pr_buffer, pr_buffer->alloc_end));
-	appendStringInfo(&s, "needed_by_worker: 0x%016lx (%ld) (n_worker: %d)\n    ", 
+	appendStringInfo(s, "needed_by_worker: 0x%016lx (%ld) (n_worker: %d)\n    ", 
 								(uint64)(pr_buffer->needed_by_worker),
 								addr_difference(pr_buffer, pr_buffer->needed_by_worker),
 								num_preplay_workers);
 	for (ii = 0; ii < num_preplay_workers; ii++)
 	{
 		if (ii == 0)
-			appendStringInfo(&s, "(idx: %d, value: %ld)", ii, pr_buffer->needed_by_worker[ii]);
+			appendStringInfo(s, "(idx: %d, value: %ld)", ii, pr_buffer->needed_by_worker[ii]);
 		else
-			appendStringInfo(&s, ", (idx: %d, value: %ld)", ii, pr_buffer->needed_by_worker[ii]);
+			appendStringInfo(s, ", (idx: %d, value: %ld)", ii, pr_buffer->needed_by_worker[ii]);
 	}
-	appendStringInfoString(&s, "\n");
-	appendStringInfoString(&s, "---Chunk---\n");
+	appendStringInfoString(s, "\n");
+	appendStringInfoString(s, "---Chunk---\n");
 	for(curr_chunk = (PR_BufChunk *)(pr_buffer->head);
 			addr_before(curr_chunk, pr_buffer->tail);
 			curr_chunk = next_chunk(curr_chunk))
@@ -1965,7 +1985,7 @@ dump_buffer(const char *funcname, bool need_lock)
 		Size *size_at_tail;
 
 		size_at_tail = SizeAtTail(curr_chunk);
-		appendStringInfo(&s, "Addr: 0x%016lx (%ld), Size: %ld, Magic: %s, Size_at_tail: %ld\n",
+		appendStringInfo(s, "Addr: 0x%016lx (%ld), Size: %ld, Magic: %s, Size_at_tail: %ld\n",
 								(uint64)curr_chunk,
 								addr_difference(pr_buffer, curr_chunk),
 								curr_chunk->size,
@@ -1975,49 +1995,79 @@ dump_buffer(const char *funcname, bool need_lock)
 		if ((curr_chunk->magic != PR_BufChunk_Allocated && curr_chunk->magic != PR_BufChunk_Free) ||
 				(curr_chunk->size != *size_at_tail))
 		{
-			appendStringInfoString(&s, "Error found in the chunk\n");
+			appendStringInfoString(s, "Error found in the chunk\n");
+			rv = false;
 			PR_breakpoint();
 			break;
 		}
 	}
 	if (need_lock)
 		SpinLockRelease(&pr_buffer->slock);
-	appendStringInfoString(&s, "\n=== Buffer dump end =================\n");
-	PRDebug_out(&s);
-	pfree(s.data);
-	s.data = NULL;
+	appendStringInfoString(s, "\n=== Buffer dump end =================\n");
+	if (outs == NULL)
+	{
+		PRDebug_out(s);
+		pfree(s->data);
+	}
+	return rv;
 }
 
 static void
-dump_chunk(PR_BufChunk *chunk, const char *funcname, bool need_lock)
+post_dump_buffer(StringInfo s, bool buf_ok)
 {
-	StringInfoData	s;
+	StringInfoData	s_shm;
+
+	if (buf_ok == true)
+	{
+		memcpy(buffer_dump_data, s->data, s->len);
+		buffer_dump_data[s->len] = '\0';
+	}
+	else
+	{
+		s_shm.data = buffer_dump_data;
+		s_shm.len = strlen(buffer_dump_data);
+		PRDebug_out(&s_shm);
+		buffer_dump_data[0] = '\0';
+		PRDebug_out(s);
+	}
+}
+
+static void
+dump_chunk(PR_BufChunk *chunk, const char *funcname, StringInfo outs, bool need_lock)
+{
+	StringInfo	s;
 	Size	*size_at_tail;
 
 	if (!PR_test)
 		return;
 
-	initStringInfo(&s);
+	if (outs == NULL)
+		s = makeStringInfo();
+	else
+		s = outs;
 
 	if (need_lock)
 		SpinLockAcquire(&pr_buffer->slock);
 	size_at_tail = SizeAtTail(chunk);
-	appendStringInfo(&s, "\n=== Chunk dump: func: %s =================\n", funcname);
-	appendStringInfo(&s, "Buffer: 0x%016lx, head: 0x%016lx (%ld), tail: 0x%016lx (%ld)\n",
+	appendStringInfo(s, "\n=== Chunk dump: func: %s =================\n", funcname);
+	appendStringInfo(s, "Buffer: 0x%016lx, head: 0x%016lx (%ld), tail: 0x%016lx (%ld)\n",
 			(uint64)pr_buffer,
 			(uint64)(pr_buffer->head), addr_difference(pr_buffer->head, pr_buffer),
 			(uint64)(pr_buffer->tail), addr_difference(pr_buffer->tail, pr_buffer));
-	appendStringInfo(&s, "Chunk: 0x%016lx (%ld), size: %ld, magic: %s, size_at_tail: %ld\n",
+	appendStringInfo(s, "Chunk: 0x%016lx (%ld), size: %ld, magic: %s, size_at_tail: %ld\n",
 			(uint64)chunk, addr_difference(pr_buffer, chunk), chunk->size,
 			chunk->magic == PR_BufChunk_Allocated ? "Alloc"
 				: (chunk->magic == PR_BufChunk_Free ? "Free" : "Error"),
 			*size_at_tail);
 	if (need_lock)
 		SpinLockRelease(&pr_buffer->slock);
-	appendStringInfoString(&s, "\n=== Chunk dump end =================\n");
-	PRDebug_out(&s);
-	pfree(s.data);
-	s.data = NULL;
+	appendStringInfoString(s, "\n=== Chunk dump end =================\n");
+	if (outs == NULL)
+	{
+		PRDebug_out(s);
+		pfree(s->data);
+		pfree(s);
+	}
 }
 
 #endif
@@ -2027,12 +2077,17 @@ PR_allocBuffer(Size sz, bool need_lock)
 {
 	PR_BufChunk	*new;
 	Size		 chunk_sz;
+	StringInfo	 s;
 	void		*wk;
 	void		*rv;
+	bool	     buf_ok;
 
 #ifdef WAL_DEBUG
-	PRDebug_log("--- %s: allocation size: %lu ---\n", __func__, sz);
-	dump_buffer(__func__, need_lock);
+	s = makeStringInfo();
+	appendStringInfo(s, "--- %s: allocation size: %lu ---\n", __func__, sz);
+	buf_ok = dump_buffer(__func__, s, need_lock);
+	post_dump_buffer(s, buf_ok);
+	resetStringInfo(s);
 #endif
 	if (need_lock)
 		SpinLockAcquire(&pr_buffer->slock);
@@ -2056,8 +2111,11 @@ PR_allocBuffer(Size sz, bool need_lock)
 				SpinLockRelease(&pr_buffer->slock);
 			rv = retry_allocBuffer(sz, need_lock);
 #ifdef WAL_DEBUG
-			dump_buffer(__func__, need_lock);
-			PRDebug_log("--- %s: returning: %p ---\n", __func__, rv);
+			buf_ok = dump_buffer(__func__, s, need_lock);
+			appendStringInfo(s, "--- %s: returning: %p ---\n", __func__, rv);
+			post_dump_buffer(s, buf_ok);
+			pfree(s->data);
+			pfree(s);
 #endif
 			return rv;
 		}
@@ -2067,8 +2125,12 @@ PR_allocBuffer(Size sz, bool need_lock)
 				SpinLockRelease(&pr_buffer->slock);
 			rv = addr_forward(new, pr_sizeof(PR_BufChunk));
 #ifdef WAL_DEBUG
-			dump_buffer(__func__, need_lock);
-			PRDebug_log("--- %s: returning: %p ---\n", __func__, rv);
+			buf_ok = dump_buffer(__func__, s, need_lock);
+			appendStringInfo(s, "--- %s: returning: %p ---\n", __func__, rv);
+			post_dump_buffer(s, buf_ok);
+			resetStringInfo(s);
+			pfree(s->data);
+			pfree(s);
 #endif
 			return rv;
 		}
@@ -2082,8 +2144,11 @@ PR_allocBuffer(Size sz, bool need_lock)
 				SpinLockRelease(&pr_buffer->slock);
 			rv = addr_forward(new, pr_sizeof(PR_BufChunk));
 #ifdef WAL_DEBUG
-			dump_buffer(__func__, need_lock);
-			PRDebug_log("--- %s: returning: %p ---\n", __func__, rv);
+			buf_ok = dump_buffer(__func__, s, need_lock);
+			appendStringInfo(s, "--- %s: returning: %p ---\n", __func__, rv);
+			post_dump_buffer(s, buf_ok);
+			pfree(s->data);
+			pfree(s);
 #endif
 			return rv;
 		}
@@ -2097,8 +2162,11 @@ PR_allocBuffer(Size sz, bool need_lock)
 			pr_buffer->alloc_start = wk;
 			rv = retry_allocBuffer(sz, need_lock);
 #ifdef WAL_DEBUG
-			dump_buffer(__func__, need_lock);
-			PRDebug_log("--- %s: returning: %p ---\n", __func__, rv);
+			dump_buffer(__func__, s, need_lock);
+			appendStringInfo(s, "--- %s: returning: %p ---\n", __func__, rv);
+			post_dump_buffer(s, buf_ok);
+			pfree(s->data);
+			pfree(s);
 #endif
 			return rv;
 		}
@@ -2108,8 +2176,11 @@ PR_allocBuffer(Size sz, bool need_lock)
 				SpinLockRelease(&pr_buffer->slock);
 			rv = addr_forward(new, pr_sizeof(PR_BufChunk));
 #ifdef WAL_DEBUG
-			dump_buffer(__func__, need_lock);
-			PRDebug_log("--- %s: returning: %p ---\n", __func__, rv);
+			buf_ok = dump_buffer(__func__, s, need_lock);
+			appendStringInfo(s, "--- %s: returning: %p ---\n", __func__, rv);
+			post_dump_buffer(s, buf_ok);
+			pfree(s->data);
+			pfree(s);
 #endif
 			return rv;
 		}
@@ -2117,8 +2188,11 @@ PR_allocBuffer(Size sz, bool need_lock)
 	if (need_lock)
 		SpinLockRelease(&pr_buffer->slock);
 #ifdef WAL_DEBUG
-		dump_buffer(__func__, need_lock);
-		PRDebug_log("--- %s: returning: NULL ---\n", __func__);
+	buf_ok = dump_buffer(__func__, s, need_lock);
+	appendStringInfo(s, "--- %s: returning: NULL ---\n", __func__);
+	post_dump_buffer(s, buf_ok);
+	pfree(s->data);
+	pfree(s);
 #endif
 	return NULL;
 }
@@ -2128,7 +2202,14 @@ static void *
 retry_allocBuffer(Size sz, bool need_lock)
 {
 #ifdef WAL_DEBUG
-	dump_buffer(__func__, need_lock);
+	StringInfo	s;
+	bool	buf_ok;
+#endif
+
+#ifdef WAL_DEBUG
+	s = makeStringInfo();
+	buf_ok = dump_buffer(__func__, s, need_lock);
+	post_dump_buffer(s, buf_ok);
 #endif
 	if (need_lock)
 		SpinLockAcquire(&pr_buffer->slock);
@@ -2245,14 +2326,20 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	Size		 available;
 	int			 ii;
 	bool		 needed_by_lower_worker;
+#ifdef WAL_DEBUG
+	StringInfo	s;
+	bool	buf_ok;
+#endif
 
 	/* Do not forget to ping reader or dispatcher if there's free area available */
 	/* Ping the reader worker only when dispatcher does not require the buffer */
 
 #ifdef WAL_DEBUG
-	PRDebug_log("--- %s: freeing: %p ---\n", __func__, buffer);
-	dump_chunk(Chunk(buffer), __func__, need_lock);
-	dump_buffer(__func__, need_lock);
+	s = makeStringInfo();
+	appendStringInfo(s, "--- %s: freeing: %p ---\n", __func__, buffer);
+	dump_chunk(Chunk(buffer), __func__, s, need_lock);
+	buf_ok = dump_buffer(__func__, s, need_lock);
+	post_dump_buffer(s, buf_ok);
 #endif
 	if (need_lock)
 		SpinLockAcquire(&pr_buffer->slock);
@@ -2293,7 +2380,10 @@ PR_freeBuffer(void *buffer, bool need_lock)
 					elog(PANIC, "Conflicting situation: replay worker freeing the buffer is also waiting for the buffer.");
 				PR_sendSync(ii);
 #ifdef WAL_DEBUG
-				dump_buffer(__func__, need_lock);
+				buf_ok = dump_buffer(__func__, s, need_lock);
+				post_dump_buffer(s, buf_ok);
+				pfree(s->data);
+				pfree(s);
 #endif
 				return;
 			}
@@ -2319,7 +2409,10 @@ PR_freeBuffer(void *buffer, bool need_lock)
 					elog(PANIC, "Conflicting situation: replay worker freeing the buffer is also waiting for the buffer.");
 				PR_sendSync(ii);
 #ifdef WAL_DEBUG
-				dump_buffer(__func__, need_lock);
+				buf_ok = dump_buffer(__func__, s, need_lock);
+				post_dump_buffer(s, buf_ok);
+				pfree(s->data);
+				pfree(s);
 #endif
 				return;
 			}
@@ -2329,7 +2422,10 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	if (need_lock)
 		SpinLockRelease(&pr_buffer->slock);
 #ifdef WAL_DEBUG
-	dump_buffer(__func__, need_lock);
+	buf_ok = dump_buffer(__func__, s, need_lock);
+	post_dump_buffer(s, buf_ok);
+	pfree(s->data);
+	pfree(s);
 #endif
 	return;
 
@@ -2386,7 +2482,7 @@ initBuffer(void)
 	*size_at_tail = chunk->size;
 #ifdef WAL_DEBUG
 	pr_buffer->updated = 0;
-	dump_buffer(__func__, false);
+	dump_buffer(__func__, NULL, false);
 #endif
 	SpinLockInit(&pr_buffer->slock);
 }
@@ -2784,6 +2880,8 @@ PRDebug_log(char *fmt, ...)
 static void
 PRDebug_out(StringInfo s)
 {
+	if ((s->data[0] == '\0') || (s->len == 0))
+		return;
 	fwrite(s->data, s->len, sizeof(char), pr_debug_log);
 	fflush(pr_debug_log);
 }
