@@ -106,7 +106,7 @@ static PR_queue		*pr_queue = NULL;
 static PR_buffer	*pr_buffer = NULL;
 
 #ifdef WAL_DEBUG
-#define BufferDumpAreaLen	8192
+#define BufferDumpAreaLen	(4096 * 16)
 static char	*buffer_dump_data;
 #endif
 
@@ -265,6 +265,11 @@ static void blockWorkerLoop(void);
 static void PRDebug_out(StringInfo s);
 static bool dump_buffer(const char *funcname, StringInfo s, bool need_lock);
 static void dump_chunk(PR_BufChunk *chunk, const char *funcname, StringInfo s, bool need_lock);
+static char *now_timeofday(void);
+static void dump_invalidPageData(XLogInvalidPageData_PR *page);
+static char *forkNumName(ForkNumber forknum);
+static char *invalidPageCmdName(PR_invalidPageCheckCmd cmd);
+static char *worker_name(int idx);
 #endif
 
 /*
@@ -294,18 +299,27 @@ PR_syncInitSockDir(void)
 
 		/* sync sock directory sync error */
 		if (my_errno != ENOENT)
+		{
+			PR_breakpoint();
 			elog(PANIC, "Failed to stat PR debug directory, %s", strerror(my_errno));
+		}
         rv = mkdir(sync_sock_dir, S_IRUSR|S_IWUSR|S_IXUSR);
         local_errno = errno;
         if (rv != 0)
+		{
+			PR_breakpoint();
             elog(PANIC, "Failed to create PR debug directory, %s", strerror(local_errno));
+		}
     }
     else
 	{
 		/* Debug directory stat successfful */
 		if ((statbuf.st_mode & S_IFDIR) == 0)
+		{
+			PR_breakpoint();
 			/* It was not a directory */
 			elog(PANIC, "%s must be a directory but not.", sync_sock_dir);
+		}
 	}
 	/* Remove all the sockets */
 	rmtree(sync_sock_dir, false);
@@ -353,18 +367,24 @@ PR_syncInit(void)
 
 		sync_sock_info[ii].syncsock = socket(AF_UNIX, SOCK_DGRAM, 0);
 		if (sync_sock_info[ii].syncsock < 0)
+		{
+			PR_breakpoint();
 			ereport(FATAL,
 					(errcode_for_socket_access(),
 					 errmsg("Could not create the socket: %m")));
+		}
 
 		if (ii == my_worker_idx)
 		{
 			rc = bind(sync_sock_info[ii].syncsock, &sync_sock_info[ii].sockaddr, sizeof(struct sockaddr_un));
 			if (rc < 0)
+			{
+				PR_breakpoint();
 				ereport(FATAL,
 						(errcode_for_socket_access(),
 						 errmsg("Could not bind the socket to \"%s\": %m",
 							 sync_sock_info[ii].sockaddr.sun_path)));
+			}
 		}
     }
     snprintf(my_worker_msg, PR_SYNC_MSG_SZ, "%04d\n", my_worker_idx);
@@ -394,10 +414,13 @@ PR_sendSync(int worker_idx)
     ll = sendto(sync_sock_info[worker_idx].syncsock, my_worker_msg, my_worker_msg_sz, 0,
 			&sync_sock_info[worker_idx].sockaddr, sizeof(struct sockaddr_un));
     if (ll != my_worker_msg_sz)
+	{
+		PR_breakpoint();
         ereport(ERROR,
                 (errcode_for_socket_access(),
                  errmsg("Can not send sync message from worker %d to %d: %m",
 					 my_worker_idx, worker_idx)));
+	}
 }
 
 int
@@ -411,9 +434,12 @@ PR_recvSync(void)
 
     sz = recv(sync_sock_info[my_worker_idx].syncsock, recv_buf, SYNC_RECV_BUF_SZ, 0);
     if (sz < 0)
+	{
+		PR_breakpoint();
         ereport(ERROR,
                 (errcode_for_socket_access(),
                  errmsg("Could not receive message.  worker %d: %m", my_worker_idx)));
+	}
     return(atoi(recv_buf));
 #undef SYNC_RECV_BUF_SZ
 }
@@ -1605,6 +1631,9 @@ PR_fetchQueue(void)
 {
 	PR_queue_el *rv;
 	unsigned flags;
+#ifdef WAL_DEBUG
+	int	synched_worker;
+#endif
 
 	SpinLockAcquire(&my_worker->slock);
 	flags = my_worker->flags;
@@ -1633,7 +1662,14 @@ PR_fetchQueue(void)
 		 */
 		my_worker->wait_dispatch = true;
 		SpinLockRelease(&my_worker->slock);
+#ifdef WAL_DEBUG
+		PRDebug_log("Queue is empty.   Wanting for sync from provider.\n");
+		synched_worker =
+#endif
 		PR_recvSync();
+#ifdef WAL_DEBUG
+		PRDebug_log("Synch received from %s.\n", worker_name(synched_worker));
+#endif
 		return PR_fetchQueue();
 	}
 	/*
@@ -1641,6 +1677,9 @@ PR_fetchQueue(void)
 	 */
 	if (flags & PR_WK_TERMINATE)
 	{
+#ifdef WAL_DEBUG
+		PRDebug_log("Detected temination flag.\n");
+#endif
 		/*
 		 * TERMINATE request has been made (orignally from READER WORKER)
 		 */
@@ -1657,6 +1696,9 @@ PR_fetchQueue(void)
 			 * So, if DISPATCHER receives this, after dispatching everything from
 			 * READER worker, it asks all the other workers to terminate.
 			 */
+#ifdef WAL_DEBUG
+			PRDebug_log("Terminating other workers.\n");
+#endif
 			for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers; ii++)
 			{
 				if (ii != PR_INVALID_PAGE_WORKER_IDX)
@@ -1672,7 +1714,14 @@ PR_fetchQueue(void)
 					{
 						pr_worker[ii].wait_dispatch = false;
 						SpinLockRelease(&pr_worker[ii].slock);
+#ifdef WAL_DEBUG
+						PRDebug_log("%s is waiting for another dispatch. Disable this and turn on termination flag.\n",
+								worker_name(ii));
+#endif
 						PR_sendSync(ii);
+#ifdef WAL_DEBUG
+						PRDebug_log("Synch sent to %s.\n", worker_name(ii));
+#endif
 					}
 					else
 						SpinLockRelease(&pr_worker[ii].slock);
@@ -1693,19 +1742,43 @@ PR_fetchQueue(void)
 		Assert(my_worker_idx != PR_READER_WORKER_IDX);
 
 		flags &= ~PR_WK_SYNC_READER;
+
 		SpinLockRelease(&my_worker->slock);
 
+#ifdef WAL_DEBUG
+		PRDebug_log("Detected synch flag to READER worker.\n");
+#endif
 		if (my_worker_idx == PR_DISPATCHER_WORKER_IDX)
+		{
+#ifdef WAL_DEBUG
+			PRDebug_log("Synch all the other workers.\n");
+#endif
 			PR_syncBeforeDispatch();
+		}
+#ifdef WAL_DEBUG
+		PRDebug_log("Synching to READER worker.\n");
+#endif
 		PR_sendSync(PR_READER_WORKER_IDX);
+#ifdef WAL_DEBUG
+		PRDebug_log("Synch done.\n");
+#endif
 	}
 	if (flags & PR_WK_SYNC_DISPATCHER)
 	{
 		Assert(my_worker_idx != PR_DISPATCHER_WORKER_IDX);
 
+#ifdef WAL_DEBUG
+		PRDebug_log("Detected synch flag to DISPATCHER worker.\n");
+#endif
 		my_worker->flags &= ~PR_WK_SYNC_DISPATCHER;
 		SpinLockRelease(&my_worker->slock);
+#ifdef WAL_DEBUG
+		PRDebug_log("Synching to DISPATCHER worker.\n");
+#endif
 		PR_sendSync(PR_DISPATCHER_WORKER_IDX);
+#ifdef WAL_DEBUG
+		PRDebug_log("Synch done.\n");
+#endif
 	}
 	if (flags & PR_WK_SYNC_TXN)
 	{
@@ -1757,12 +1830,16 @@ PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx)
 	{
 		target_worker->wait_dispatch = false;
 		SpinLockRelease(&target_worker->slock);
+#ifdef WAL_DEBUG
+		PRDebug_log("%s queue is empty and it is waiting. Sending sync.\n", worker_name(worker_idx));
+#endif
 		PR_sendSync(worker_idx);
+#ifdef WAL_DEBUG
+		PRDebug_log("Sync sent.\n");
+#endif
 	}
 	else
-	{
 		SpinLockRelease(&target_worker->slock);
-	}
 	return;
 }
 
@@ -2217,9 +2294,11 @@ retry_allocBuffer(Size sz, bool need_lock)
 	if (need_lock)
 		SpinLockRelease(&pr_buffer->slock);
 	if (!isOtherWorkersRunning())
+	{
 		elog(PANIC,
 				"Shared buffer overflow.  "
 				"Please consider to increase preplay_buffers configuation parameter.");
+	}
 	PR_recvSync();
 
 	return PR_allocBuffer(sz, need_lock);
@@ -2662,7 +2741,7 @@ alloc_chunk(Size sz, void *start, void *end)
  */
 
 
-#define	PRDEBUG_BUFSZ 4096
+#define	PRDEBUG_BUFSZ (4096 * 16)
 #define	PRDEBUG_HDRSZ 512
 
 #define	true 1
@@ -2754,6 +2833,15 @@ my_timeofday(void)
 }
 #undef PR_TIEOFDAY_LEN
 
+static char *break_point_file[] =
+{
+ 	"reader_break.gdb",
+	"dispatfher_worker_break.gdb",
+	"txn_worker_break.gdb",
+	"invalid_page_worker_break.gdb",
+	"block_worker_break.gdb"
+};
+
 /*
  * Should be called by each worker, including READER WORKER
  *
@@ -2778,10 +2866,20 @@ PRDebug_start(int worker_idx)
 	char	found_debug_file = false;
 	static const int start_timeout = 60 * 10;	/* start timeout = 10min */
 	int		time_waiting = 0;
+	char	*break_point_fname;
+
+	Assert(worker_idx >= 0);
 
 	my_worker_idx = worker_idx;
 	build_PRDebug_log_hdr();
 	pr_debug_signal_file = (char *)malloc(DEBUG_LOG_FILENAME_LEN);
+
+	/* Setup breakpoint file for each worker */
+	if (worker_idx < PR_BLK_WORKER_MIN_IDX)
+		break_point_fname = break_point_file[worker_idx];
+	else
+		break_point_fname = break_point_file[PR_BLK_WORKER_MIN_IDX];
+	
 	sprintf(pr_debug_signal_file, "%s/%s/%d.signal", DataDir, DEBUG_LOG_DIRNAME, my_worker_idx);
 	unlink(pr_debug_signal_file);
 	PRDebug_log("\n-------------------------------------------\n"
@@ -2793,11 +2891,11 @@ PRDebug_start(int worker_idx)
 				"sudo gdb\n"
 				"attach %d\n"
 				"tb PRDebug_sync\n"
-				"source breaksymbol.gdb\n"
+				"source %s\n"
 				"shell touch  %s\n"
 				"c\n",
 			getpid(), worker_idx, pr_debug_signal_file,
-			getpid(), pr_debug_signal_file);
+			getpid(), break_point_fname, pr_debug_signal_file);
 	while((found_debug_file == false) && (time_waiting < start_timeout))
 	{
 		rv = stat(pr_debug_signal_file, &statbuf);
@@ -2846,7 +2944,7 @@ PRDebug_sync(void)
  * Breakpoint function to detect error with the debugger.
  */
 void
-PR_breakpoint(void)
+PR_breakpoint_func(void)
 {
 	return;
 }
@@ -2871,10 +2969,27 @@ PRDebug_log(char *fmt, ...)
 	va_start(arg_ptr, fmt);
 	vsprintf(buf, fmt, arg_ptr);
 	elog(LOG, "%s%s", pr_debug_log_hdr, buf);
-	fprintf(pr_debug_log, "%s%s", pr_debug_log_hdr, buf);
+	fprintf(pr_debug_log, "%s %s ===  %s",
+			pr_debug_log_hdr, now_timeofday(), buf);
 	fflush(pr_debug_log);
 
 	error_context_stack = error_context_stack_backup;
+}
+
+static char *
+now_timeofday(void)
+{
+	static char	timebuf[16];
+	struct timeval	tv;
+	struct tm	    now;
+
+	gettimeofday(&tv, NULL);
+	if (gmtime_r(&tv.tv_sec, &now) != &now)
+		return "";
+	sprintf(timebuf,
+			"%02d:%02d:%02d.%05ld",
+			now.tm_hour, now.tm_min, now.tm_sec, tv.tv_usec);
+	return timebuf;
 }
 
 static void
@@ -2882,7 +2997,9 @@ PRDebug_out(StringInfo s)
 {
 	if ((s->data[0] == '\0') || (s->len == 0))
 		return;
-	fwrite(s->data, s->len, sizeof(char), pr_debug_log);
+	elog(LOG, "%s%s", pr_debug_log_hdr, s->data);
+	fprintf(pr_debug_log, "%s %s === %s",
+			pr_debug_log_hdr, now_timeofday(), s->data);
 	fflush(pr_debug_log);
 }
 
@@ -2890,8 +3007,32 @@ static void
 build_PRDebug_log_hdr(void)
 {
 	pr_debug_log_hdr = (char *)malloc(PRDEBUG_HDRSZ);
-	sprintf(pr_debug_log_hdr, "PRDdebug_LOG, worker_idx(%d): ", my_worker_idx);
+	if (my_worker_idx < PR_BLK_WORKER_MIN_IDX)
+		sprintf(pr_debug_log_hdr, "%s(%d): ",
+				worker_name(my_worker_idx), my_worker_idx);
+	else
+		sprintf(pr_debug_log_hdr, "%s_%02d(%d): ",
+				worker_name(my_worker_idx), (my_worker_idx - PR_BLK_WORKER_MIN_IDX), my_worker_idx);
 }
+
+static char *worker_name_list[] =
+{
+	"READER WORKER",
+	"DISPATCHER",
+	"TXN WORKER",
+	"INVALID PAGE WORKER",
+	"BLOCK WORKER"
+};
+
+static char *
+worker_name(int idx)
+{
+	if (idx < PR_BLK_WORKER_MIN_IDX)
+		return worker_name_list[idx];
+	else
+		return worker_name_list[PR_BLK_WORKER_MIN_IDX];
+}
+
 
 /*
  * Should be called from READER worker after all the WAL replay finished.
@@ -3081,6 +3222,62 @@ PR_debug_analyzeState(XLogReaderState *state, XLogRecord *record)
  ******************************************************************************************************************
  */
 
+#ifdef WAL_DEBUG
+static void
+dump_invalidPageData(XLogInvalidPageData_PR *page)
+{
+	StringInfo	s;
+
+	s = makeStringInfo();
+	appendStringInfo(s, "XLogInvalidPageData_PR dump: cmd: %s, ", invalidPageCmdName(page->cmd));
+	appendStringInfo(s, "node.spc:%d, node.db:%d, node.rel:%d, ",
+			page->node.spcNode, page->node.dbNode, page->node.relNode);
+	appendStringInfo(s, "forkNum: %s, BlockNum: %d, present: %s.\n",
+			forkNumName(page->forkno), page->blkno, page->present ? "true" : "false");
+	PRDebug_out(s);
+	pfree(s->data);
+	pfree(s);
+}
+
+static char *
+forkNumName(ForkNumber forknum)
+{
+	switch(forknum)
+	{
+		case InvalidForkNumber:
+			return "InvalidForkNumber";
+		case MAIN_FORKNUM:
+			return "MAIN_FORKNUM";
+		case FSM_FORKNUM:
+			return "FSM_FORKNUM";
+		case VISIBILITYMAP_FORKNUM:
+			return "VISIBILITYMAP_FORKNUM";
+		case INIT_FORKNUM:
+			return "INIT_FORKNUM";
+		default:
+			return "unknown";
+	}
+}
+
+static char *
+invalidPageCmdName(PR_invalidPageCheckCmd cmd)
+{
+	switch(cmd)
+	{
+		case PR_LOG:
+			return "PR_LOG";
+		case PR_FORGET_PAGES:
+			return "PR_FORGET_PAGES";
+		case PR_FORGET_DB:
+			return "PR_FORGET_DB";
+		case PR_CHECK_INVALID_PAGES:
+			return "PR_CHECK_INVALID_PAGES";
+		default:
+			return "unknown";
+	}
+}
+#endif
+
 /*
  * When this starts, we assume that worker data have already been set up.
  *
@@ -3093,12 +3290,19 @@ invalidPageWorkerLoop(void)
 	XLogInvalidPageData_PR	*page;
 	bool invalidPageFound;
 
+#ifdef WAL_DEBUG
+	PRDebug_log("Started %s()\n", __func__);
+#endif
+
 	SpinLockAcquire(&my_worker->slock);
 	my_worker->handledRecPtr = 0;
 	SpinLockRelease(&my_worker->slock);
 	
 	for (;;)
 	{
+#ifdef WAL_DEBUG
+		PRDebug_log("Fetching queue\n");
+#endif
 		el = PR_fetchQueue();
 		if (el == NULL)
 			break;	/* Process termination request */
@@ -3106,6 +3310,10 @@ invalidPageWorkerLoop(void)
 			elog(PANIC, "Invalid internal status for invalid page worker.");
 		page = (XLogInvalidPageData_PR *)(el->data);
 		PR_freeQueueElement(el);
+#ifdef WAL_DEBUG
+		PRDebug_log("Fetched\n");
+		dump_invalidPageData(page);
+#endif
 		switch(page->cmd)
 		{
 			case PR_LOG:
@@ -3133,6 +3341,9 @@ invalidPageWorkerLoop(void)
 		}
 		PR_freeBuffer(page, true);
 	}
+#ifdef WAL_DEBUG
+	PRDebug_log("Terminating %s()\n", __func__);
+#endif
 	return;
 }
 
@@ -3150,21 +3361,36 @@ blockWorkerLoop(void)
 	XLogDispatchData_PR	*data;
 	XLogRecord	*record;
 	int		*worker_list;
+#ifdef WAL_DEBUG
+	int		 sync_worker;
+#endif
 	
+#ifdef WAL_DEBUG
+	PRDebug_log("Started %s()\n", __func__);
+#endif
 	for (;;)
 	{
 		XLogRecPtr	currRecPtr;
 
+#ifdef WAL_DEBUG
+		PRDebug_log("Fetching queue\n");
+#endif
 		el = PR_fetchQueue();
 		if (el == NULL)
 			break;	/* Process termination request */
 		if (el->data_type != XLogDispatchData)
+		{
+			PR_breakpoint();		/* GDB breakpoint */
 			elog(PANIC, "Invalid internal status for block worker.");
+		}
 		data = (XLogDispatchData_PR *)(el->data);
 		PR_freeQueueElement(el);
 
 		SpinLockAcquire(&data->slock);
 
+#ifdef WAL_DEBUG
+		PRDebug_log("Fetched: ser_no: %ld, xlogrecord: \"%s\"\n", data->reader->ser_no, data->reader->xlog_string);
+#endif
 		data->n_remaining--;
 		currRecPtr = data->reader->ReadRecPtr;
 
@@ -3173,7 +3399,14 @@ blockWorkerLoop(void)
 			/* This worker is not eligible to handle this */
 			SpinLockRelease(&data->slock);
 			/* Wait another BLOCK worker to handle this and sync to me */
+#ifdef WAL_DEBUG
+			PRDebug_log("Xlogrecord is assigned to multiple worker.  Waiting for other workers to finish.\n");
+			sync_worker =
+#endif
 			PR_recvSync();
+#ifdef WAL_DEBUG
+			PRDebug_log("Sync reeived from the worker (%d).\n", sync_worker);
+#endif
 		}
 		else
 		{
@@ -3185,10 +3418,16 @@ blockWorkerLoop(void)
 			record = data->reader->record;
 			SpinLockRelease(&data->slock);
 
+#ifdef WAL_DEBUG
+			PRDebug_log("Now I can replay the XLOGRecord.\n");
+#endif
 			/* REDO */
 
 			RmgrTable[record->xl_rmid].rm_redo(data->reader);
 
+#ifdef WAL_DEBUG
+			PRDebug_log("Replay DONE. Ser_no(%ld)\n", data->reader->ser_no);
+#endif
 			/* Koichi: TBD: ここで、XLogHistory と txn history の更新を行うこと */
 			
 			if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
@@ -3224,7 +3463,13 @@ blockWorkerLoop(void)
 			{
 				if (*worker_list != my_worker_idx)
 				{
+#ifdef WAL_DEBUG
+					PRDebug_log("Now synch other assigned %s.\n", worker_name(*worker_list));
+#endif
 					PR_sendSync(*worker_list);
+#ifdef WAL_DEBUG
+					PRDebug_log("Sync to %s done.\n", worker_name(*worker_list));
+#endif
 				}
 			}
 
@@ -3260,6 +3505,9 @@ blockWorkerLoop(void)
 		my_worker->handledRecPtr = currRecPtr;
 		SpinLockRelease(&my_worker->slock);
 	}
+#ifdef WAL_DEBUG
+	PRDebug_log("Terminating %s()\n", __func__);
+#endif
 	return;
 }
 
@@ -3290,34 +3538,58 @@ txnWorkerLoop(void)
 	TransactionId		 xid;
 	txn_cell_PR			*txn_cell;
 
+#ifdef WAL_DEBUG
+	PRDebug_log("Started %s()\n", __func__);
+#endif
 	for (;;)
 	{
 		XLogRecPtr	currRecPtr;
 		unsigned	flags;
 
+#ifdef WAL_DEBUG
+		PRDebug_log("Fetching queue\n");
+#endif
 		el = PR_fetchQueue();
 		if (el == NULL)
 			break;	/* Process termination request */
 		if (el->data_type != XLogDispatchData)
+		{
+			PR_breakpoint();		/* GDB breakpoint */
 			elog(PANIC, "Invalid internal status for transaction worker.");
+		}
 		dispatch_data = (XLogDispatchData_PR *)(el->data);
 		record = dispatch_data->reader->record;
 		xlogreader = dispatch_data->reader;
 		currRecPtr = xlogreader->ReadRecPtr;
 		txn_cell = isTxnSyncNeeded(dispatch_data, record, &xid, true);
+#ifdef WAL_DEBUG
+		PRDebug_log("Fetched: ser_no: %ld, xlogrecord: \"%s\"\n", xlogreader->ser_no, xlogreader->xlog_string);
+#endif
 		if (txn_cell)
 		{
 			/*
 			 * Here waits until all the preceding WAL records for this trancation
 			 * are handled by block workers.
 			 */
+#ifdef WAL_DEBUG
+			PRDebug_log("Need to wait until all the other workers handling this txn.\n");
+#endif
 			syncTxn(txn_cell);
+#ifdef WAL_DEBUG
+			PRDebug_log("Synch done.\n");
+#endif
 
 			/* Deallocate the trancaction cell */
 			free_txn_cell(txn_cell, true);
 		}
 		/* Now apply the WAL record itself */
+#ifdef WAL_DEBUG
+		PRDebug_log("Ser no (%ld), Replaying: \"%s\"\n", xlogreader->ser_no, xlogreader->xlog_string);
+#endif
 		RmgrTable[record->xl_rmid].rm_redo(xlogreader);
+#ifdef WAL_DEBUG
+		PRDebug_log("Replay done. Ser_no(%ld).\n", xlogreader->ser_no);
+#endif
 
 		/*
 		 * After redo, check whether the backup pages associated with
@@ -3365,6 +3637,9 @@ txnWorkerLoop(void)
 		
 		freeDispatchData(dispatch_data);
 	}
+#ifdef WAL_DEBUG
+	PRDebug_log("Terminating %s()\n", __func__);
+#endif
 	return;
 }
 
@@ -3452,6 +3727,9 @@ static void
 syncTxn(txn_cell_PR *txn_cell)
 {
 	txn_hash_el_PR	*txn_hash;
+#ifdef WAL_DEBUG
+	int	synched_worker;
+#endif
 
 	txn_hash = get_txn_hash(txn_cell->xid);
 
@@ -3465,7 +3743,14 @@ syncTxn(txn_cell_PR *txn_cell)
 		 */
 		txn_cell->txn_worker_waiting = true;
 		SpinLockRelease(&txn_hash->slock);
+#ifdef WAL_DEBUG
+		PRDebug_log("Need to wait until all the xlogrecords of this transaction has been replayed.\n");
+		synched_worker =
+#endif
 		PR_recvSync();
+#ifdef WAL_DEBUG
+		PRDebug_log("Synch done from %s\n", worker_name(synched_worker));
+#endif
 	}
 	else
 		/* All the preceding WALs have already been replayed */
@@ -3487,20 +3772,35 @@ dispatcherWorkerLoop(void)
 	XLogRecord *record;
 	XLogDispatchData_PR	*dispatch_data;
 	int	*worker_list;
+#ifdef WAL_DEBUG
+	int	synched_worker;
+#endif
 
+#ifdef WAL_DEBUG
+	PRDebug_log("Started %s()\n", __func__);
+#endif
 	for (;;)
 	{
 		XLogRecPtr	currRecPtr;
 		bool		sync_needed;
 
 		/* Dequeue */
+#ifdef WAL_DEBUG
+		PRDebug_log("Fetching queue\n");
+#endif
 		el = PR_fetchQueue();
 		if (el == NULL)
 			break;	/* Process termination request */
 		if (el->data_type != ReaderState)
+		{
+			PR_breakpoint();
 			elog(PANIC, "Invalid internal status for dispatcher worker.");
+		}
 		reader = (XLogReaderState *)el->data;
 		currRecPtr = reader->ReadRecPtr;
+#ifdef WAL_DEBUG
+		PRDebug_log("Fetched.  Ser_no(%ld), xlog: \"%s\"\n", reader->ser_no, reader->xlog_string);
+#endif
 		PR_freeQueueElement(el);
 		record = reader->record;
 		dispatch_data = PR_analyzeXLogReaderState(reader, record);
@@ -3519,14 +3819,35 @@ dispatcherWorkerLoop(void)
 			sync_needed = false;
 		}
 		for (worker_list = dispatch_data->worker_list; *worker_list > PR_DISPATCHER_WORKER_IDX; worker_list++)
+		{
+#ifdef WAL_DEBUG
+			PRDebug_log("Enqueue, ser_no(%ld) to %s, XLOGrecord: \"%s\"\n",
+					reader->ser_no, worker_name(*worker_list), reader->xlog_string);
+#endif
 			PR_enqueue(dispatch_data, XLogDispatchData, *worker_list);
+#ifdef WAL_DEBUG
+			PRDebug_log("Enqueue done, ser_no(%ld) to %s\n", reader->ser_no, worker_name(*worker_list));
+#endif
+		}
 		if (sync_needed)
+		{
+#ifdef WAL_DEBUG
+			PRDebug_log("Syc needed for this xlog record.\n");
+			synched_worker =
+#endif
 			PR_recvSync();	/* Only one WORKER actually handled this data sends sync. */
+#ifdef WAL_DEBUG
+			PRDebug_log("Sync from %s received.\n", worker_name(synched_worker));
+#endif
+		}
 
 		SpinLockAcquire(&my_worker->slock);
 		my_worker->handledRecPtr = currRecPtr;
 		SpinLockRelease(&my_worker->slock);
 	}
+#ifdef WAL_DEBUG
+	PRDebug_log("Terminating %s()\n", __func__);
+#endif
 	return;
 }
 

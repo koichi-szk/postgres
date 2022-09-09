@@ -450,7 +450,13 @@ extern void PRDebug_finish(void);
 extern void PR_debug_buffer(void);
 extern void PR_debug_buffer2(void);
 extern void PR_debug_analyzeState(XLogReaderState *state, XLogRecord *record);
-extern void PR_breakpoint(void);
+extern void PR_breakpoint_func(void);
+
+#ifdef WAL_DEBUG
+#define PR_breakpoint()	PR_breakpoint_func()
+#else
+#define PR_breakpoint() do{}while(0)
+#endif
 
 /*
  ****************************************************************************

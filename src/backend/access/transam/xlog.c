@@ -7587,7 +7587,7 @@ StartupXLOG(void)
 					XLogRecord *record_shm;
 					uint32		tot_len;
 #ifdef WAL_DEBUG
-					static long	ser_no = 0;
+					static long	ser_no = -1;
 #endif
 
 					tot_len = record->xl_tot_len;
@@ -7596,7 +7596,7 @@ StartupXLOG(void)
 					xlogreader_PR = (XLogReaderState *)PR_allocBuffer(sizeof(XLogReaderState), true);
 					memcpy(xlogreader_PR, xlogreader, sizeof(XLogReaderState));
 #ifdef WAL_DEBUG
-					xlogreader_PR->ser_no = ser_no++;
+					xlogreader_PR->ser_no = ++ser_no;
 #endif
 					xlogreader_PR->record = record_shm;
 					/* Need to take care of decoded record here */
@@ -7612,8 +7612,21 @@ StartupXLOG(void)
 #ifdef WAL_DEBUG
 					xlogreader_PR->xlog_string = xlog_string;
 					PR_debug_analyzeState(xlogreader_PR, record_shm);
+
+					PRDebug_log("========================================================================================================\n");
+					PRDebug_log("Enqueue, ser_no(%ld) to worker(%d), XLOGrecord: \"%s\"\n",
+							ser_no, PR_DISPATCHER_WORKER_IDX, xlogreader_PR->xlog_string);
+#define	PR_ITER_NUM 10
+#if 0
+					if (ser_no && (ser_no % PR_ITER_NUM == 0))
+#endif
+						PR_breakpoint();
+#undef PR_ITER_NUM
 #endif
 					PR_enqueue(xlogreader_PR, ReaderState, PR_DISPATCHER_WORKER_IDX);
+#ifdef WAL_DEBUG
+					PRDebug_log("Enqueue done\n");
+#endif
 				}
 				else
 				{
