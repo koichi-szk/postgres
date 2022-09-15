@@ -269,7 +269,6 @@ static char *now_timeofday(void);
 static void dump_invalidPageData(XLogInvalidPageData_PR *page);
 static char *forkNumName(ForkNumber forknum);
 static char *invalidPageCmdName(PR_invalidPageCheckCmd cmd);
-static char *worker_name(int idx);
 #endif
 
 /*
@@ -883,10 +882,17 @@ freeDispatchData(XLogDispatchData_PR *dispatch_data)
 #endif
 	if (dispatch_data->reader)
 	{
+		int ii;
+
 		if (dispatch_data->reader->main_data)
 			PR_freeBuffer(dispatch_data->reader->main_data, false);
 		if (dispatch_data->reader->record)
 			PR_freeBuffer(dispatch_data->reader->record, false);
+		for (ii = 0; dispatch_data->reader->max_block_id; ii++)
+		{
+			if (dispatch_data->reader->blocks[ii].has_data)
+				PR_freeBuffer(dispatch_data->reader->blocks[ii].data, false);
+		}
 		PR_freeBuffer(dispatch_data->reader, false);
 	}
 	PR_freeBuffer(dispatch_data, false);
@@ -1215,7 +1221,10 @@ PR_addXLogHistory(XLogRecPtr currPtr, XLogRecPtr endPtr, TimeLineID myTimeline)
 	el->replayed = false;
 
 	SpinLockRelease(&pr_history->slock);
-
+#ifdef WAL_DEBUG
+	PRDebug_log("%s: returning %p, currPtr %016lx, endPtr: %016lx, Timeline: %d\n",
+			__func__, el, currPtr, endPtr, myTimeline);
+#endif
 	return el;
 }
 
@@ -1668,7 +1677,7 @@ PR_fetchQueue(void)
 #endif
 		PR_recvSync();
 #ifdef WAL_DEBUG
-		PRDebug_log("Synch received from %s.\n", worker_name(synched_worker));
+		PRDebug_log("Synch received from %s.\n", PR_worker_name(synched_worker));
 #endif
 		return PR_fetchQueue();
 	}
@@ -1716,11 +1725,11 @@ PR_fetchQueue(void)
 						SpinLockRelease(&pr_worker[ii].slock);
 #ifdef WAL_DEBUG
 						PRDebug_log("%s is waiting for another dispatch. Disable this and turn on termination flag.\n",
-								worker_name(ii));
+								PR_worker_name(ii));
 #endif
 						PR_sendSync(ii);
 #ifdef WAL_DEBUG
-						PRDebug_log("Synch sent to %s.\n", worker_name(ii));
+						PRDebug_log("Synch sent to %s.\n", PR_worker_name(ii));
 #endif
 					}
 					else
@@ -1831,7 +1840,7 @@ PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx)
 		target_worker->wait_dispatch = false;
 		SpinLockRelease(&target_worker->slock);
 #ifdef WAL_DEBUG
-		PRDebug_log("%s queue is empty and it is waiting. Sending sync.\n", worker_name(worker_idx));
+		PRDebug_log("%s queue is empty and it is waiting. Sending sync.\n", PR_worker_name(worker_idx));
 #endif
 		PR_sendSync(worker_idx);
 #ifdef WAL_DEBUG
@@ -1939,6 +1948,35 @@ PR_analyzeXLogReaderState(XLogReaderState *reader, XLogRecord *record)
 		dispatch_data->worker_array[PR_TXN_WORKER_IDX] = true;
 	}
 	return dispatch_data;
+}
+
+/*
+ * Setup blocks member for shared XLogReaderState
+ */
+void
+PR_setBlocks(XLogReaderState *shared, XLogReaderState *orig)
+{
+	int ii;
+	DecodedBkpBlock	*shared_block;
+	DecodedBkpBlock *orig_block;
+
+	for (ii = 0; ii < orig->max_block_id; ii++)
+	{
+		shared_block = &shared->blocks[ii];
+		orig_block = &orig->blocks[ii];
+		if (orig_block->has_image)
+		{
+			/* set bkp_image ptr */
+			shared_block->bkp_image
+				= (char *)addr_forward(shared->record, addr_difference(orig_block->bkp_image, orig->record));
+		}
+		if (orig_block->has_data)
+		{
+			/* aloocate data */
+			shared_block->data = (char *)PR_allocBuffer(orig_block->data_len, true);
+			memcpy(shared_block->data, orig_block->data, orig_block->data_len);
+		}
+	}
 }
 
 static int
@@ -3009,10 +3047,10 @@ build_PRDebug_log_hdr(void)
 	pr_debug_log_hdr = (char *)malloc(PRDEBUG_HDRSZ);
 	if (my_worker_idx < PR_BLK_WORKER_MIN_IDX)
 		sprintf(pr_debug_log_hdr, "%s(%d): ",
-				worker_name(my_worker_idx), my_worker_idx);
+				PR_worker_name(my_worker_idx), my_worker_idx);
 	else
 		sprintf(pr_debug_log_hdr, "%s_%02d(%d): ",
-				worker_name(my_worker_idx), (my_worker_idx - PR_BLK_WORKER_MIN_IDX), my_worker_idx);
+				PR_worker_name(my_worker_idx), (my_worker_idx - PR_BLK_WORKER_MIN_IDX), my_worker_idx);
 }
 
 static char *worker_name_list[] =
@@ -3024,8 +3062,8 @@ static char *worker_name_list[] =
 	"BLOCK WORKER"
 };
 
-static char *
-worker_name(int idx)
+char *
+PR_worker_name(int idx)
 {
 	if (idx < PR_BLK_WORKER_MIN_IDX)
 		return worker_name_list[idx];
@@ -3464,11 +3502,11 @@ blockWorkerLoop(void)
 				if (*worker_list != my_worker_idx)
 				{
 #ifdef WAL_DEBUG
-					PRDebug_log("Now synch other assigned %s.\n", worker_name(*worker_list));
+					PRDebug_log("Now synch other assigned %s.\n", PR_worker_name(*worker_list));
 #endif
 					PR_sendSync(*worker_list);
 #ifdef WAL_DEBUG
-					PRDebug_log("Sync to %s done.\n", worker_name(*worker_list));
+					PRDebug_log("Sync to %s done.\n", PR_worker_name(*worker_list));
 #endif
 				}
 			}
@@ -3749,7 +3787,7 @@ syncTxn(txn_cell_PR *txn_cell)
 #endif
 		PR_recvSync();
 #ifdef WAL_DEBUG
-		PRDebug_log("Synch done from %s\n", worker_name(synched_worker));
+		PRDebug_log("Synch done from %s\n", PR_worker_name(synched_worker));
 #endif
 	}
 	else
@@ -3822,11 +3860,11 @@ dispatcherWorkerLoop(void)
 		{
 #ifdef WAL_DEBUG
 			PRDebug_log("Enqueue, ser_no(%ld) to %s, XLOGrecord: \"%s\"\n",
-					reader->ser_no, worker_name(*worker_list), reader->xlog_string);
+					reader->ser_no, PR_worker_name(*worker_list), reader->xlog_string);
 #endif
 			PR_enqueue(dispatch_data, XLogDispatchData, *worker_list);
 #ifdef WAL_DEBUG
-			PRDebug_log("Enqueue done, ser_no(%ld) to %s\n", reader->ser_no, worker_name(*worker_list));
+			PRDebug_log("Enqueue done, ser_no(%ld) to %s\n", reader->ser_no, PR_worker_name(*worker_list));
 #endif
 		}
 		if (sync_needed)
@@ -3837,7 +3875,7 @@ dispatcherWorkerLoop(void)
 #endif
 			PR_recvSync();	/* Only one WORKER actually handled this data sends sync. */
 #ifdef WAL_DEBUG
-			PRDebug_log("Sync from %s received.\n", worker_name(synched_worker));
+			PRDebug_log("Sync from %s received.\n", PR_worker_name(synched_worker));
 #endif
 		}
 

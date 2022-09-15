@@ -64,7 +64,9 @@ typedef struct PR_queue_el	PR_queue_el;
 typedef struct PR_buffer	PR_buffer;
 typedef struct PR_queue_el	PR_queue_el;
 typedef struct PR_RecChunk	PR_RecChunk;
+#if 0
 typedef struct XLogReaderState_PR	XLogReaderState_PR;
+#endif
 typedef struct XLogInvalidPageData_PR XLogInvalidPageData_PR;
 typedef struct PR_BufChunk PR_BufChunk;
 
@@ -441,6 +443,7 @@ struct PR_BufChunk
  ****************************************************************************
  */
 
+#ifdef WAL_DEBUG
 extern void PRDebug_init(bool force_init);
 extern void PRDebug_start(int worker_idx);
 extern void PRDebug_attach(void);
@@ -451,6 +454,8 @@ extern void PR_debug_buffer(void);
 extern void PR_debug_buffer2(void);
 extern void PR_debug_analyzeState(XLogReaderState *state, XLogRecord *record);
 extern void PR_breakpoint_func(void);
+extern char *PR_worker_name(int idx);
+#endif
 
 #ifdef WAL_DEBUG
 #define PR_breakpoint()	PR_breakpoint_func()
@@ -519,11 +524,14 @@ extern void	PR_freeQueueElement(PR_queue_el *el);
 extern PR_queue_el	*PR_fetchQueue(void);
 
 /* Dispatch functions */
+#if 0
 extern void  PR_dispatch(XLogDispatchData_PR *data, int worker_idx);
 extern void  PR_dispatch_state(XLogReaderState_PR *state, int worker_idx);
+#endif
 extern void	 PR_enqueueXLogReaderState(XLogReaderState *state, XLogRecord *record, int worker_idx);
 extern XLogDispatchData_PR	*PR_allocXLogDispatchData(void);
 extern XLogDispatchData_PR	*PR_analyzeXLogReaderState(XLogReaderState *state, XLogRecord *record);
+extern void	PR_setBlocks(XLogReaderState *shared, XLogReaderState *orig);
 
 /* Miscellaneous */
 extern int	PR_myWorkerIdx(void);

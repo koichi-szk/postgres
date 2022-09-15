@@ -7446,7 +7446,7 @@ StartupXLOG(void)
 				{
 					xlog_string = PR_allocBuffer(buf.len, true);
 					memcpy(xlog_string, buf.data, buf.len);
-					PRDebug_log("=== WAL record parsed ===\n%s\n--- WAL record end ---\n", xlog_string);
+					PRDebug_log("=== WAL record parsed === %s\n", xlog_string);
 				}
 				if (XLOG_DEBUG ||
 					(rmid == RM_XACT_ID && trace_recovery_messages <= DEBUG2) ||
@@ -7595,6 +7595,7 @@ StartupXLOG(void)
 					memcpy(record_shm, record, tot_len);
 					xlogreader_PR = (XLogReaderState *)PR_allocBuffer(sizeof(XLogReaderState), true);
 					memcpy(xlogreader_PR, xlogreader, sizeof(XLogReaderState));
+					PR_setBlocks(xlogreader_PR, xlogreader);
 #ifdef WAL_DEBUG
 					xlogreader_PR->ser_no = ++ser_no;
 #endif
@@ -7614,18 +7615,16 @@ StartupXLOG(void)
 					PR_debug_analyzeState(xlogreader_PR, record_shm);
 
 					PRDebug_log("========================================================================================================\n");
-					PRDebug_log("Enqueue, ser_no(%ld) to worker(%d), XLOGrecord: \"%s\"\n",
-							ser_no, PR_DISPATCHER_WORKER_IDX, xlogreader_PR->xlog_string);
+					PRDebug_log("Enqueue, ser_no(%ld) to %s, XLOGrecord: \"%s\"\n",
+							ser_no, PR_worker_name(PR_DISPATCHER_WORKER_IDX), xlogreader_PR->xlog_string);
 #define	PR_ITER_NUM 10
-#if 0
 					if (ser_no && (ser_no % PR_ITER_NUM == 0))
-#endif
 						PR_breakpoint();
 #undef PR_ITER_NUM
 #endif
 					PR_enqueue(xlogreader_PR, ReaderState, PR_DISPATCHER_WORKER_IDX);
 #ifdef WAL_DEBUG
-					PRDebug_log("Enqueue done\n");
+					PRDebug_log("Enqueue done, ser_no(%ld)\n", ser_no);
 #endif
 				}
 				else
