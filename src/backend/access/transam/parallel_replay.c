@@ -888,7 +888,7 @@ freeDispatchData(XLogDispatchData_PR *dispatch_data)
 			PR_freeBuffer(dispatch_data->reader->main_data, false);
 		if (dispatch_data->reader->record)
 			PR_freeBuffer(dispatch_data->reader->record, false);
-		for (ii = 0; dispatch_data->reader->max_block_id; ii++)
+		for (ii = 0; ii < dispatch_data->reader->max_block_id; ii++)
 		{
 			if (dispatch_data->reader->blocks[ii].has_data)
 				PR_freeBuffer(dispatch_data->reader->blocks[ii].data, false);
@@ -1968,14 +1968,18 @@ PR_setBlocks(XLogReaderState *shared, XLogReaderState *orig)
 		{
 			/* set bkp_image ptr */
 			shared_block->bkp_image
-				= (char *)addr_forward(shared->record, addr_difference(orig_block->bkp_image, orig->record));
+				= (char *)addr_forward(shared->record, addr_difference(orig->record, orig_block->bkp_image));
 		}
+		else
+			shared_block->bkp_image = NULL;
 		if (orig_block->has_data)
 		{
 			/* aloocate data */
 			shared_block->data = (char *)PR_allocBuffer(orig_block->data_len, true);
 			memcpy(shared_block->data, orig_block->data, orig_block->data_len);
 		}
+		else
+			shared_block->data = NULL;
 	}
 }
 
