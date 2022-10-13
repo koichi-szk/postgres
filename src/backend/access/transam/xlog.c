@@ -7371,6 +7371,13 @@ StartupXLOG(void)
 #endif
 #endif
 			PR_WorkerStartup();
+
+			/*
+			 * Koichi: Cleanup xlogreader for subsequent read and decode.
+			 */
+			XLogReaderStateCleanupDecodedData(xlogreader);
+			xlogreader->for_parallel_replay = true;
+
 		}
 
 		/*
@@ -7584,35 +7591,19 @@ StartupXLOG(void)
 					 * chain record, and dispatch to DISPATCHER WORKER
 					 */
 					XLogReaderState *xlogreader_PR;
-					XLogRecord *record_shm;
-					uint32		tot_len;
 #ifdef WAL_DEBUG
 					static long	ser_no = -1;
 #endif
 
-					tot_len = record->xl_tot_len;
-					record_shm = (XLogRecord *)PR_allocBuffer(tot_len, true);
-					memcpy(record_shm, record, tot_len);
 					xlogreader_PR = (XLogReaderState *)PR_allocBuffer(sizeof(XLogReaderState), true);
 					memcpy(xlogreader_PR, xlogreader, sizeof(XLogReaderState));
 					PR_setBlocks(xlogreader_PR, xlogreader);
 #ifdef WAL_DEBUG
 					xlogreader_PR->ser_no = ++ser_no;
 #endif
-					xlogreader_PR->record = record_shm;
-					/* Need to take care of decoded record here */
-					/* From xlogreader.c, decoded_record is set to NULL or record */
-					if (xlogreader->decoded_record == record)
-						xlogreader_PR->decoded_record = record_shm;
-					/* Then the main data */
-					if (xlogreader->main_data)
-					{
-						xlogreader_PR->main_data = (char *)PR_allocBuffer(xlogreader->main_data_len, true);
-						memcpy(xlogreader_PR->main_data, xlogreader->main_data, xlogreader->main_data_len);
-					}
 #ifdef WAL_DEBUG
 					xlogreader_PR->xlog_string = xlog_string;
-					PR_debug_analyzeState(xlogreader_PR, record_shm);
+					PR_debug_analyzeState(xlogreader_PR, xlogreader->decoded_record);
 
 					PRDebug_log("========================================================================================================\n");
 					PRDebug_log("Enqueue, ser_no(%ld) to %s, XLOGrecord: \"%s\"\n",

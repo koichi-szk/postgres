@@ -185,6 +185,8 @@ struct XLogReaderState
 	 */
 	TimeLineID	timeline;
 
+	bool		for_parallel_replay;		
+
 
 	/* ----------------------------------------
 	 * Decoded representation of current record
@@ -350,5 +352,7 @@ extern char *XLogRecGetBlockData(XLogReaderState *record, uint8 block_id, Size *
 extern bool XLogRecGetBlockTag(XLogReaderState *record, uint8 block_id,
 							   RelFileNode *rnode, ForkNumber *forknum,
 							   BlockNumber *blknum);
+void XLogReaderStateCleanupDecodedData(XLogReaderState *state);
+
 
 #endif							/* XLOGREADER_H */

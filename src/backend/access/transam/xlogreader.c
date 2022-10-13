@@ -19,11 +19,6 @@
 
 #include <unistd.h>
 
-#if 0
-#ifndef FRONTEND
-#include "access/parallel_replay.h"
-#endif
-#endif
 #include "access/transam.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -33,6 +28,7 @@
 #include "replication/origin.h"
 
 #ifndef FRONTEND
+#include "access/parallel_replay.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "utils/memutils.h"
@@ -108,6 +104,9 @@ XLogReaderAllocate(int wal_segment_size, const char *waldir,
 		return NULL;
 	}
 
+	/* Initialize parallel replay flag */
+	state->for_parallel_replay = false;
+
 	/* Initialize segment info. */
 	WALOpenSegmentInit(&state->seg, &state->segcxt, wal_segment_size,
 					   waldir);
@@ -148,14 +147,16 @@ XLogReaderFree(XLogReaderState *state)
 	if (state->seg.ws_file != -1)
 		state->routine.segment_close(state);
 
-	for (block_id = 0; block_id <= XLR_MAX_BLOCK_ID; block_id++)
+	if (!(state->for_parallel_replay))
 	{
-		if (state->blocks[block_id].data)
-			pfree(state->blocks[block_id].data);
+		for (block_id = 0; block_id <= XLR_MAX_BLOCK_ID; block_id++)
+		{
+			if (state->blocks[block_id].data)
+				pfree(state->blocks[block_id].data);
+		}
+		if (state->main_data)
+			pfree(state->main_data);
 	}
-	if (state->main_data)
-		pfree(state->main_data);
-
 	pfree(state->errormsg_buf);
 	if (state->readRecordBuf)
 		pfree(state->readRecordBuf);
@@ -593,28 +594,26 @@ restart:
 	}
 #endif
 #endif
-	if (DecodeXLogRecord(state, record, errormsg))
+#ifndef FRONTEND
+	if (state->for_parallel_replay)
+	{
+		XLogRecord *record_shm;
+
+		record_shm = (XLogRecord *)PR_allocBuffer(record->xl_tot_len, true);
+		memcpy(record_shm, record, record->xl_tot_len);
+		if (DecodeXLogRecord(state, record_shm, errormsg))
+			return record_shm;
+		else
+		{
+			PR_freeBuffer(record_shm, true);
+			return NULL;
+		}
+	}
+#endif
+	if (!(state->for_parallel_replay) && DecodeXLogRecord(state, record, errormsg))
 		return record;
 	else
-	{
-#if 0
-#ifndef FRONTEND
-		if (PR_isInParallelRecovery())
-		{
-			/*
-			 * Koichi:
-			 *	We leave another status in the reader state as is.
-			 *	Such info will not be used before set again by
-			 *	subsequent call.
-			 */
-			PR_freeBuffer(record, true);
-			state->record = NULL;
-			state->decoded_record = NULL;
-		}
-#endif
-#endif
 		return NULL;
-	}
 
 err:
 	if (assembled)
@@ -1251,6 +1250,21 @@ ResetDecoder(XLogReaderState *state)
  *
  * On error, a human-readable error message is returned in *errormsg, and
  * the return value is false.
+ *
+ * Koichi:
+ * ここで、decode した結果を palloc() で確保するか、PR_allocBuffer() で
+ * 確保するかのフラグを XLogReaderState に入れる (for_parallel_replay)。
+ * このフラグが false なら、従前通り、decode 結果は palloc() で確保した
+ * 領域に保存し、確保した領域は再利用する。
+ * このフラグが true なら、main_data や block_data など、従前 palloc() 
+ * で確保していた部分は PR_allocBuffer() で確保し、再利用しない。
+ * この場合は、関係する領域へのポインタはすべて NULL クリアする。
+ * データ実体は、この後 redo 実行した worker が解放するので、ここでは
+ * ローカルメモリに書かれているポインタをクリアするのみとする。
+ *
+ * これらはすべて READER worker で実行する。その後、XLogReaderState は
+ * 共有メモリ領域にコピーし、Dispatcher worker 以下の Worker に渡される。
+ * 最後に redo した worker が、これらの Decode で使った領域を解放する。
  */
 bool
 DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
@@ -1504,7 +1518,12 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 		}
 		if (blk->has_data)
 		{
-			if (!blk->data || blk->data_len > blk->data_bufsz)
+			if (state->for_parallel_replay)
+			{
+				blk->data_bufsz = MAXALIGN(Max(blk->data_len, BLCKSZ));
+				blk->data = PR_allocBuffer(blk->data_len, true);
+			}
+			else if (!blk->data || blk->data_len > blk->data_bufsz)
 			{
 				if (blk->data)
 					pfree(blk->data);
@@ -1525,7 +1544,12 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 	/* and finally, the main data */
 	if (state->main_data_len > 0)
 	{
-		if (!state->main_data || state->main_data_len > state->main_data_bufsz)
+		if (state->for_parallel_replay)
+		{
+			state->main_data_bufsz = MAXALIGN(Max(state->main_data_len, BLCKSZ/2));
+			state->main_data = PR_allocBuffer(state->main_data_bufsz, true);
+		}
+		else if (!state->main_data || state->main_data_len > state->main_data_bufsz)
 		{
 			if (state->main_data)
 				pfree(state->main_data);
@@ -1561,6 +1585,34 @@ err:
 	*errormsg = state->errormsg_buf;
 
 	return false;
+}
+
+void
+XLogReaderStateCleanupDecodedData(XLogReaderState *state)
+{
+	uint8		block_id;
+
+	if (state->for_parallel_replay)
+		return;
+	/* block data first */
+	for (block_id = 0; block_id <= state->max_block_id; block_id++)
+	{
+
+		DecodedBkpBlock *blk = &state->blocks[block_id];
+
+		if (blk->data)
+		{
+			pfree(blk->data);
+			blk->data = NULL;
+			blk->data_len = blk->data_bufsz = 0;
+		}
+	}
+	if (state->main_data) 
+	{
+		pfree(state->main_data);
+		state->main_data = NULL;
+		state->main_data_bufsz = state->main_data_len = 0;
+	}
 }
 
 /*
