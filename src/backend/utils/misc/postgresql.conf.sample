@@ -286,6 +286,24 @@
 #recovery_target_action = 'pause'	# 'pause', 'promote', 'shutdown'
 				# (change requires restart)
 
+# - Parallel Recovery
+
+#parallel_replay = off			# Enables parallel worker to replay WAL records
+#parallel_replay_test = off		# Enable additional feature to test parallel replay with gdb
+#num_preplay_workers = 5		# Number of parallel replay worker process, including startup process
+#num_preplay_queues = 128		# Number of queues to assign replay to replay workers
+#num_preplay_max_txn = 0		# Max active transaction in parallel replay.
+								# Taken from max_connections if the value is less than max_connections.
+								# In the case of standby, this must be at least max_connections of the master.
+#preplay_buffers = 4MB			# Shared memory size used in parallel replay.
+								# Must be larger than (BLKSZ * XLR_MAX_BLOCK_ID * (num_preplay_workers + 1))
+								# At present BLKSZ = 8KB and XLR_MAX_BLOCK_ID = 32.
+								# Given num_preplay_workers = 5, then minimum value is
+								# 1560KB.   Although it is very rare that XLogRecord includes this
+								# maximum blocks, you should consider to assign larger value.
+
+
+
 
 #------------------------------------------------------------------------------
 # REPLICATION

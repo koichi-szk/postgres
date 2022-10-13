@@ -26,6 +26,7 @@
 #include "access/commit_ts.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
+#include "access/parallel_replay.h"
 #include "access/rewriteheap.h"
 #include "access/subtrans.h"
 #include "access/timeline.h"
@@ -393,7 +394,7 @@ static XLogRecPtr RedoRecPtr;
 static bool doPageWrites;
 
 /* Has the recovery code requested a walreceiver wakeup? */
-static bool doRequestWalReceiverReply;
+bool doRequestWalReceiverReply;		/* parallel_replay.c need to see this */
 
 /*
  * RedoStartLSN points to the checkpoint's REDO location which is specified
@@ -985,12 +986,22 @@ static char *GetXLogBuffer(XLogRecPtr ptr);
 static XLogRecPtr XLogBytePosToRecPtr(uint64 bytepos);
 static XLogRecPtr XLogBytePosToEndRecPtr(uint64 bytepos);
 static uint64 XLogRecPtrToBytePos(XLogRecPtr ptr);
-static void checkXLogConsistency(XLogReaderState *record);
 
 static void WALInsertLockAcquire(void);
 static void WALInsertLockAcquireExclusive(void);
 static void WALInsertLockRelease(void);
 static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
+
+/* Dummy breakpoint for GDB */
+#ifdef WAL_DEBUG
+void PR_gdb_sync(void);
+void PR_gdb_sync(void)
+{
+	return;
+}
+#endif
+
+
 
 /*
  * Insert an XLOG record represented by an already-constructed chain of data
@@ -1423,7 +1434,7 @@ ReserveXLogSwitch(XLogRecPtr *StartPos, XLogRecPtr *EndPos, XLogRecPtr *PrevPtr)
  * function should be called once WAL replay has been completed for a
  * given record.
  */
-static void
+void
 checkXLogConsistency(XLogReaderState *record)
 {
 	RmgrId		rmid = XLogRecGetRmid(record);
@@ -7348,6 +7359,32 @@ StartupXLOG(void)
 		CheckRecoveryConsistency();
 
 		/*
+		 * Koichi: Start parallel worker here.
+		 */
+		if (parallel_replay)
+		{
+			ereport(LOG,
+					(errmsg("redo in parallel.   Number of worker: %d",
+							num_preplay_workers)));
+			PR_syncInitSockDir();
+			PR_initShm();
+#ifdef WAL_DEBUG
+#if 0
+			PR_debug_buffer();
+			PR_debug_buffer2();
+#endif
+#endif
+			PR_WorkerStartup();
+
+			/*
+			 * Koichi: Cleanup xlogreader for subsequent read and decode.
+			 */
+			XLogReaderStateCleanupDecodedData(xlogreader);
+			xlogreader->for_parallel_replay = true;
+
+		}
+
+		/*
 		 * Find the first record that logically follows the checkpoint --- it
 		 * might physically precede it, though.
 		 */
@@ -7369,6 +7406,7 @@ StartupXLOG(void)
 			TimestampTz xtime;
 			PGRUsage	ru0;
 
+
 			pg_rusage_init(&ru0);
 
 			InRedo = true;
@@ -7376,31 +7414,56 @@ StartupXLOG(void)
 			ereport(LOG,
 					(errmsg("redo starts at %X/%X",
 							LSN_FORMAT_ARGS(ReadRecPtr))));
+			
 
 			/*
 			 * main redo apply loop
 			 */
 			do
 			{
-				bool		switchedTLI = false;
-
+				bool		 switchedTLI = false;
 #ifdef WAL_DEBUG
+				char		*xlog_string;
+				StringInfoData buf;
+#endif
+
+				/*
+				 * Koichi:
+				 *
+				 * XLogReadRecords reuses read buffer from WAL segments.
+				 * We cannot use this for parallel recovery because the read
+				 * buffer (and hence reccord content) can be overwritten
+				 * at any moment before it is really replayed in a worker.
+				 *
+				 * It may be easiest way to just allocate record in the
+				 * shared memory and simply copy.
+				 *
+				 * There may be better way to minimize simple copy all
+				 * the records.
+				 */
+#ifdef WAL_DEBUG
+				PR_gdb_sync();		/* Sync point with GDB */
+
+				xlog_string = NULL;
+
+				initStringInfo(&buf);
+				appendStringInfo(&buf, "REDO @ %X/%X; LSN %X/%X: ",
+								 LSN_FORMAT_ARGS(ReadRecPtr),
+								 LSN_FORMAT_ARGS(EndRecPtr));
+				xlog_outrec(&buf, xlogreader);
+				appendStringInfoString(&buf, " - ");
+				xlog_outdesc(&buf, xlogreader);
+				if (PR_isInParallelRecovery() && PR_needTestSync())
+				{
+					xlog_string = PR_allocBuffer(buf.len, true);
+					memcpy(xlog_string, buf.data, buf.len);
+					PRDebug_log("=== WAL record parsed === %s\n", xlog_string);
+				}
 				if (XLOG_DEBUG ||
 					(rmid == RM_XACT_ID && trace_recovery_messages <= DEBUG2) ||
 					(rmid != RM_XACT_ID && trace_recovery_messages <= DEBUG3))
-				{
-					StringInfoData buf;
-
-					initStringInfo(&buf);
-					appendStringInfo(&buf, "REDO @ %X/%X; LSN %X/%X: ",
-									 LSN_FORMAT_ARGS(ReadRecPtr),
-									 LSN_FORMAT_ARGS(EndRecPtr));
-					xlog_outrec(&buf, xlogreader);
-					appendStringInfoString(&buf, " - ");
-					xlog_outdesc(&buf, xlogreader);
 					elog(LOG, "%s", buf.data);
-					pfree(buf.data);
-				}
+				pfree(buf.data);
 #endif
 
 				/* Handle interrupt signals of startup process */
@@ -7504,6 +7567,7 @@ StartupXLOG(void)
 					}
 				}
 
+
 				/*
 				 * Update shared replayEndRecPtr before replaying this record,
 				 * so that XLogFlush will update minRecoveryPoint correctly.
@@ -7513,58 +7577,103 @@ StartupXLOG(void)
 				XLogCtl->replayEndTLI = ThisTimeLineID;
 				SpinLockRelease(&XLogCtl->info_lck);
 
-				/*
-				 * If we are attempting to enter Hot Standby mode, process
-				 * XIDs we see
-				 */
-				if (standbyState >= STANDBY_INITIALIZED &&
-					TransactionIdIsValid(record->xl_xid))
-					RecordKnownAssignedTransactionIds(record->xl_xid);
+					/*
+					 * If we are attempting to enter Hot Standby mode, process
+					 * XIDs we see
+					 */
+					if (standbyState >= STANDBY_INITIALIZED &&
+						TransactionIdIsValid(record->xl_xid))
+						RecordKnownAssignedTransactionIds(record->xl_xid);
 
-				/* Now apply the WAL record itself */
-				RmgrTable[record->xl_rmid].rm_redo(xlogreader);
-
-				/*
-				 * After redo, check whether the backup pages associated with
-				 * the WAL record are consistent with the existing pages. This
-				 * check is done only if consistency check is enabled for this
-				 * record.
-				 */
-				if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
-					checkXLogConsistency(xlogreader);
-
-				/* Pop the error context stack */
-				error_context_stack = errcallback.previous;
-
-				/*
-				 * Update lastReplayedEndRecPtr after this record has been
-				 * successfully replayed.
-				 */
-				SpinLockAcquire(&XLogCtl->info_lck);
-				XLogCtl->lastReplayedEndRecPtr = EndRecPtr;
-				XLogCtl->lastReplayedTLI = ThisTimeLineID;
-				SpinLockRelease(&XLogCtl->info_lck);
-
-				/*
-				 * If rm_redo called XLogRequestWalReceiverReply, then we wake
-				 * up the receiver so that it notices the updated
-				 * lastReplayedEndRecPtr and sends a reply to the primary.
-				 */
-				if (doRequestWalReceiverReply)
+				if (PR_isInParallelRecovery())
 				{
-					doRequestWalReceiverReply = false;
-					WalRcvForceReply();
-				}
+					/*
+					 * Koichi: TBD
+					 *
+					 * Reader Worker part.
+					 * Copy the XLogReaderState to shared memory,
+					 * chain record, and dispatch to DISPATCHER WORKER
+					 */
+					XLogReaderState *xlogreader_PR;
+#ifdef WAL_DEBUG
+					static long	ser_no = -1;
+#endif
 
+					xlogreader_PR = (XLogReaderState *)PR_allocBuffer(sizeof(XLogReaderState), true);
+					memcpy(xlogreader_PR, xlogreader, sizeof(XLogReaderState));
+					PR_setBlocks(xlogreader_PR, xlogreader);
+#ifdef WAL_DEBUG
+					xlogreader_PR->ser_no = ++ser_no;
+#endif
+#ifdef WAL_DEBUG
+					xlogreader_PR->xlog_string = xlog_string;
+					PR_debug_analyzeState(xlogreader_PR, xlogreader->decoded_record);
+
+					PRDebug_log("========================================================================================================\n");
+					PRDebug_log("Enqueue, ser_no(%ld) to %s, XLOGrecord: \"%s\"\n",
+							ser_no, PR_worker_name(PR_DISPATCHER_WORKER_IDX), xlogreader_PR->xlog_string);
+#define	PR_ITER_NUM 10
+					if (ser_no && (ser_no % PR_ITER_NUM == 0))
+						PR_breakpoint();
+#undef PR_ITER_NUM
+#endif
+					PR_enqueue(xlogreader_PR, ReaderState, PR_DISPATCHER_WORKER_IDX);
+#ifdef WAL_DEBUG
+					PRDebug_log("Enqueue done, ser_no(%ld)\n", ser_no);
+#endif
+				}
+				else
+				{
+
+					/* Now apply the WAL record itself */
+					RmgrTable[record->xl_rmid].rm_redo(xlogreader);
+
+					/*
+					 * After redo, check whether the backup pages associated with
+					 * the WAL record are consistent with the existing pages. This
+					 * check is done only if consistency check is enabled for this
+					 * record.
+					 */
+					if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
+						checkXLogConsistency(xlogreader);
+
+					/* Pop the error context stack */
+					error_context_stack = errcallback.previous;
+
+					/*
+					 * Update lastReplayedEndRecPtr after this record has been
+					 * successfully replayed.
+					 */
+					SpinLockAcquire(&XLogCtl->info_lck);
+					XLogCtl->lastReplayedEndRecPtr = EndRecPtr;
+					XLogCtl->lastReplayedTLI = ThisTimeLineID;
+					SpinLockRelease(&XLogCtl->info_lck);
+
+					/*
+					 * If rm_redo called XLogRequestWalReceiverReply, then we wake
+					 * up the receiver so that it notices the updated
+					 * lastReplayedEndRecPtr and sends a reply to the primary.
+					 */
+					if (doRequestWalReceiverReply)
+					{
+						doRequestWalReceiverReply = false;
+						WalRcvForceReply();
+					}
+
+				}
 				/* Remember this record as the last-applied one */
 				LastRec = ReadRecPtr;
 
 				/* Allow read-only connections if we're consistent now */
+
 				CheckRecoveryConsistency();
 
 				/* Is this a timeline switch? */
 				if (switchedTLI)
 				{
+					if (PR_isInParallelRecovery())
+						/* Wait worker process to handle all the assigned XLogRecord */
+						PR_WaitDispatcherQueueHandling();
 					/*
 					 * Before we continue on the new timeline, clean up any
 					 * (possibly bogus) future WAL segments on the old
@@ -7594,6 +7703,23 @@ StartupXLOG(void)
 			/*
 			 * end of main redo apply loop
 			 */
+
+			/*
+			 * Stop all the workers and free shared memory
+			 */
+			if (PR_isInParallelRecovery())
+			{
+				PR_WorkerFinish();
+				PR_finishShm();
+				PR_syncFinishSockDir();
+				if (PR_test)
+					PRDebug_finish();
+				/*
+				 * We need to call this here to check all the outstanding WAL
+				 * replay not found in the previous call.
+				 */
+				CheckRecoveryConsistency();
+			}
 
 			if (reachedRecoveryTarget)
 			{
@@ -7650,6 +7776,16 @@ StartupXLOG(void)
 		}
 		else
 		{
+			if (PR_isInParallelRecovery())
+			{
+				PR_WorkerFinish();
+				PR_finishShm();
+				/*
+				 * We need to call this here to check all the outstanding WAL
+				 * replay not found in the previous call.
+				 */
+				CheckRecoveryConsistency();
+			}
 			/* there are no WAL records following the checkpoint */
 			ereport(LOG,
 					(errmsg("redo is not required")));
@@ -13206,4 +13342,18 @@ void
 XLogRequestWalReceiverReply(void)
 {
 	doRequestWalReceiverReply = true;
+}
+
+/*
+ * Update XLogCtl from outside
+ */
+void
+XLogCtlDataUpdatePtr(XLogRecPtr lastReplayedEndRecPtr, TimeLineID timeline, bool need_lock)
+{
+	if (need_lock)
+		SpinLockAcquire(&XLogCtl->info_lck);
+	XLogCtl->lastReplayedEndRecPtr = lastReplayedEndRecPtr;
+	XLogCtl->lastReplayedTLI = timeline;
+	if (need_lock)
+		SpinLockRelease(&XLogCtl->info_lck);
 }

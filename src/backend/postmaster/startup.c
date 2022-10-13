@@ -19,6 +19,7 @@
  */
 #include "postgres.h"
 
+#include "access/parallel_replay.h"
 #include "access/xlog.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -145,6 +146,11 @@ StartupRereadConfig(void)
 }
 
 /* Handle various signals that might be sent to the startup process */
+/*
+ * Koichi: Here if parallel replay is running, we wait for all ther workers
+ * to terminate.   Workers are expected to handle all the assigned WAL records
+ * so that se can maintain low revel consistency.
+ */
 void
 HandleStartupProcInterrupts(void)
 {

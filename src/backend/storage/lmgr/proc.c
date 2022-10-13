@@ -104,7 +104,7 @@ ProcGlobalShmemSize(void)
 	Size		size = 0;
 	Size		TotalProcs =
 	add_size(MaxBackends, add_size(NUM_AUXILIARY_PROCS, max_prepared_xacts));
-
+	
 	/* ProcGlobal */
 	size = add_size(size, sizeof(PROC_HDR));
 	size = add_size(size, mul_size(TotalProcs, sizeof(PGPROC)));
@@ -155,6 +155,11 @@ ProcGlobalSemas(void)
  * not even in the EXEC_BACKEND case.  The ProcGlobal and AuxiliaryProcs
  * pointers must be propagated specially for EXEC_BACKEND operation.
  */
+
+#ifdef WAL_DEBUG
+uint32 aux_proc_num = 0;
+#endif
+
 void
 InitProcGlobal(void)
 {
@@ -163,6 +168,8 @@ InitProcGlobal(void)
 				j;
 	bool		found;
 	uint32		TotalProcs = MaxBackends + NUM_AUXILIARY_PROCS + max_prepared_xacts;
+
+	aux_proc_num = NUM_AUXILIARY_PROCS;
 
 	/* Create the ProcGlobal shared structure */
 	ProcGlobal = (PROC_HDR *)
