@@ -992,17 +992,6 @@ static void WALInsertLockAcquireExclusive(void);
 static void WALInsertLockRelease(void);
 static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
 
-/* Dummy breakpoint for GDB */
-#ifdef WAL_DEBUG
-void PR_gdb_sync(void);
-void PR_gdb_sync(void)
-{
-	return;
-}
-#endif
-
-
-
 /*
  * Insert an XLOG record represented by an already-constructed chain of data
  * chunks.  This is a low-level routine; to construct the WAL record header
@@ -7368,19 +7357,12 @@ StartupXLOG(void)
 							num_preplay_workers)));
 			PR_syncInitSockDir();
 			PR_initShm();
-#ifdef WAL_DEBUG
-#if 0
-			PR_debug_buffer();
-			PR_debug_buffer2();
-#endif
-#endif
 			PR_WorkerStartup();
 
 			/*
 			 * Koichi: Cleanup xlogreader for subsequent read and decode.
 			 */
 			XLogReaderStateCleanupDecodedData(xlogreader);
-			xlogreader->for_parallel_replay = true;
 
 		}
 
@@ -7388,15 +7370,26 @@ StartupXLOG(void)
 		 * Find the first record that logically follows the checkpoint --- it
 		 * might physically precede it, though.
 		 */
+
+		PR_breakpoint();		/* Sync point with GDB */
+
+		/*
+		 * Koichi:
+		 * We don't like to run XLogBeginRead() with for_parallel_replay == true.
+		 */
 		if (checkPoint.redo < RecPtr)
 		{
 			/* back up to find the record */
 			XLogBeginRead(xlogreader, checkPoint.redo);
+			if (PR_isInParallelRecovery())
+				xlogreader->for_parallel_replay = true;
 			record = ReadRecord(xlogreader, PANIC, false);
 		}
 		else
 		{
 			/* just have to read next record after CheckPoint */
+			if (PR_isInParallelRecovery())
+				xlogreader->for_parallel_replay = true;
 			record = ReadRecord(xlogreader, LOG, false);
 		}
 
@@ -7442,7 +7435,9 @@ StartupXLOG(void)
 				 * the records.
 				 */
 #ifdef WAL_DEBUG
-				PR_gdb_sync();		/* Sync point with GDB */
+#if 0
+				PR_breakpoint();		/* Sync point with GDB: Don't needed any more */
+#endif
 
 				xlog_string = NULL;
 
@@ -7455,8 +7450,9 @@ StartupXLOG(void)
 				xlog_outdesc(&buf, xlogreader);
 				if (PR_isInParallelRecovery() && PR_needTestSync())
 				{
-					xlog_string = PR_allocBuffer(buf.len, true);
+					xlog_string = PR_allocBuffer(buf.len+1, true);
 					memcpy(xlog_string, buf.data, buf.len);
+					xlog_string[buf.len] = '\0';
 					PRDebug_log("=== WAL record parsed === %s\n", xlog_string);
 				}
 				if (XLOG_DEBUG ||
@@ -7597,6 +7593,7 @@ StartupXLOG(void)
 					XLogReaderState *xlogreader_PR;
 #ifdef WAL_DEBUG
 					static long	ser_no = -1;
+					char	workername[64];
 #endif
 
 					xlogreader_PR = (XLogReaderState *)PR_allocBuffer(sizeof(XLogReaderState), true);
@@ -7607,11 +7604,11 @@ StartupXLOG(void)
 #endif
 #ifdef WAL_DEBUG
 					xlogreader_PR->xlog_string = xlog_string;
-					PR_debug_analyzeState(xlogreader_PR, xlogreader->decoded_record);
+					PR_debug_analyzeState(xlogreader_PR, xlogreader->decoded_record);	/* This is not needed any longer */
 
 					PRDebug_log("========================================================================================================\n");
 					PRDebug_log("Enqueue, ser_no(%ld) to %s, XLOGrecord: \"%s\"\n",
-							ser_no, PR_worker_name(PR_DISPATCHER_WORKER_IDX), xlogreader_PR->xlog_string);
+							ser_no, PR_worker_name(PR_DISPATCHER_WORKER_IDX, workername), xlogreader_PR->xlog_string);
 #define	PR_ITER_NUM 10
 					if (ser_no && (ser_no % PR_ITER_NUM == 0))
 						PR_breakpoint();
@@ -13346,14 +13343,19 @@ XLogRequestWalReceiverReply(void)
 
 /*
  * Update XLogCtl from outside
+ *
+ * Due to the parallel worker environment, poiter update can come in reverse order.
+ * To deal with this case, only actual update is recorded to XLogCtl.
  */
 void
 XLogCtlDataUpdatePtr(XLogRecPtr lastReplayedEndRecPtr, TimeLineID timeline, bool need_lock)
 {
 	if (need_lock)
 		SpinLockAcquire(&XLogCtl->info_lck);
-	XLogCtl->lastReplayedEndRecPtr = lastReplayedEndRecPtr;
-	XLogCtl->lastReplayedTLI = timeline;
+	if (XLogCtl->lastReplayedEndRecPtr < lastReplayedEndRecPtr)
+		XLogCtl->lastReplayedEndRecPtr = lastReplayedEndRecPtr;
+	if (XLogCtl->lastReplayedTLI < timeline)
+		XLogCtl->lastReplayedTLI = timeline;
 	if (need_lock)
 		SpinLockRelease(&XLogCtl->info_lck);
 }

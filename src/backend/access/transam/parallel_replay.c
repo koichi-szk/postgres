@@ -95,15 +95,15 @@ int		num_preplay_max_txn;		/* If less than max_connections, max_connections will
 static dsm_segment	*pr_shm_seg = NULL;
 
 /* The following variables are initialized by PR_initShm() */
-PR_shm   	*pr_shm = NULL;
-static txn_wal_info_PR	*pr_txn_wal_info = NULL;
-static txn_hash_el_PR	*pr_txn_hash = NULL;
-static txn_cell_PR		*pr_txn_cell_pool = NULL;
-static PR_invalidPages 	*pr_invalidPages = NULL;
-static PR_XLogHistory	*pr_history = NULL;
-static PR_worker	*pr_worker = NULL;
-static PR_queue		*pr_queue = NULL;
-static PR_buffer	*pr_buffer = NULL;
+PR_shm   	*pr_shm = NULL;							/* Whole shared memory area */
+static txn_wal_info_PR	*pr_txn_wal_info = NULL;	/* Chain of WAL for a transaction */
+static txn_hash_el_PR	*pr_txn_hash = NULL;		/* Hash for TXN hash pool */
+static txn_cell_PR		*pr_txn_cell_pool = NULL;	/* Pool of transaction track information */
+static PR_invalidPages 	*pr_invalidPages = NULL;	/* Shared information of invalic page registration */
+static PR_XLogHistory	*pr_history = NULL;			/* List of outstanding XLogRecord */
+static PR_worker	*pr_worker = NULL;				/* Paralle replay workers */
+static PR_queue		*pr_queue = NULL;				/* Dispatch queue element to workers */
+static PR_buffer	*pr_buffer = NULL;				/* Buffer are for other usage */
 
 #ifdef WAL_DEBUG
 #define BufferDumpAreaLen	(4096 * 16)
@@ -112,9 +112,17 @@ static char	*buffer_dump_data;
 
 /* My worker process info */
 static int           my_worker_idx = 0;         /* Index of the worker.  Set when the worker starts. */
-static PR_worker    *my_worker = NULL;      /* My worker structure */
+static PR_worker    *my_worker = NULL;      	/* My worker structure */
 
 /* For test code */
+/*
+ * Mainly usage:
+ * 1) Test logs to dedicated directory ($PGDATA/$PR_SYNCSOCKDIR)
+ * 2) Provide means to connect workers to gdb at run.
+ *    Instruction to start GDB, attach workers to gdb, defining break point and
+ *    continue to run the worker will be written to test logs.   Copy and paste
+ *    these lines to your bash.
+ */ 
 static FILE *pr_debug_log = NULL;
 static char	*pr_debug_signal_file = NULL;
 static char	*debug_log_dir = NULL;
@@ -125,23 +133,19 @@ static int	 my_worker_idx;
 /* Module-global definition */
 #define PR_MAXPATHLEN	512
 
-
-
 /*
  * Size boundary, address calculation and boundary adjustment
  */
 
-#define MemBoundary         (sizeof(void *))
-#define addr_forward(p, s)  ((void *)((uint64)(p) + (Size)(s)))
-#define addr_backward(p, s) ((void *)((uint64)(p) - (Size)(s)))
-#if 0
-#define addr_subtract(a, b) ((Size)((b) - (a)))
-#endif
-#define addr_after(a, b)    ((uint64)(a) > (uint64)(b))
-#define addr_after_eq(a, b) ((uint64)(a) >= (uint64)(b))
-#define addr_before(a, b)   ((uint64)(a) < (uint64)(b))
+#define MemBoundary         	(sizeof(void *))
+#define addr_forward(p, s)  	((void *)((uint64)(p) + (Size)(s)))
+#define addr_backward(p, s) 	((void *)((uint64)(p) - (Size)(s)))
+#define addr_after(a, b)    	((uint64)(a) > (uint64)(b))
+#define addr_after_eq(a, b) 	((uint64)(a) >= (uint64)(b))
+#define addr_before(a, b)   	((uint64)(a) < (uint64)(b))
 #define addr_before_eq(a, b)    ((uint64)(a) <= (uint64)(b))
 
+/* Addresses are casted to unsigned INT64 to calculate the distance */
 static Size
 addr_difference(void *start, void * end)
 {
@@ -153,23 +157,27 @@ addr_difference(void *start, void * end)
 	else
 		return (Size)(uend - ustart);
 }
+
+/* When O0 is ised, it conflicts with inline function. */
+#if 1
+#define INLINE static
+#else
+#define INLINE inline
+#endif
+
+
+/*
+ ***********************************************************************************************
+ * Directories and related definition for synchronization among workers.
+ ***********************************************************************************************
+ */
+
 /* Macros */
 #define PR_SOCKNAME_LEN 127
 #define PR_SYNCSOCKDIR  "pr_syncsock"
 #define PR_SYNCSOCKFMT  "%s/%s/pr_%06d"
 #define PR_SYNC_MSG_SZ 15
 #define PR_MB	(2 << 19)
-
-/* When O0 is ised, it conflicts with inline function. */
-#define INLINE static
-
-
-/*
- ***********************************************************************************************
- * Internal Variables
- ***********************************************************************************************
- */
-
 /* Worker process synchronization */
 static char *sync_sock_dir = NULL;
 static char	 my_worker_msg[PR_SYNC_MSG_SZ + 1];
@@ -209,14 +217,17 @@ INLINE Size			 buffer_size(void);
 static void			 initBuffer(void);
 static PR_BufChunk	*prev_chunk(PR_BufChunk *chunk);
 static void			 free_chunk(PR_BufChunk *chunk);
-static PR_BufChunk	*alloc_chunk(Size sz, void *start, void *end);
-static void			 concat_next_chunk(PR_BufChunk *chunk);
-static void			 concat_prev_chunk(PR_BufChunk *chunk);
-static void			 chunk_arrange_free_wraparound(void);
+static PR_BufChunk	*alloc_chunk(Size sz);
+static PR_BufChunk	*concat_next_chunk(PR_BufChunk *chunk);
+static PR_BufChunk	*concat_prev_chunk(PR_BufChunk *chunk);
+#define concat_surrounding_chunks(c)	concat_prev_chunk(concat_next_chunk(c))
+static PR_BufChunk  *search_chunk(void *addr);
 static void			*retry_allocBuffer(Size sz, bool need_lock);
 INLINE PR_BufChunk	*next_chunk(PR_BufChunk *chunk);
 static Size			 available_size(PR_buffer *buffer);
 static bool			 isOtherWorkersRunning(void);
+#define CHUNK_OVERHEAD	(sizeof(PR_BufChunk) + sizeof(Size))
+static bool			 alloc_required_buffer(int worker_idx);
 
 /*
  * Dispatch Data function
@@ -238,9 +249,6 @@ static void			 free_txn_cell(txn_cell_PR *txn_cell, bool need_lock);
 static txn_cell_PR	*find_txn_cell(TransactionId xid, bool create, bool need_lock);
 static void			 addDispatchDataToTxn(XLogDispatchData_PR *dispatch_data, bool need_lock);
 static bool			 removeDispatchDataFromTxn(XLogDispatchData_PR *dispatch_data, bool need_lock);
-#if 0
-static bool			 removeTxnCell(txn_cell_PR *txn_cell);
-#endif
 static txn_cell_PR	*isTxnSyncNeeded(XLogDispatchData_PR *dispatch_data, XLogRecord *record, TransactionId *xid, bool remove_myself);
 static void			 syncTxn(txn_cell_PR *txn_cell);
 static void			 dispatchDataToXLogHistory(XLogDispatchData_PR *dispatch_data);
@@ -248,17 +256,16 @@ static void			 dispatchDataToXLogHistory(XLogDispatchData_PR *dispatch_data);
 
 /* XLogReaderState/XLogRecord functions */
 static int	blockHash(int spc, int db, int rel, int blk, int n_max);
-#if 0
-INLINE int	fold_int2int8(int val);
-#endif
 static void getXLogRecordRmgrInfo(XLogReaderState *reader, RmgrId *rmgrid, uint8 *info);
 
 
 /* Workerr Loop */
-static void dispatcherWorkerLoop(void);
-static void txnWorkerLoop(void);
-static void invalidPageWorkerLoop(void);
-static void blockWorkerLoop(void);
+static int loop_exit_code = 0;			/* Use this value as exit code of each worker */
+
+static int dispatcherWorkerLoop(void);
+static int txnWorkerLoop(void);
+static int invalidPageWorkerLoop(void);
+static int blockWorkerLoop(void);
 
 /* Test code */
 #ifdef WAL_DEBUG
@@ -278,7 +285,10 @@ static char *invalidPageCmdName(PR_invalidPageCheckCmd cmd);
  */
 
 /*
- * Initialize socket directory
+ * Initialize socket directory - build socket directory if necessary.
+ *
+ * Synchronization is implemented using UDP socket.
+ *
  * This hould be called before worker process is folked.
  */
 void
@@ -300,6 +310,7 @@ PR_syncInitSockDir(void)
 		if (my_errno != ENOENT)
 		{
 			PR_breakpoint();
+			PR_failing();
 			elog(PANIC, "Failed to stat PR debug directory, %s", strerror(my_errno));
 		}
         rv = mkdir(sync_sock_dir, S_IRUSR|S_IWUSR|S_IXUSR);
@@ -307,6 +318,7 @@ PR_syncInitSockDir(void)
         if (rv != 0)
 		{
 			PR_breakpoint();
+			PR_failing();
             elog(PANIC, "Failed to create PR debug directory, %s", strerror(local_errno));
 		}
     }
@@ -317,6 +329,7 @@ PR_syncInitSockDir(void)
 		{
 			PR_breakpoint();
 			/* It was not a directory */
+			PR_failing();
 			elog(PANIC, "%s must be a directory but not.", sync_sock_dir);
 		}
 	}
@@ -324,6 +337,9 @@ PR_syncInitSockDir(void)
 	rmtree(sync_sock_dir, false);
 }
 
+/*
+ * Clean all the subtree under sync socket dir.
+ */
 void
 PR_syncFinishSockDir(void)
 {
@@ -390,6 +406,9 @@ PR_syncInit(void)
     my_worker_msg_sz = strlen(my_worker_msg);
 }
 
+/*
+ * Close all the sync sock info
+ */
 void
 PR_syncFinish(void)
 {
@@ -403,6 +422,9 @@ PR_syncFinish(void)
 	sync_sock_info = NULL;
 }
 
+/*
+ * Send synchronization message to the target worker
+ */
 void
 PR_sendSync(int worker_idx)
 {
@@ -422,6 +444,11 @@ PR_sendSync(int worker_idx)
 	}
 }
 
+/*
+ * Receive synchronization message from a worker.
+ *
+ * Return value indicates the worker sending synchronization message.
+ */
 int
 PR_recvSync(void)
 {
@@ -484,6 +511,9 @@ PR_syncAll(void)
 	 * PR_syncBeforeDispatcher() を行って、その後 READER に
 	 * 完了同期を取るもの。
 	 */
+	/*
+	 * これらは各 worker の loop での実装に変更されているので注意
+	 */
 	int	ii;
 	int	num_sync = 0;
 
@@ -506,6 +536,10 @@ PR_syncAll(void)
 }
 
 
+/*
+ * Koichi: ここでは、Invalid Page Worker の同期は取っていない。これで大丈夫か、
+ * 見直しておくこと。
+ */
 static void
 PR_syncBeforeDispatch(void)
 {
@@ -528,6 +562,10 @@ PR_syncBeforeDispatch(void)
 		PR_recvSync();
 }
 
+/*
+ * Check if all the XLogRecord for the transaction must have been replayed
+ * before replaying this XLogRecord.
+ */
 static bool
 checkRmgrTxnSync(RmgrId rmgrid, uint8 info)
 {
@@ -545,6 +583,10 @@ checkRmgrTxnSync(RmgrId rmgrid, uint8 info)
 	return false;
 }
 
+/*
+ * Check if all the outstanding XLogRecord must have been replayed before
+ * dispatching this XLogRecord.
+ */
 static bool
 checkSyncBeforeDispatch(RmgrId rmgrid, uint8 info)
 {
@@ -639,6 +681,10 @@ isSyncBeforeDispatchNeeded(XLogReaderState *reader)
 	return checkSyncBeforeDispatch(rmgr_id, info);
 }
 
+/*
+ * Check if this XLogRecord must have been replayed before
+ * dispatching subsequent XLogRecords.
+ */
 static bool
 checkSyncAfterDispatch(RmgrId rmgrid, uint8 info)
 {
@@ -676,7 +722,12 @@ isSyncAfterDispatchNeeded(XLogReaderState *reader)
  *
  ****************************************************************************
  */
-
+/*
+ * Koichi: 今の所、PR_buf_size_mg (preplay_buffers) は、バッファ領域のサイズに使用し、
+ * 他の構造体はそれぞれのパラメータからサイズを持ってきている。従って、結果的に確保される
+ * 共有メモリのサイズは preplay_buffers で指定したサイズよりも大きくなる。
+ * これでいいかどうか、後で決める必要がある。
+ */
 void
 PR_initShm(void)
 {
@@ -713,8 +764,9 @@ PR_initShm(void)
 	pr_shm->workers = pr_worker = addr_forward(pr_history, my_history_sz);
 	pr_shm->queue = pr_queue = addr_forward(pr_worker, my_worker_sz);
 	pr_shm->buffer = pr_buffer = addr_forward(pr_queue, my_queue_sz);
-	pr_shm->wk_EndRecPtr = InvalidXLogRecPtr;
-	pr_shm->wk_TimeLineID = InvalidXLogRecPtr;
+	pr_shm->some_failed = false;
+	pr_shm->EndRecPtr = InvalidXLogRecPtr;
+	pr_shm->MinTimeLineID = 0;
 
 	SpinLockInit(&pr_shm->slock);
 
@@ -760,6 +812,10 @@ static int txn_hash_size = 0;
 static Size
 pr_txn_hash_size(void)
 {
+	/*
+	 * Koichi: 実は、Standby で動作している場合、この MaxConnections は
+	 * Primary のものでなければならない。この部分も後で見直す必要がある。
+	 */
 	if (num_preplay_max_txn < MaxConnections)
 		num_preplay_max_txn = MaxConnections;
 	txn_hash_size = num_preplay_max_txn/2;
@@ -794,6 +850,10 @@ init_txn_hash(void)
 
 #define txn_hash_value(x)	((x) % txn_hash_size)
 
+/*
+ * It is very very rare but as a logic, we have a chance
+ * to return NULL value.
+ */
 static txn_cell_PR *
 get_txn_cell(bool need_lock)
 {
@@ -802,11 +862,11 @@ get_txn_cell(bool need_lock)
 	if (need_lock)
 		SpinLockAcquire(&pr_txn_wal_info->cell_slock);
 	rv = pr_txn_cell_pool->next;
-	if (rv == NULL)
-		pr_txn_cell_pool->next = NULL;
-	else
+	if (rv)
+	{
 		pr_txn_cell_pool->next = rv->next;
-	rv->next = NULL;
+		rv->next = NULL;
+	}
 	if (need_lock)
 		SpinLockRelease(&pr_txn_wal_info->cell_slock);
 	return rv;
@@ -884,6 +944,8 @@ freeDispatchData(XLogDispatchData_PR *dispatch_data)
 	{
 		int ii;
 
+		Assert(dispatch_data->reader->for_parallel_replay == true);
+
 		if (dispatch_data->reader->main_data)
 			PR_freeBuffer(dispatch_data->reader->main_data, false);
 		if (dispatch_data->reader->record)
@@ -926,6 +988,8 @@ addDispatchDataToTxn(XLogDispatchData_PR *dispatch_data, bool need_lock)
 
 	hash_v = txn_hash_value(dispatch_data->xid);
 	txn_cell = find_txn_cell(dispatch_data->xid, true, need_lock);
+	if (txn_cell == NULL)
+		elog(ERROR, "Could not allocate transaction cell.");
 	hash_el = &pr_txn_hash[hash_v];
 
 	Assert(txn_cell);
@@ -1286,15 +1350,50 @@ PR_myWorkerIdx(void)
 	return my_worker_idx;
 }
 
+/*
+ * Indicates that I failed and exiting.
+ *
+ * Koichi: この関数はまだ使われていない。これから、エラー処理として使うようにする。
+ */
+void
+PR_failing(void)
+{
+	SpinLockAcquire(&my_worker->slock);
+	my_worker->worker_failed = true;
+	SpinLockRelease(&my_worker->slock);
+	SpinLockAcquire(&pr_shm->slock);
+	pr_shm->some_failed = true;
+	SpinLockRelease(&pr_shm->slock);
+}
+
 void
 PR_setWorker(int worker_idx)
 {
 	Assert(pr_shm);
 
 	if ((worker_idx <= 0) || (worker_idx >= num_preplay_workers))
+	{
+		PR_failing();
 		elog(PANIC, "Worker idex %d out of range.", worker_idx);
+	}
 	my_worker_idx = worker_idx;
 	my_worker = &pr_worker[worker_idx];
+}
+
+char *
+PR_worker_name(int worker_idx, char *buff)
+{
+	if (worker_idx == PR_READER_WORKER_IDX)
+		strcpy(buff, "READER");
+	else if (worker_idx == PR_DISPATCHER_WORKER_IDX)
+		strcpy(buff, "DISPATCHER");
+	else if (worker_idx == PR_WK_SYNC_TXN)
+		strcpy(buff, "TXN WORKER");
+	else if (PR_INVALID_PAGE_WORKER_IDX)
+		strcpy(buff, "INVALID PAGE WORKER");
+	else
+		sprintf(buff, "BLOCK WORKER(%d)", worker_idx - PR_BLK_WORKER_MIN_IDX);
+	return buff;
 }
 
 PR_worker *
@@ -1322,6 +1421,7 @@ initWorker(void)
 		worker = &pr_worker[ii];
 		worker->worker_idx = ii;
 		worker->wait_dispatch = false;
+		worker->worker_failed = false;
 		worker->flags = 0;
 		worker->head = NULL;
 		worker->tail = NULL;
@@ -1390,13 +1490,17 @@ PR_WorkerStartup(void)
 		{
 			rv = PR_recvSync();
 			if (rv != ii)
+			{
+				PR_failing();
 				elog(PANIC, "Invalid initial redo sequence.");
+			}
 			else
 				elog(LOG, "Parallel Redo Process (%d) start.", ii);
 		}
 		else if (pid <= 0)
 		{
 			/* Should not return here */
+			PR_failing();
 			elog(PANIC, "Internal error.  Should not come here.");
 			exit(1);	/* Should not come here */
 		}
@@ -1463,6 +1567,13 @@ PR_WorkerFinish(void)
 }
 
 /* See xlog.c */
+/*
+ * This function is called by READER worker and instructs DISPATCHER worker
+ * to handle all the outstanding queues, and then wait for other workers
+ * to finish all their queues and sync to READER worker.
+ * This does not instruct to exit workers.   When all the workers handled
+ * assigned queue, they continue to wait for subsequent dispatches.
+ */
 void
 PR_WaitDispatcherQueueHandling(void)
 {
@@ -1476,19 +1587,6 @@ PR_WaitDispatcherQueueHandling(void)
 	SpinLockRelease(&pr_worker[PR_DISPATCHER_WORKER_IDX].slock);
 
 	PR_recvSync();
-
-	/*
-	 * Koichi:
-	 *
-	 * これは、READER 以外のすべての worker がその時点で READER から割り当てられた queue をすべて処理
-	 * し終わったことの同期をとるためのものである。
-	 *
-	 * 同様に、まず DISPATCHER にこの指示を出し、DISPATCHER は、自分に割り当て済の全ての queue の処理を
-	 * 完了したことを確認して、その他全ての worker の処理完了を監視する。
-	 *
-	 * これは、プロセスの完了を伴わないので、socket を使った同期処理を使うことができるし、どの worker で
-	 * 同期をとってもいい。
-	 */
 }
 
 /*
@@ -1502,6 +1600,7 @@ PR_WaitDispatcherQueueHandling(void)
  */
 void ParallelRedoProcessMain(int idx)
 {
+	int exitcode;
 	/*
 	 * Note: READER worker is in fact Startup process and is handled by
 	 * StartupProcessMain().
@@ -1512,25 +1611,28 @@ void ParallelRedoProcessMain(int idx)
 	if (idx == PR_DISPATCHER_WORKER_IDX)
 	{
 		PR_atStartWorker(PR_DISPATCHER_WORKER_IDX);
-		dispatcherWorkerLoop();
+		exitcode = dispatcherWorkerLoop();
 	}
 	else if (idx == PR_TXN_WORKER_IDX)
 	{
 		PR_atStartWorker(PR_TXN_WORKER_IDX);
-		txnWorkerLoop();
+		exitcode = txnWorkerLoop();
 	}
 	else if (idx == PR_INVALID_PAGE_WORKER_IDX)
 	{
 		PR_atStartWorker(PR_INVALID_PAGE_WORKER_IDX);
-		invalidPageWorkerLoop();
+		exitcode = invalidPageWorkerLoop();
 	}
 	else if (PR_IS_BLK_WORKER_IDX(idx))
 	{
 		PR_atStartWorker(idx);
-		blockWorkerLoop();
+		exitcode = blockWorkerLoop();
 	}
 	else
+	{
+		PR_failing();
 		elog(PANIC, "Internal error. Invalid Parallel Redo worker index: %d", idx);
+	}
 
 	/* The worker does not return */
 
@@ -1538,7 +1640,7 @@ void ParallelRedoProcessMain(int idx)
 	 * Exit normally.  Exit code 0 tells that parallel redo process completed
 	 * all the assigned recovery work.
 	 */
-	proc_exit(0);
+	proc_exit(exitcode);
 }
 
 /*
@@ -1642,6 +1744,7 @@ PR_fetchQueue(void)
 	unsigned flags;
 #ifdef WAL_DEBUG
 	int	synched_worker;
+	char workername[64];
 #endif
 
 	SpinLockAcquire(&my_worker->slock);
@@ -1677,7 +1780,7 @@ PR_fetchQueue(void)
 #endif
 		PR_recvSync();
 #ifdef WAL_DEBUG
-		PRDebug_log("Synch received from %s.\n", PR_worker_name(synched_worker));
+		PRDebug_log("Synch received from %s.\n", PR_worker_name(synched_worker, workername));
 #endif
 		return PR_fetchQueue();
 	}
@@ -1725,11 +1828,11 @@ PR_fetchQueue(void)
 						SpinLockRelease(&pr_worker[ii].slock);
 #ifdef WAL_DEBUG
 						PRDebug_log("%s is waiting for another dispatch. Disable this and turn on termination flag.\n",
-								PR_worker_name(ii));
+								PR_worker_name(ii, workername));
 #endif
 						PR_sendSync(ii);
 #ifdef WAL_DEBUG
-						PRDebug_log("Synch sent to %s.\n", PR_worker_name(ii));
+						PRDebug_log("Synch sent to %s.\n", PR_worker_name(ii, workername));
 #endif
 					}
 					else
@@ -1809,6 +1912,10 @@ PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx)
 	PR_queue_el	*el;
 	PR_worker	*target_worker;
 	XLogRecPtr	 currRecPtr;
+#ifdef WAL_DEBUG
+	char	workername[64];
+#endif
+
 
 	target_worker = &pr_worker[worker_idx];
 	el = getQueueElement();
@@ -1840,7 +1947,7 @@ PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx)
 		target_worker->wait_dispatch = false;
 		SpinLockRelease(&target_worker->slock);
 #ifdef WAL_DEBUG
-		PRDebug_log("%s queue is empty and it is waiting. Sending sync.\n", PR_worker_name(worker_idx));
+		PRDebug_log("%s queue is empty and it is waiting. Sending sync.\n", PR_worker_name(worker_idx, workername));
 #endif
 		PR_sendSync(worker_idx);
 #ifdef WAL_DEBUG
@@ -2006,26 +2113,6 @@ blockHash(int spc, int db, int rel, int blk, int n_max)
 #endif
 }
 
-#if 0
-INLINE int
-fold_int2int8(int val)
-{
-	int ii;
-	int rv;
-	static const int num_repeat = sizeof(int);
-
-	rv = 0;
-	for (ii = 0; ii < num_repeat; ii++)
-	{
-		rv += val & 0xFF;
-		val = val >> 8;
-	}
-	return rv;
-}
-#endif
-
- 
-
 /*
  ****************************************************************************
  *
@@ -2034,19 +2121,16 @@ fold_int2int8(int val)
  *
  ****************************************************************************
  */
-/*
- * Koichi:
- *	バッファの管理の試験のため、現在のバッファエリアの CHUNK をダンプする
- *	関数を実装して、これを呼べるようにすること。
- *	これで、buffer allocation/free のたびにグローバルなバッファエリアの確認
- *	が可能となるようにする。
- */
 
 #define SizeAtTail(chunk)   (Size *)(addr_backward(addr_forward((chunk), (chunk)->size), pr_sizeof(Size)))
 #define Chunk(buffer)		(PR_BufChunk *)(addr_backward((buffer), pr_sizeof(PR_BufChunk)))
 #define Tail(buffer)		SizeAtTail(Chunk(buffer))
 #define Buffer(chunk)		(void *)addr_forward(chunk, pr_sizeof(PR_BufChunk))
 
+/*
+ * The function assumes chunk is valid.   If chunk is at the last of the pr_buffer area,
+ * this will return pr_buffer->tail, not NULL.
+ */
 INLINE PR_BufChunk *
 next_chunk(PR_BufChunk *chunk)
 {
@@ -2077,7 +2161,7 @@ dump_buffer(const char *funcname, StringInfo outs, bool need_lock)
 	if (need_lock)
 		SpinLockAcquire(&pr_buffer->slock);
 	appendStringInfo(s, "\n=== Buffer area dump: func: %s, worker: %d =================\n", funcname, my_worker_idx);
-	appendStringInfo(s, "Pr_buffer: 0x%016lx, updated: %ld,\n", (uint64)pr_buffer, pr_buffer->updated);
+	appendStringInfo(s, "Pr_buffer: 0x%016lx, updated: %ld,\n", (uint64)pr_buffer, pr_buffer->update_sno);
 	appendStringInfo(s, "head: 0x%016lx (%ld), tail: 0x%016lx (%ld)\n",
 								(uint64)(pr_buffer->head), addr_difference(pr_buffer, pr_buffer->head),
 								(uint64)(pr_buffer->tail), addr_difference(pr_buffer, pr_buffer->tail));
@@ -2191,20 +2275,38 @@ dump_chunk(PR_BufChunk *chunk, const char *funcname, StringInfo outs, bool need_
 
 #endif
 
+
+/*
+ * Allocate memory in pr_buffer area.
+ *
+ * All the memory area in this buffer is for each XLogRecord, this is allocated and
+ * eventually consumed by workers.
+ *
+ * For this, when buffer is full, we can wait ultin such area is consumed and freed.
+ * Globaay, the allocation is done from the top to tail.   Even if intermediate
+ * area is freed, it is not allocated until it is freed and becomes a part of
+ * allocation area between alloc_start to alloc_end, or from alloc_start to tail.
+ *
+ * Allocation is done in loose cyclic way.
+ */
 void *
 PR_allocBuffer(Size sz, bool need_lock)
 {
-	PR_BufChunk	*new;
+	PR_BufChunk	*new_chunk;
 	Size		 chunk_sz;
-	StringInfo	 s;
-	void		*wk;
 	void		*rv;
+#ifdef WAL_DEBUG
+	StringInfo	 s;
 	bool	     buf_ok;
+#endif
+
 
 #ifdef WAL_DEBUG
 	s = makeStringInfo();
 	appendStringInfo(s, "--- %s: allocation size: %lu ---\n", __func__, sz);
 	buf_ok = dump_buffer(__func__, s, need_lock);
+	if (buf_ok != true)
+		PR_breakpoint();
 	post_dump_buffer(s, buf_ok);
 	resetStringInfo(s);
 #endif
@@ -2212,114 +2314,40 @@ PR_allocBuffer(Size sz, bool need_lock)
 		SpinLockAcquire(&pr_buffer->slock);
 
 #ifdef WAL_DEBUG
-	pr_buffer->updated++;
+	pr_buffer->update_sno++;
 #endif
-	if (pr_buffer->alloc_start == pr_buffer->alloc_end)
+	chunk_sz = sz + CHUNK_OVERHEAD;
+	new_chunk = alloc_chunk(chunk_sz);
+	if (new_chunk == NULL)
 	{
 		if (need_lock)
 			SpinLockRelease(&pr_buffer->slock);
 		return retry_allocBuffer(sz, need_lock);
 	}
-	chunk_sz = sz + pr_sizeof(PR_BufChunk) + pr_sizeof(Size);
-	if (addr_before(pr_buffer->alloc_start, pr_buffer->alloc_end))
-	{
-		new = alloc_chunk(chunk_sz, pr_buffer->alloc_start, pr_buffer->alloc_end);
-		if (new == NULL)
-		{
-			if (need_lock)
-				SpinLockRelease(&pr_buffer->slock);
-			rv = retry_allocBuffer(sz, need_lock);
-#ifdef WAL_DEBUG
-			buf_ok = dump_buffer(__func__, s, need_lock);
-			appendStringInfo(s, "--- %s: returning: %p ---\n", __func__, rv);
-			post_dump_buffer(s, buf_ok);
-			pfree(s->data);
-			pfree(s);
-#endif
-			return rv;
-		}
-		else
-		{
-			if (need_lock)
-				SpinLockRelease(&pr_buffer->slock);
-			rv = addr_forward(new, pr_sizeof(PR_BufChunk));
-#ifdef WAL_DEBUG
-			buf_ok = dump_buffer(__func__, s, need_lock);
-			appendStringInfo(s, "--- %s: returning: %p ---\n", __func__, rv);
-			post_dump_buffer(s, buf_ok);
-			resetStringInfo(s);
-			pfree(s->data);
-			pfree(s);
-#endif
-			return rv;
-		}
-	}
-	else
-	{
-		new = alloc_chunk(chunk_sz, pr_buffer->alloc_start, pr_buffer->tail);
-		if (new)
-		{
-			if (need_lock)
-				SpinLockRelease(&pr_buffer->slock);
-			rv = addr_forward(new, pr_sizeof(PR_BufChunk));
-#ifdef WAL_DEBUG
-			buf_ok = dump_buffer(__func__, s, need_lock);
-			appendStringInfo(s, "--- %s: returning: %p ---\n", __func__, rv);
-			post_dump_buffer(s, buf_ok);
-			pfree(s->data);
-			pfree(s);
-#endif
-			return rv;
-		}
-		wk = pr_buffer->alloc_start;
-		pr_buffer->alloc_start = pr_buffer->head;
-		new = alloc_chunk(chunk_sz, pr_buffer->alloc_start, pr_buffer->alloc_end);
-		if (new == NULL)
-		{
-			if (need_lock)
-				SpinLockRelease(&pr_buffer->slock);
-			pr_buffer->alloc_start = wk;
-			rv = retry_allocBuffer(sz, need_lock);
-#ifdef WAL_DEBUG
-			dump_buffer(__func__, s, need_lock);
-			appendStringInfo(s, "--- %s: returning: %p ---\n", __func__, rv);
-			post_dump_buffer(s, buf_ok);
-			pfree(s->data);
-			pfree(s);
-#endif
-			return rv;
-		}
-		else
-		{
-			if (need_lock)
-				SpinLockRelease(&pr_buffer->slock);
-			rv = addr_forward(new, pr_sizeof(PR_BufChunk));
-#ifdef WAL_DEBUG
-			buf_ok = dump_buffer(__func__, s, need_lock);
-			appendStringInfo(s, "--- %s: returning: %p ---\n", __func__, rv);
-			post_dump_buffer(s, buf_ok);
-			pfree(s->data);
-			pfree(s);
-#endif
-			return rv;
-		}
-	}
+	rv = &new_chunk->data[0];
 	if (need_lock)
 		SpinLockRelease(&pr_buffer->slock);
 #ifdef WAL_DEBUG
 	buf_ok = dump_buffer(__func__, s, need_lock);
+	if (buf_ok != true)
+		PR_breakpoint();
 	appendStringInfo(s, "--- %s: returning: NULL ---\n", __func__);
 	post_dump_buffer(s, buf_ok);
 	pfree(s->data);
 	pfree(s);
 #endif
-	return NULL;
+	return rv;
 }
 
 
+/*
+ * When requested size of buffer is not available, the worker writes requested size
+ * to pr_buffer and wait until requested size is available by PR_freeBuffer().
+ */
 static void *
 retry_allocBuffer(Size sz, bool need_lock)
 {
+	void	*rv;
 #ifdef WAL_DEBUG
 	StringInfo	s;
 	bool	buf_ok;
@@ -2328,6 +2356,8 @@ retry_allocBuffer(Size sz, bool need_lock)
 #ifdef WAL_DEBUG
 	s = makeStringInfo();
 	buf_ok = dump_buffer(__func__, s, need_lock);
+	if (buf_ok != true)
+		PR_breakpoint();
 	post_dump_buffer(s, buf_ok);
 #endif
 	if (need_lock)
@@ -2337,16 +2367,115 @@ retry_allocBuffer(Size sz, bool need_lock)
 		SpinLockRelease(&pr_buffer->slock);
 	if (!isOtherWorkersRunning())
 	{
+		PR_failing();
 		elog(PANIC,
-				"Shared buffer overflow.  "
+				"Out of parallel replay shared buffer.  "
 				"Please consider to increase preplay_buffers configuation parameter.");
 	}
+	/*
+	 * Wait for other worker to free buffer and assign it to me.
+	 */
 	PR_recvSync();
 
-	return PR_allocBuffer(sz, need_lock);
+	if (need_lock)
+		SpinLockAcquire(&pr_buffer->slock);
+	rv = pr_buffer->allocated_buffer[my_worker_idx];
+	pr_buffer->allocated_buffer[my_worker_idx] = NULL;
+	if (need_lock)
+		SpinLockRelease(&pr_buffer->slock);
+	return rv;
 }
 
+/*
+ * Allocate chunk in the free area.  pr_buffer->slock has to be acquired by the caller.
+ */
+static PR_BufChunk *
+alloc_chunk(Size chunk_sz)
+{
+	PR_BufChunk	*base_chunk;	/* Candidate free chunk to allocate new chunk */
+	PR_BufChunk	*new_free_chunk;
+	Size		 new_free_chunk_size;
+	Size		*size_at_tail;
 
+
+	if (pr_buffer->alloc_start == pr_buffer->alloc_end)
+		/* No space left */
+		return NULL;
+
+	base_chunk = (PR_BufChunk *)pr_buffer->alloc_start;
+	if (base_chunk->size >= chunk_sz)
+	{
+		/*
+		 * There's sufficient free area to assing the chunk.
+		 */
+		if (base_chunk->size > chunk_sz + CHUNK_OVERHEAD)
+		{
+			/* Current free chunk can be divided into alloc chunk and free chunk */
+			/*
+			 * Divide free chunk into allocated chunk and remainig free chunk.
+			 */
+			new_free_chunk_size = base_chunk->size - chunk_sz;
+			new_free_chunk = addr_forward(pr_buffer->alloc_start, chunk_sz);
+			base_chunk->size = chunk_sz;
+			size_at_tail = SizeAtTail(base_chunk);
+			*size_at_tail = chunk_sz;
+			new_free_chunk->size = new_free_chunk_size;
+			size_at_tail = SizeAtTail(new_free_chunk);
+			*size_at_tail = new_free_chunk_size;
+			base_chunk->magic = PR_BufChunk_Allocated;
+			new_free_chunk->magic = PR_BufChunk_Free;
+			pr_buffer->alloc_start = (void *)new_free_chunk;
+		}
+		else
+		{
+			/*
+			 * Current free chunk is sufficient to allocate new chunk but remaining
+			 * area is not large enough to allocate free chunk.
+			 * In this case, all the free are is returned and alloc_start becomes
+			 * same as alloc_end eventually.
+			 */
+			base_chunk->magic = PR_BufChunk_Allocated;
+			pr_buffer->alloc_start = next_chunk(base_chunk);
+		}
+		return base_chunk;
+	}
+	else if (addr_before_eq(pr_buffer->alloc_start, pr_buffer->alloc_end))
+	{
+		/* No free area before alloc_start.  Can allocate no chunk */
+		return NULL;
+	}
+	else
+	{
+		/*
+		 * Try to allocate the buffer in another free buffer area.
+		 */
+		if (addr_before(pr_buffer->alloc_end, pr_buffer->alloc_start))
+		{
+			PR_BufChunk *new_chunk;
+			void		*old_alloc_start;
+
+			old_alloc_start = pr_buffer->alloc_start;
+			pr_buffer->alloc_start = pr_buffer->head;
+			new_chunk =  alloc_chunk(chunk_sz);
+			if (new_chunk == NULL)
+			{
+				/*
+				 * If no space is left, restore alloc_start for subsequent request
+				 * if the requested size is smaller.
+				 */
+				pr_buffer->alloc_start = old_alloc_start;
+			}
+			return new_chunk;
+		}
+	}
+	return NULL;	/* Does not reach here */
+}
+
+/*
+ * Check if all the workers are waiting for buffer request.  This is a kind of clinch and
+ * we need to stop the replay.   This is rare to happen but possible especially when very 
+ * small amount of shared buffer size is configured.
+ */
 static bool
 isOtherWorkersRunning(void)
 {
@@ -2439,7 +2568,13 @@ isOtherWorkersRunning(void)
 	return false;
 }
 
-
+/*
+ * When freeing the buffer, freed buffer will be concatinated with surrounding free 
+ * buffer area.
+ *
+ * Also, if pending buffer request can be fullfilled by such release, buffer will be
+ * allocated for such worker here.
+ */
 void
 PR_freeBuffer(void *buffer, bool need_lock)
 {
@@ -2447,10 +2582,24 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	Size		 available;
 	int			 ii;
 	bool		 needed_by_lower_worker;
+	static bool *sync_alloc_target = NULL;
 #ifdef WAL_DEBUG
 	StringInfo	s;
 	bool	buf_ok;
 #endif
+
+
+	/*
+	 * Initialize sync target structure if needed.
+	 */
+	if (sync_alloc_target == NULL)
+	{
+		sync_alloc_target = (bool *)palloc(sizeof(bool) * num_preplay_workers);
+		for (ii = 0; ii < num_preplay_workers; ii++)
+		{
+			sync_alloc_target[ii] = false;
+		}
+	}
 
 	/* Do not forget to ping reader or dispatcher if there's free area available */
 	/* Ping the reader worker only when dispatcher does not require the buffer */
@@ -2460,18 +2609,23 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	appendStringInfo(s, "--- %s: freeing: %p ---\n", __func__, buffer);
 	dump_chunk(Chunk(buffer), __func__, s, need_lock);
 	buf_ok = dump_buffer(__func__, s, need_lock);
+	if (buf_ok != true)
+		PR_breakpoint();
 	post_dump_buffer(s, buf_ok);
 #endif
 	if (need_lock)
 		SpinLockAcquire(&pr_buffer->slock);
 #ifdef WAL_DEBUG
-	pr_buffer->updated++;
+	pr_buffer->update_sno++;
 #endif
 	chunk = Chunk(buffer);
-	if (chunk->magic != PR_BufChunk_Allocated)
+	if ((chunk->magic != PR_BufChunk_Allocated) && (chunk->magic != PR_BufChunk_Free))
+		chunk = search_chunk(chunk);
+	if (chunk == NULL || chunk->magic != PR_BufChunk_Allocated)
 	{
 		if (need_lock)
 			SpinLockRelease(&pr_buffer->slock);
+		PR_failing();
 		elog(PANIC, "Attempt to free wrong buffer.");
 	}
 	free_chunk(chunk);
@@ -2488,62 +2642,99 @@ PR_freeBuffer(void *buffer, bool need_lock)
 
 	available = available_size(pr_buffer);
 
-	for (ii = PR_TXN_WORKER_IDX, needed_by_lower_worker = false; ii < num_preplay_workers; ii++)
+	/*
+	 * Allocated as many request as possible if large amount of buffer area was freed above.
+	 */
+	for (ii = (num_preplay_workers - 1), needed_by_lower_worker = false; ii >= PR_TXN_WORKER_IDX; ii--)
 	{
+		/*
+		 * For TXN, Invalid Page and BLOCK worker
+		 */
 		if (pr_buffer->needed_by_worker[ii] != 0)
 		{
-			needed_by_lower_worker = true;
 			if ((pr_buffer->needed_by_worker[ii] <= available) && (ii != my_worker_idx))
 			{
-				if (need_lock)
-					SpinLockRelease(&pr_buffer->slock);
-				if (ii == my_worker_idx)
-					elog(PANIC, "Conflicting situation: replay worker freeing the buffer is also waiting for the buffer.");
-				PR_sendSync(ii);
+				bool rv;
+
+				rv = alloc_required_buffer(ii);
+				if (rv)
+				{
+					sync_alloc_target[ii] = true;
+					available = available_size(pr_buffer);
 #ifdef WAL_DEBUG
-				buf_ok = dump_buffer(__func__, s, need_lock);
-				post_dump_buffer(s, buf_ok);
-				pfree(s->data);
-				pfree(s);
+					buf_ok = dump_buffer(__func__, s, need_lock);
+					if (buf_ok != true)
+						PR_breakpoint();
+					post_dump_buffer(s, buf_ok);
+					pfree(s->data);
+					pfree(s);
 #endif
-				return;
+				}
+				else
+					/* Mark that some lower workers are still requesting buffer */
+					needed_by_lower_worker = true;
 			}
 		}
+		else
+			sync_alloc_target[ii] = false;
 	}
 	
-	if (needed_by_lower_worker == true)
+	if (needed_by_lower_worker == false)
 	{
-		if (need_lock)
-			SpinLockRelease(&pr_buffer->slock);
-		return;
-	}
-
-	for (ii = PR_READER_WORKER_IDX; ii < PR_TXN_WORKER_IDX; ii++)
-	{
-		if (pr_buffer->needed_by_worker[ii] != 0)
+		/*
+		 * For READER and DISPATCHER worker.
+		 * This is skipped if any TXN/INVALID PAGE/BLOCK worker is waiting for buffer
+		 * allocation.
+		 */
+		for (ii = PR_DISPATCHER_WORKER_IDX; ii >= 0; ii--)
 		{
-			if ((pr_buffer->needed_by_worker[ii] <= available) && (ii != my_worker_idx))
+			if (pr_buffer->needed_by_worker[ii] != 0)
 			{
-				if (need_lock)
-					SpinLockRelease(&pr_buffer->slock);
-				if (ii == my_worker_idx)
-					elog(PANIC, "Conflicting situation: replay worker freeing the buffer is also waiting for the buffer.");
-				PR_sendSync(ii);
+				if ((pr_buffer->needed_by_worker[ii] <= available) && (ii != my_worker_idx))
+				{
+					bool rv;
+
+					rv = alloc_required_buffer(ii);
+					if (rv)
+					{
+						sync_alloc_target[ii] = true;
+						available = available_size(pr_buffer);
+					}
+					else
+						sync_alloc_target[ii] = false;
 #ifdef WAL_DEBUG
-				buf_ok = dump_buffer(__func__, s, need_lock);
-				post_dump_buffer(s, buf_ok);
-				pfree(s->data);
-				pfree(s);
+					buf_ok = dump_buffer(__func__, s, need_lock);
+					if (buf_ok != true)
+						PR_breakpoint();
+					post_dump_buffer(s, buf_ok);
+					pfree(s->data);
+					pfree(s);
 #endif
-				return;
+				}
 			}
 		}
 	}
 
 	if (need_lock)
 		SpinLockRelease(&pr_buffer->slock);
+
+	/*
+	 * Synching to waiting workers (if request is fulfilled) will be done
+	 * after slock is released.
+	 */
+	for (ii = PR_READER_WORKER_IDX; ii < num_preplay_workers; ii++)
+	{
+		if (sync_alloc_target[ii] == true)
+		{
+			PR_sendSync(ii);
+			sync_alloc_target[ii] = false;
+		}
+	}
+
 #ifdef WAL_DEBUG
 	buf_ok = dump_buffer(__func__, s, need_lock);
+	if (buf_ok != true)
+		PR_breakpoint();
 	post_dump_buffer(s, buf_ok);
 	pfree(s->data);
 	pfree(s);
@@ -2552,6 +2743,180 @@ PR_freeBuffer(void *buffer, bool need_lock)
 
 }
 
+/* The caller should acquire the lock pr_buffer->slock */
+static void
+free_chunk(PR_BufChunk *chunk)
+{
+	PR_BufChunk	*new_chunk;
+
+	if (chunk->magic != PR_BufChunk_Allocated)
+		return;
+	chunk->magic = PR_BufChunk_Free;
+	if (addr_before(pr_buffer->alloc_start, pr_buffer->alloc_end))
+	{
+		if (((void *)chunk == pr_buffer->head) && ((void *)next_chunk(chunk) == pr_buffer->alloc_start))
+		{
+			/* (1) Chunk is the whole area from head to alloc_start */
+			new_chunk = concat_next_chunk(chunk);
+			pr_buffer->alloc_start = pr_buffer->head;
+		}
+		else if (((void *)chunk == pr_buffer->alloc_end) && (next_chunk(chunk) == pr_buffer->tail))
+		{
+			/* (2) Chunk is whole from alloc_end to tail */
+			new_chunk = concat_prev_chunk(chunk);
+			pr_buffer->alloc_end = pr_buffer->tail;
+		}
+		else if ((void *)next_chunk(chunk) == pr_buffer->alloc_start)
+		{
+			/* (3) The chunk is just before allocation start point */
+			new_chunk = concat_surrounding_chunks(chunk);
+			pr_buffer->alloc_start = (void *)new_chunk;
+		}
+		else if (addr_before(next_chunk(chunk), pr_buffer->alloc_start))
+			/*
+			 * (4) Chunk is in the begging part and other allocated chunks exists
+			 *     between this chunk and pr_buffer->alloc_start
+			 */
+			concat_surrounding_chunks(chunk);
+		else if ((void *)chunk == pr_buffer->alloc_end)
+		{
+			/* (5) Chunk is just after pr_buffer->allloc_end. */
+			new_chunk = concat_surrounding_chunks(chunk);
+			pr_buffer->alloc_end = next_chunk(new_chunk);
+		}
+		else if ((void *)chunk == pr_buffer->head && pr_buffer->alloc_end == pr_buffer->tail)
+		{
+			/*
+			 * (6) Chunk is at the beginning of the buffer pool and
+			 *     alloc_end == tail.   In this case, this (concatenated) chunk additional
+			 *     free area.
+			 */
+			new_chunk = concat_next_chunk(chunk);
+			pr_buffer->alloc_end = next_chunk(chunk);
+		}
+		else
+			/*
+			 * (7) Chunk is in the middle between head and alloc_start
+			 *     or alloc_end and tail
+			 */
+			concat_surrounding_chunks(chunk);
+	}
+	else if (addr_after(pr_buffer->alloc_start, pr_buffer->alloc_end))
+	{
+		if (((void *)chunk == pr_buffer->alloc_end) && ((void *)next_chunk(chunk) == pr_buffer->alloc_start))
+		{
+			/* (8) Chunk is the whole allocated area */
+			concat_surrounding_chunks(chunk);
+			pr_buffer->alloc_start = pr_buffer->head;
+			pr_buffer->alloc_end = pr_buffer->tail;
+		}
+		else if ((void *)chunk == pr_buffer->alloc_end)
+		{
+			/* (9) Chunk is just after pr_buffer->alloc_end */
+			new_chunk = concat_surrounding_chunks(chunk);
+			pr_buffer->alloc_end = next_chunk(new_chunk);
+		}
+		else if ((void *)next_chunk(chunk) == pr_buffer->alloc_start)
+		{
+			/* (10) Chunk is just before pr_buffer->alloc_start */
+			new_chunk = concat_surrounding_chunks(chunk);
+			pr_buffer->alloc_start = new_chunk;
+		}
+		else
+			/* (11) Chunk is in the midddle of alloc_end and alloc_start */
+			concat_surrounding_chunks(chunk);
+	}
+	else
+	{
+		Assert(pr_buffer->alloc_start == pr_buffer->alloc_end);
+
+		/* Now no space left in the buffer pool.   alloc_start == alloc_end */
+		/*
+		 * We need to use current alloc_start and alloc_end so that 
+		 * buffer near current_start will be freed first.
+		 */
+		if ((void *)chunk == pr_buffer->alloc_end)
+		{
+			/* (12) Releasing chunk just before alloc_start/alloc_end */
+			chunk = concat_next_chunk(chunk);	/* Concat just in case */
+			pr_buffer->alloc_end = next_chunk(chunk);
+		}
+		else if ((void *)next_chunk(chunk) == pr_buffer->alloc_start)
+		{
+			/* (13) Releasing chunk just after alloc_start/alloc_end */
+			chunk = concat_prev_chunk(chunk);
+			pr_buffer->alloc_start = chunk;
+		}
+		else
+			/* (14) Releasing chunk in intermediate place */
+			concat_surrounding_chunks(chunk);
+	}
+	return;
+}
+
+/* The caller must acquire the lock at pr_buffer->slock */
+/*
+ * Allocate buffer to specified waiting worker.  Synch'ing to the worker
+ * is done in PR_freeBuffer() to keep slock acquired.
+ */
+static bool
+alloc_required_buffer(int worker_idx)
+{
+	void *new_buf;
+	new_buf = PR_allocBuffer(pr_buffer->needed_by_worker[worker_idx], false);
+
+	if (new_buf == NULL)
+		return false;
+	pr_buffer->allocated_buffer[worker_idx] = new_buf;
+	pr_buffer->needed_by_worker[worker_idx] = 0;
+	return true;
+}
+
+/* The caller must acquire the lock at pr_buffer->slock */
+/*
+ * Search chunk for given address
+ */
+static PR_BufChunk *
+search_chunk(void *addr)
+{
+	PR_BufChunk *curr;
+	PR_BufChunk *next;
+
+	/*
+	 * The check so far is not exact.  Some line allows addr in the OVERHEAD area
+	 * of the chunk and some does not.
+	 *
+	 * Hope this is simple and good enough for most of the case.
+	 */
+	if (addr_before_eq(addr, pr_buffer->head) || addr_after_eq(addr, pr_buffer->tail))
+		return NULL;
+	for (curr = (PR_BufChunk *)pr_buffer->head, next = next_chunk(curr);
+			addr_before(curr, pr_buffer->tail);
+			curr = next, next = next_chunk(next))
+	{
+		if (addr_after_eq(addr, curr) && addr_before(addr, next))
+			return curr;
+	}
+	return NULL;
+}
+
+
+/*
+ * Check if the address is in allocated shared buffer
+ */
+bool
+PR_isInBuffer(void *addr)
+{
+	/*
+	 * The check so far is not exact.  Some condition allows addr in the OVERHEAD area
+	 * of the chunk and some does not.
+	 *
+	 * Hope this is simple and good enough for most of the case.
+	 */
+	return (addr_after(addr, pr_buffer->head) && addr_before(addr, pr_buffer->tail)) ? true : false;
+}
+
+
 /* Caller must obtain pr_buffer->slock lock */
 static Size
 available_size(PR_buffer *buffer)
@@ -2559,11 +2924,13 @@ available_size(PR_buffer *buffer)
 	Size	sz1,
 			sz2;
 
+	if (buffer->alloc_start == buffer->alloc_end)
+		return 0;
 	if (addr_before(buffer->alloc_start, buffer->alloc_end))
-		return ((PR_BufChunk *)buffer)->size - pr_sizeof(PR_BufChunk) - pr_sizeof(Size);
+		return ((PR_BufChunk *)buffer)->size - CHUNK_OVERHEAD;;
 
-	sz1 = addr_difference(buffer->tail, buffer->alloc_start) - pr_sizeof(PR_BufChunk) - pr_sizeof(Size);
-	sz2 = addr_difference(buffer->alloc_end, buffer->head) - pr_sizeof(PR_BufChunk) - pr_sizeof(Size);
+	sz1 = addr_difference(buffer->tail, buffer->alloc_start) - CHUNK_OVERHEAD;
+	sz2 = addr_difference(buffer->alloc_end, buffer->head) - CHUNK_OVERHEAD;
 
 	if (sz1 > sz2)
 		return sz1;
@@ -2602,7 +2969,7 @@ initBuffer(void)
 	size_at_tail = SizeAtTail(chunk);
 	*size_at_tail = chunk->size;
 #ifdef WAL_DEBUG
-	pr_buffer->updated = 0;
+	pr_buffer->update_sno = 0;
 	dump_buffer(__func__, NULL, false);
 #endif
 	SpinLockInit(&pr_buffer->slock);
@@ -2610,136 +2977,69 @@ initBuffer(void)
 
 
 /* The caller should acquire the lock pr_buffer->slock */
+/*
+ * The function assumes that the given chunk is valid.   This function may return NULL
+ * if chunk is at the beginning of pr_buffer data area.
+ */
 static PR_BufChunk *
 prev_chunk(PR_BufChunk *chunk)
 {
-	Size *size_at_tail;
+	Size		*size_at_tail;
 
-	if (chunk == (PR_BufChunk *)pr_buffer->head)
+	if ((void *)chunk == pr_buffer->head)
 		return NULL;
 	size_at_tail = addr_backward(chunk, pr_sizeof(Size));
 	return (PR_BufChunk *)addr_backward(chunk, *size_at_tail);
 }
 
 
-/* The caller should acquire the lock pr_buffer->slock */
-static void
-free_chunk(PR_BufChunk *chunk)
-{
-	if (chunk->magic != PR_BufChunk_Allocated)
-		return;
-	chunk->magic = PR_BufChunk_Free;
-	if (chunk == pr_buffer->alloc_end)
-		pr_buffer->alloc_end = addr_forward(pr_buffer->alloc_end, chunk->size);
-	concat_next_chunk(chunk);
-	concat_prev_chunk(chunk);
-	chunk_arrange_free_wraparound();
-}
-
-
-/* Concatinate this free chunk with the next one */
+/*
+ * Concatinate this free chunk with the next one.  The function
+ * assumes that the given chunk is valid.
+ */
 /* Caller must acquire the lock pr_block->slock */
-static void
+static PR_BufChunk *
 concat_next_chunk(PR_BufChunk *chunk)
 {
 	PR_BufChunk *next;
-	PR_BufChunk *new_end;
 	Size	*size_at_tail;
 
 	Assert(pr_buffer && (chunk->magic == PR_BufChunk_Free));
-	Assert(addr_after_eq(chunk, pr_buffer->head) && addr_before_eq(chunk, pr_buffer->tail));
 
 	next = next_chunk(chunk);
 	if (addr_after_eq(next, pr_buffer->tail))
-		return;
+		return chunk;
 	if (next->magic != PR_BufChunk_Free)
-		return;
-	new_end = next_chunk(next);
+		return chunk;;
 	chunk->size += next->size;
 	size_at_tail = SizeAtTail(chunk);
 	*size_at_tail = chunk->size;
-	if (next == pr_buffer->alloc_start)
-		pr_buffer->alloc_start = chunk;
-	if (next == pr_buffer->alloc_end)
-		pr_buffer->alloc_end = new_end;
+	return chunk;
 }
 
-/* Concatinate this free chunk with the previous one */
+/*
+ * Concatinate this free chunk with the previous one.  The function
+ * assumes that the given chunk is valid.
+ */
 /* Caller must acquire the lock pr_block->slock */
-static void
+static PR_BufChunk *
 concat_prev_chunk(PR_BufChunk *chunk)
 {
 	PR_BufChunk *prev;
-	PR_BufChunk *new_end;
 	Size	*size_at_tail;
 
 	Assert(pr_buffer && (chunk->magic == PR_BufChunk_Free));
 	Assert(addr_after_eq(chunk, pr_buffer->head) && addr_before_eq(chunk, pr_buffer->tail));
 
 	if (addr_before_eq(chunk, pr_buffer->head))
-		return;
+		return chunk;
 	size_at_tail = SizeAtTail(chunk);
 	prev = prev_chunk(chunk);
-	if (prev->magic != PR_BufChunk_Free)
-		return;
-	new_end = next_chunk(chunk);
+	if (!prev || prev->magic != PR_BufChunk_Free)
+		return chunk;
 	prev->size += chunk->size;
 	*size_at_tail = prev->size;
-	if (chunk == pr_buffer->alloc_start)
-		pr_buffer->alloc_start = prev;
-	if (addr_after(pr_buffer->alloc_end, prev) && addr_before(pr_buffer->alloc_end, new_end))
-		pr_buffer->alloc_end = new_end;
-}
-
-/* Rearrange pr_buffer->alloc_start */
-static void
-chunk_arrange_free_wraparound(void)
-{
-	PR_BufChunk	*head;
-
-	if (pr_buffer->alloc_start == pr_buffer->tail)
-		pr_buffer->alloc_start = pr_buffer->head;
-	if (pr_buffer->alloc_end == pr_buffer->tail)
-	{
-		head = (PR_BufChunk *)pr_buffer->head;
-		if (head->magic == PR_BufChunk_Free)
-			pr_buffer->alloc_end = addr_forward(head, head->size);
-	}
-}
-
-
-/* The caller should acquire the lock pr_buffer->slock */
-static PR_BufChunk *
-alloc_chunk(Size sz, void *start, void *end)
-{
-	Size		 available;
-	PR_BufChunk	*chunk;
-	PR_BufChunk	*next;
-	Size *size_at_tail;
-
-	Assert(addr_before(start, end));
-
-	available = addr_difference(end, start);
-	if (available < sz)
-		return NULL;
-	if ((available - sz) <= pr_sizeof(PR_BufChunk) + pr_sizeof(Size))
-		sz = available;
-	chunk = (PR_BufChunk *)start;
-	chunk->size = sz;
-	chunk->magic = PR_BufChunk_Allocated;
-	size_at_tail = SizeAtTail(chunk);
-	*size_at_tail = sz;
-	next = next_chunk(chunk);
-	if (available > sz)
-	{
-		next->size = available - sz;
-		next->magic = PR_BufChunk_Free;
-		size_at_tail = SizeAtTail(next);
-		*size_at_tail = next->size;
-	}
-	pr_buffer->alloc_start = next;
-	concat_next_chunk(next);
-	return chunk;
+	return prev;
 }
 
 /*
@@ -2821,13 +3121,12 @@ PRDebug_init(bool force_init)
 		int	local_errno;
 
 		if (my_errno != ENOENT)
-		{
 			elog(PANIC, "Failed to stat PR debug directory, %s", strerror(my_errno));
-		}
 		rv = mkdir(debug_log_dir, S_IRUSR|S_IWUSR|S_IXUSR);
 		local_errno = errno;
 		if (rv != 0)
 		{
+			PR_failing();
 			elog(PANIC, "Failed to create PR debug directory, %s", strerror(local_errno));
 		}
 	}
@@ -2952,6 +3251,7 @@ PRDebug_start(int worker_idx)
 			}
 			else
 			{
+				PR_failing();
 				elog(PANIC, "%s stat error, %s", pr_debug_signal_file, strerror(my_errno));
 				printf("%s stat error, %s", pr_debug_signal_file, strerror(my_errno));
 				exit(1);
@@ -3048,33 +3348,15 @@ PRDebug_out(StringInfo s)
 static void
 build_PRDebug_log_hdr(void)
 {
+	char workername[64];
 	pr_debug_log_hdr = (char *)malloc(PRDEBUG_HDRSZ);
 	if (my_worker_idx < PR_BLK_WORKER_MIN_IDX)
 		sprintf(pr_debug_log_hdr, "%s(%d): ",
-				PR_worker_name(my_worker_idx), my_worker_idx);
+				PR_worker_name(my_worker_idx, workername), my_worker_idx);
 	else
 		sprintf(pr_debug_log_hdr, "%s_%02d(%d): ",
-				PR_worker_name(my_worker_idx), (my_worker_idx - PR_BLK_WORKER_MIN_IDX), my_worker_idx);
+				PR_worker_name(my_worker_idx, workername), (my_worker_idx - PR_BLK_WORKER_MIN_IDX), my_worker_idx);
 }
-
-static char *worker_name_list[] =
-{
-	"READER WORKER",
-	"DISPATCHER",
-	"TXN WORKER",
-	"INVALID PAGE WORKER",
-	"BLOCK WORKER"
-};
-
-char *
-PR_worker_name(int idx)
-{
-	if (idx < PR_BLK_WORKER_MIN_IDX)
-		return worker_name_list[idx];
-	else
-		return worker_name_list[PR_BLK_WORKER_MIN_IDX];
-}
-
 
 /*
  * Should be called from READER worker after all the WAL replay finished.
@@ -3325,7 +3607,7 @@ invalidPageCmdName(PR_invalidPageCheckCmd cmd)
  *
  * So this is just a main loop.
  */
-static void
+static int
 invalidPageWorkerLoop(void)
 {
 	PR_queue_el	*el;
@@ -3349,7 +3631,10 @@ invalidPageWorkerLoop(void)
 		if (el == NULL)
 			break;	/* Process termination request */
 		if (el->data_type != InvalidPageData)
+		{
+			PR_failing();
 			elog(PANIC, "Invalid internal status for invalid page worker.");
+		}
 		page = (XLogInvalidPageData_PR *)(el->data);
 		PR_freeQueueElement(el);
 #ifdef WAL_DEBUG
@@ -3371,6 +3656,7 @@ invalidPageWorkerLoop(void)
 				PR_XLogCheckInvalidPages_int();
 				break;
 			default:
+				PR_failing();
 				elog(PANIC, "Inconsistent internal status.");
 				break;
 		}
@@ -3386,7 +3672,7 @@ invalidPageWorkerLoop(void)
 #ifdef WAL_DEBUG
 	PRDebug_log("Terminating %s()\n", __func__);
 #endif
-	return;
+	return loop_exit_code;
 }
 
 
@@ -3396,7 +3682,7 @@ invalidPageWorkerLoop(void)
  *****************************************************************************************************************
  */
 
-static void
+static int
 blockWorkerLoop(void)
 {
 	PR_queue_el	*el;
@@ -3405,6 +3691,7 @@ blockWorkerLoop(void)
 	int		*worker_list;
 #ifdef WAL_DEBUG
 	int		 sync_worker;
+	char	 workername[64];
 #endif
 	
 #ifdef WAL_DEBUG
@@ -3423,6 +3710,7 @@ blockWorkerLoop(void)
 		if (el->data_type != XLogDispatchData)
 		{
 			PR_breakpoint();		/* GDB breakpoint */
+			PR_failing();
 			elog(PANIC, "Invalid internal status for block worker.");
 		}
 		data = (XLogDispatchData_PR *)(el->data);
@@ -3506,11 +3794,11 @@ blockWorkerLoop(void)
 				if (*worker_list != my_worker_idx)
 				{
 #ifdef WAL_DEBUG
-					PRDebug_log("Now synch other assigned %s.\n", PR_worker_name(*worker_list));
+					PRDebug_log("Now synch other assigned %s.\n", PR_worker_name(*worker_list, workername));
 #endif
 					PR_sendSync(*worker_list);
 #ifdef WAL_DEBUG
-					PRDebug_log("Sync to %s done.\n", PR_worker_name(*worker_list));
+					PRDebug_log("Sync to %s done.\n", PR_worker_name(*worker_list, workername));
 #endif
 				}
 			}
@@ -3550,7 +3838,7 @@ blockWorkerLoop(void)
 #ifdef WAL_DEBUG
 	PRDebug_log("Terminating %s()\n", __func__);
 #endif
-	return;
+	return loop_exit_code;
 }
 
 /*
@@ -3562,15 +3850,7 @@ blockWorkerLoop(void)
 /*
  * Need to add hash key to take care of block worker data
  */
-/*
- * Koichi: TXN 完了時点で、このTXNのWAL replay 完了同期を取る必要がある。この情報をどのように保持するか、検討要。
- *
- * 問題は、
- *			* メモリを節約するため、完了した WAL レコードは速やかに TXN の情報から除去する必要がある
- *			* 同期を取るのは、UDP ソケットの一方通行のみで行う
- *			* WAL の replay を行った worker は、実行されるまで決定されない
- */
-static void
+static int
 txnWorkerLoop(void)
 {
 	PR_queue_el			*el;
@@ -3597,6 +3877,7 @@ txnWorkerLoop(void)
 		if (el->data_type != XLogDispatchData)
 		{
 			PR_breakpoint();		/* GDB breakpoint */
+			PR_failing();
 			elog(PANIC, "Invalid internal status for transaction worker.");
 		}
 		dispatch_data = (XLogDispatchData_PR *)(el->data);
@@ -3682,7 +3963,7 @@ txnWorkerLoop(void)
 #ifdef WAL_DEBUG
 	PRDebug_log("Terminating %s()\n", __func__);
 #endif
-	return;
+	return loop_exit_code;
 }
 
 static void
@@ -3771,6 +4052,7 @@ syncTxn(txn_cell_PR *txn_cell)
 	txn_hash_el_PR	*txn_hash;
 #ifdef WAL_DEBUG
 	int	synched_worker;
+	char workername[64];
 #endif
 
 	txn_hash = get_txn_hash(txn_cell->xid);
@@ -3791,7 +4073,7 @@ syncTxn(txn_cell_PR *txn_cell)
 #endif
 		PR_recvSync();
 #ifdef WAL_DEBUG
-		PRDebug_log("Synch done from %s\n", PR_worker_name(synched_worker));
+		PRDebug_log("Synch done from %s\n", PR_worker_name(synched_worker, workername));
 #endif
 	}
 	else
@@ -3806,7 +4088,7 @@ syncTxn(txn_cell_PR *txn_cell)
  *************************************************************************************************************
  */
 
-static void
+static int
 dispatcherWorkerLoop(void)
 {
 	PR_queue_el *el;
@@ -3816,6 +4098,7 @@ dispatcherWorkerLoop(void)
 	int	*worker_list;
 #ifdef WAL_DEBUG
 	int	synched_worker;
+	char workername[64];
 #endif
 
 #ifdef WAL_DEBUG
@@ -3836,6 +4119,7 @@ dispatcherWorkerLoop(void)
 		if (el->data_type != ReaderState)
 		{
 			PR_breakpoint();
+			PR_failing();
 			elog(PANIC, "Invalid internal status for dispatcher worker.");
 		}
 		reader = (XLogReaderState *)el->data;
@@ -3864,11 +4148,11 @@ dispatcherWorkerLoop(void)
 		{
 #ifdef WAL_DEBUG
 			PRDebug_log("Enqueue, ser_no(%ld) to %s, XLOGrecord: \"%s\"\n",
-					reader->ser_no, PR_worker_name(*worker_list), reader->xlog_string);
+					reader->ser_no, PR_worker_name(*worker_list, workername), reader->xlog_string);
 #endif
 			PR_enqueue(dispatch_data, XLogDispatchData, *worker_list);
 #ifdef WAL_DEBUG
-			PRDebug_log("Enqueue done, ser_no(%ld) to %s\n", reader->ser_no, PR_worker_name(*worker_list));
+			PRDebug_log("Enqueue done, ser_no(%ld) to %s\n", reader->ser_no, PR_worker_name(*worker_list, workername));
 #endif
 		}
 		if (sync_needed)
@@ -3879,7 +4163,7 @@ dispatcherWorkerLoop(void)
 #endif
 			PR_recvSync();	/* Only one WORKER actually handled this data sends sync. */
 #ifdef WAL_DEBUG
-			PRDebug_log("Sync from %s received.\n", PR_worker_name(synched_worker));
+			PRDebug_log("Sync from %s received.\n", PR_worker_name(synched_worker, workername));
 #endif
 		}
 
@@ -3890,7 +4174,7 @@ dispatcherWorkerLoop(void)
 #ifdef WAL_DEBUG
 	PRDebug_log("Terminating %s()\n", __func__);
 #endif
-	return;
+	return loop_exit_code;
 }
 
 /*

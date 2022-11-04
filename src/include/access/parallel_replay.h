@@ -90,10 +90,9 @@ struct PR_shm
 	PR_queue	*queue;
 	PR_buffer	*buffer;
 	slock_t		slock;			/* Spin lock for EndRecPtr and MinTimeLineID */
+	bool		some_failed;	/* Indicates if some worker failed and exited. */
 	XLogRecPtr	EndRecPtr;		/* Minimum EndRecPtr among workers */
 	TimeLineID  MinTimeLineID;	/* Min Timeline ID among workers */
-	XLogRecPtr	*wk_EndRecPtr;
-	TimeLineID	*wk_TimeLineID;
 };
 
 /*
@@ -152,6 +151,7 @@ typedef struct PR_worker
 								/* Can be spinlock */
 	bool	 	wait_dispatch;	/* Flag to indicate the worker is waiting for xlogrec to handle */
 								/* Dispatcher check this and sync. */
+	bool		worker_failed;	/* Indicates this worker failed and exited. */
 	unsigned	flags;			/* Indicates instructions from outside */
 	XLogRecPtr	assignedRecPtr;	/* Latest assigned XLOG record ptr. */
 								/* Set by enqueue side worker. */
@@ -188,11 +188,12 @@ typedef struct PR_worker
  *  2. If this worker sets wait_dispatch, then clear them and write sync to the target worker.
  */
 
-#define PR_WK_TERMINATE			0x00000001	/* Instruction to terminate the worker process */
+#define PR_WK_TERMINATE			0x00000001	/* Instruction to terminate the worker process peacefully */
 #define PR_WK_SYNC_READER		0x00000002	/* Sync to the READER when all the dispatched data was done */
 #define PR_WK_SYNC_DISPATCHER	0x00000004	/* Sync to the DISPATCHER when all the didpsatched data was done */
 #define PR_WK_SYNC_TXN			0x00000008	/* Sync to the TXN worker when all the didpsatched data was done */
 #define PR_WK_SYNC				0x0000000E	/* Mask to indicate any of SYNC bit above */
+#define PR_ERROR_TERMINATE		0x80000000	/* Some worker failed.   Exit immediately. */
 
 /* Worker Idx */
 /*
@@ -403,13 +404,14 @@ struct PR_buffer
 	Size		 area_size;			/* Exluding this buffer */
 	slock_t		 slock;				/* For allocation/free operation */
 #ifdef WAL_DEBUG
-	uint64		 updated;
+	uint64		 update_sno;
 #endif
 	void		*head;				/* Start of the area: Initialized and then static */
 	void		*tail;				/* Next of the end of the area: Initialized and then static */
 	void		*alloc_start;		/* Can allocate from here. */
 	void		*alloc_end;			/* Can allocate up to here. */
 	Size		*needed_by_worker;	/* Size of the buffer needed by each worker */
+	void	   **allocated_buffer;	/* Allocated buffer for each worker, in response to needed_by_worker flag */
 };
 
 struct PR_BufChunk
@@ -454,7 +456,6 @@ extern void PR_debug_buffer(void);
 extern void PR_debug_buffer2(void);
 extern void PR_debug_analyzeState(XLogReaderState *state, XLogRecord *record);
 extern void PR_breakpoint_func(void);
-extern char *PR_worker_name(int idx);
 #endif
 
 #ifdef WAL_DEBUG
@@ -491,10 +492,16 @@ extern void	PR_WorkerStartup(void);
 extern void	PR_WorkerFinish(void);
 extern void	ParallelRedoProcessMain(int idx);
 extern void	PR_setWorker(int worker_idx);
+extern char *PR_worker_name(int worker_idx, char *buff);
+#if 0
+extern char *PR_worker_name(int idx);
+#endif
 extern int	PR_myWorkerIdx(void);
 extern PR_worker	*PR_myWorker(void);
 extern void PR_WaitDispatcherQueueHandling(void);
 extern void PR_atStartWorker(int idx);
+void PR_failing(void);
+
 
 /* Invalid Page Worker functions */
 extern void PR_log_invalid_page(RelFileNode node, ForkNumber forkno, BlockNumber blkno, bool present);
@@ -515,6 +522,8 @@ extern void	 PR_syncFinish(void);
 /* Buffer functions */
 extern void	*PR_allocBuffer(Size sz, bool need_lock);
 extern void	 PR_freeBuffer(void *buffer, bool need_lock);
+bool PR_isInBuffer(void *addr);
+
 
 /* Queue functions */
 extern void	PR_queue_init(void);

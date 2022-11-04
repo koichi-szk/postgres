@@ -577,23 +577,6 @@ restart:
 		state->EndRecPtr -= XLogSegmentOffset(state->EndRecPtr, state->segcxt.ws_segsize);
 	}
 
-#if 0
-#ifndef FRONTEND
-	if (PR_isInParallelRecovery())
-	{
-		uint32		 tot_len;
-		/*
-		 * Koichi:
-		 *		In the case of parallel recovery, we need to copy XLogRecord to shared memory buffer
-		 */
-		record_old = record;
-		tot_len = record_old->xl_tot_len;
-		record = (XLogRecord *)PR_allocBuffer(tot_len, true);
-		memcpy(record, record_old, tot_len);
-		state->record = record;
-	}
-#endif
-#endif
 #ifndef FRONTEND
 	if (state->for_parallel_replay)
 	{
@@ -610,7 +593,7 @@ restart:
 		}
 	}
 #endif
-	if (!(state->for_parallel_replay) && DecodeXLogRecord(state, record, errormsg))
+	if (DecodeXLogRecord(state, record, errormsg))
 		return record;
 	else
 		return NULL;
@@ -1252,19 +1235,16 @@ ResetDecoder(XLogReaderState *state)
  * the return value is false.
  *
  * Koichi:
- * ここで、decode した結果を palloc() で確保するか、PR_allocBuffer() で
- * 確保するかのフラグを XLogReaderState に入れる (for_parallel_replay)。
- * このフラグが false なら、従前通り、decode 結果は palloc() で確保した
- * 領域に保存し、確保した領域は再利用する。
- * このフラグが true なら、main_data や block_data など、従前 palloc() 
- * で確保していた部分は PR_allocBuffer() で確保し、再利用しない。
- * この場合は、関係する領域へのポインタはすべて NULL クリアする。
- * データ実体は、この後 redo 実行した worker が解放するので、ここでは
- * ローカルメモリに書かれているポインタをクリアするのみとする。
+ * If for_parallel_replay flag of XLogReaderState is true, then
+ * all the block data and main_data will be copied to shared buffer for
+ * parallel replay.    Because this is sent to each worker and replayed
+ * there, these shared memory data will be released at replaying
+ * worker.
  *
- * これらはすべて READER worker で実行する。その後、XLogReaderState は
- * 共有メモリ領域にコピーし、Dispatcher worker 以下の Worker に渡される。
- * 最後に redo した worker が、これらの Decode で使った領域を解放する。
+ * This is only for database kernel.   When this file isused from other
+ * tools such as pg_waldump, this (mainly spin lock) conflicts with such
+ * case and this part of the code is not effective in such case (when
+ * FROTEND is defined).
  */
 bool
 DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
@@ -1520,8 +1500,10 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 		{
 			if (state->for_parallel_replay)
 			{
-				blk->data_bufsz = MAXALIGN(Max(blk->data_len, BLCKSZ));
+#ifndef FRONTEND
+				blk->data_bufsz = blk->data_len;
 				blk->data = PR_allocBuffer(blk->data_len, true);
+#endif
 			}
 			else if (!blk->data || blk->data_len > blk->data_bufsz)
 			{
@@ -1546,8 +1528,10 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 	{
 		if (state->for_parallel_replay)
 		{
+#ifndef FRONTEND
 			state->main_data_bufsz = MAXALIGN(Max(state->main_data_len, BLCKSZ/2));
 			state->main_data = PR_allocBuffer(state->main_data_bufsz, true);
+#endif
 		}
 		else if (!state->main_data || state->main_data_len > state->main_data_bufsz)
 		{
