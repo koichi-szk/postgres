@@ -17,6 +17,9 @@
 #include "access/bufmask.h"
 #include "access/nbtree.h"
 #include "access/nbtxlog.h"
+#ifdef WAL_DEBUG
+#include "access/parallel_replay.h"
+#endif
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xlogutils.h"
@@ -53,6 +56,13 @@ _bt_restore_page(Page page, char *from, int len)
 	i = 0;
 	while (from < end)
 	{
+#ifdef WAL_DEBUG
+		if (i >= MaxIndexTuplesPerPage)
+		{
+			PRDebug_log("Number of items exceeds MaxIndexTuplesPerPage.");
+			abort();
+		}
+#endif
 		/*
 		 * As we step through the items, 'from' won't always be properly
 		 * aligned, so we need to use memcpy().  Further, we use Item (which

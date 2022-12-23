@@ -162,6 +162,11 @@ struct XLogReaderState
 	 */
 	uint64		system_identifier;
 
+#ifdef WAL_DEBUG
+	long		ser_no;			/* Serial number of the record, for parallel */
+								/* replay debug */
+#endif
+
 	/*
 	 * Opaque data for callbacks to use.  Not used by XLogReader.
 	 */
@@ -175,6 +180,13 @@ struct XLogReaderState
 	XLogRecPtr	ReadRecPtr;		/* start of last record read */
 	XLogRecPtr	EndRecPtr;		/* end+1 of last record read */
 
+	/*
+	 * Timeline ID for this state
+	 */
+	TimeLineID	timeline;
+
+	bool		for_parallel_replay;		
+
 
 	/* ----------------------------------------
 	 * Decoded representation of current record
@@ -183,6 +195,7 @@ struct XLogReaderState
 	 * should not be accessed directly.
 	 * ----------------------------------------
 	 */
+	XLogRecord *record; 		/* XLog record used in parallel replay */
 	XLogRecord *decoded_record; /* currently decoded record */
 
 	char	   *main_data;		/* record's main data portion */
@@ -262,6 +275,9 @@ struct XLogReaderState
 	XLogRecPtr	missingContrecPtr;
 	/* Set when XLP_FIRST_IS_OVERWRITE_CONTRECORD is found */
 	XLogRecPtr	overwrittenRecPtr;
+#ifdef WAL_DEBUG
+	char	*xlog_string;		/* String representation of the WAL record */
+#endif
 };
 
 /* Get a new XLogReader */
@@ -336,5 +352,7 @@ extern char *XLogRecGetBlockData(XLogReaderState *record, uint8 block_id, Size *
 extern bool XLogRecGetBlockTag(XLogReaderState *record, uint8 block_id,
 							   RelFileNode *rnode, ForkNumber *forknum,
 							   BlockNumber *blknum);
+void XLogReaderStateCleanupDecodedData(XLogReaderState *state, bool should_free);
+
 
 #endif							/* XLOGREADER_H */

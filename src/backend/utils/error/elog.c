@@ -2473,7 +2473,7 @@ log_line_prefix(StringInfo buf, ErrorData *edata)
 					else if (MyBackendType == B_BG_WORKER)
 						backend_type_str = MyBgworkerEntry->bgw_type;
 					else
-						backend_type_str = GetBackendTypeDesc(MyBackendType);
+						backend_type_str = GetBackendTypeDesc(MyBackendType, MyAuxProcIdx);
 
 					if (padding != 0)
 						appendStringInfo(buf, "%*s", padding, backend_type_str);
@@ -2948,7 +2948,7 @@ write_csvlog(ErrorData *edata)
 	else if (MyBackendType == B_BG_WORKER)
 		appendCSVLiteral(&buf, MyBgworkerEntry->bgw_type);
 	else
-		appendCSVLiteral(&buf, GetBackendTypeDesc(MyBackendType));
+		appendCSVLiteral(&buf, GetBackendTypeDesc(MyBackendType, MyAuxProcIdx));
 
 	appendStringInfoChar(&buf, ',');
 

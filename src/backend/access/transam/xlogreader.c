@@ -19,6 +19,9 @@
 
 #include <unistd.h>
 
+#ifndef FRONTEND
+#include "access/parallel_replay.h"
+#endif
 #include "access/transam.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -1230,6 +1233,21 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 
 	ResetDecoder(state);
 
+#ifndef FRONTEND
+	if (PR_isInParallelRecovery())
+	{
+		/*
+		 * In parallel recovery, all the data area are consumed by corresponding worker
+		 * and should be freed there.
+		 * We just need to cleanup corresponding pointers.
+		 */
+		state->decoded_record = PR_allocBuffer(record->xl_tot_len, true);
+		memcpy(state->decoded_record, record, record->xl_tot_len);
+		record = state->decoded_record;
+		state->record = record;
+	}
+	else
+#endif
 	state->decoded_record = record;
 	state->record_origin = InvalidRepOriginId;
 	state->toplevel_xid = InvalidTransactionId;
@@ -1459,6 +1477,14 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 		}
 		if (blk->has_data)
 		{
+#ifndef FRONTEND
+			if (PR_isInParallelRecovery())
+			{
+				blk->data_bufsz = MAXALIGN(Max(blk->data_len, BLCKSZ));
+				blk->data = PR_allocBuffer(blk->data_bufsz, true);
+			}
+			else
+#endif
 			if (!blk->data || blk->data_len > blk->data_bufsz)
 			{
 				if (blk->data)
@@ -1480,6 +1506,15 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 	/* and finally, the main data */
 	if (state->main_data_len > 0)
 	{
+#ifndef FRONTEND
+		if (PR_isInParallelRecovery())
+		{
+			state->main_data_bufsz = MAXALIGN(Max(state->main_data_len,
+												  BLCKSZ / 2));
+			state->main_data = PR_allocBuffer(state->main_data_bufsz, true);
+		}
+		else
+#endif
 		if (!state->main_data || state->main_data_len > state->main_data_bufsz)
 		{
 			if (state->main_data)
@@ -1542,6 +1577,36 @@ XLogRecGetBlockTag(XLogReaderState *record, uint8 block_id,
 	if (blknum)
 		*blknum = bkpb->blkno;
 	return true;
+}
+
+void
+XLogReaderStateCleanupDecodedData(XLogReaderState *state, bool should_free)
+{
+    uint8       block_id;
+
+    if (state->for_parallel_replay)
+        return;
+    /* block data first */
+    for (block_id = 0; block_id < XLR_MAX_BLOCK_ID; block_id++)
+    {
+
+        DecodedBkpBlock *blk = &state->blocks[block_id];
+
+        if (blk->data)
+        {
+            if (should_free)
+                pfree(blk->data);
+            blk->data = NULL;
+            blk->data_len = blk->data_bufsz = 0;
+        }
+    }
+    if (state->main_data)
+    {
+        if (should_free)
+            pfree(state->main_data);
+        state->main_data = NULL;
+        state->main_data_bufsz = state->main_data_len = 0;
+    }
 }
 
 /*

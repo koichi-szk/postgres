@@ -336,11 +336,13 @@ typedef enum BackendType
 	B_ARCHIVER,
 	B_STATS_COLLECTOR,
 	B_LOGGER,
+	B_PARALLEL_REPLAY
 } BackendType;
 
 extern BackendType MyBackendType;
+extern int		   MyAuxProcIdx;
 
-extern const char *GetBackendTypeDesc(BackendType backendType);
+extern const char *GetBackendTypeDesc(BackendType backendType, int auxProcIdx);
 
 extern void SetDatabasePath(const char *path);
 extern void checkDataDir(void);
@@ -435,6 +437,10 @@ typedef enum
 	CheckpointerProcess,
 	WalWriterProcess,
 	WalReceiverProcess,
+
+	/* Koichi: Additional type for parallel redo */
+	/* Reader, Dispatcher, TXN, Block: indicated by additional index. */
+	ParallelRedoProcess,
 
 	NUM_AUXPROCTYPES			/* Must be last! */
 } AuxProcType;

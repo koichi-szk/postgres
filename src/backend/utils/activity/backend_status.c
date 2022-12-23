@@ -332,6 +332,7 @@ pgstat_bestart(void)
 	 */
 	lbeentry.st_procpid = MyProcPid;
 	lbeentry.st_backendType = MyBackendType;
+	lbeentry.st_backendIdx = MyAuxProcIdx;
 	lbeentry.st_proc_start_timestamp = MyStartTimestamp;
 	lbeentry.st_activity_start_timestamp = 0;
 	lbeentry.st_state_start_timestamp = 0;

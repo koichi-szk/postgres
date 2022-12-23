@@ -117,6 +117,7 @@ typedef struct PgBackendStatus
 
 	/* Type of backends */
 	BackendType st_backendType;
+	int		    st_backendIdx;	/* Auxiliary Backend Index for parallel replay */
 
 	/* Times when current backend, transaction, and activity started */
 	TimestampTz st_proc_start_timestamp;

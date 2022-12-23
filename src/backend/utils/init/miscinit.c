@@ -228,9 +228,11 @@ SwitchBackToLocalLatch(void)
 }
 
 const char *
-GetBackendTypeDesc(BackendType backendType)
+GetBackendTypeDesc(BackendType backendType, int auxProcIdx)
 {
 	const char *backendDesc = "unknown process type";
+	MemoryContext	oldContext;
+#define	PR_DESKLEN	128
 
 	switch (backendType)
 	{
@@ -276,6 +278,27 @@ GetBackendTypeDesc(BackendType backendType)
 		case B_LOGGER:
 			backendDesc = "logger";
 			break;
+		case B_PARALLEL_REPLAY:
+			Assert(auxProcIdx >= PR_DISPATCHER_WORKER_IDX);
+
+			if (auxProcIdx == PR_DISPATCHER_WORKER_IDX)
+				backendDesc = "parallel_replay: dispatcher worker";
+			else if (auxProcIdx == PR_TXN_WORKER_IDX)
+				backendDesc = "parallel_replay: transaction worker";
+			else if (auxProcIdx == PR_INVALID_PAGE_WORKER_IDX)
+				backendDesc = "parallel_replay: invalid page worker";
+			else if (auxProcIdx >= PR_BLK_WORKER_MIN_IDX)
+			{
+				char	*work_desc;
+
+				oldContext = MemoryContextSwitchTo(TopMemoryContext);
+				work_desc = (char *)palloc(PR_DESKLEN);
+				MemoryContextSwitchTo(oldContext);
+				sprintf(work_desc, "parallel_replay: block worker (%d)", auxProcIdx - PR_BLK_WORKER_MIN_IDX);
+				backendDesc = work_desc;
+			}
+			break;
+#undef PR_DESKLEN
 	}
 
 	return backendDesc;
