@@ -7358,6 +7358,9 @@ StartupXLOG(void)
 		 */
 		if (parallel_replay)
 		{
+#ifdef PR_IGNORE_REPLAY_ERROR
+			pr_during_redo = false;
+#endif
 			ereport(LOG,
 					(errmsg("redo in parallel.   Number of worker: %d",
 							num_preplay_workers)));

@@ -12,6 +12,11 @@
 #ifndef PARALLEL_REPLAY_H
 #define PARALLEL_REPLAY_H
 
+#ifdef PR_IGNORE_REPLAY_ERROR
+#include <setjmp.h>
+extern	jmp_buf	pr_jmpbuf;
+#endif
+
 #include "postgres.h"
 
 #include "storage/block.h"
@@ -31,6 +36,13 @@ extern int	num_preplay_worker_queue;	/* Total queue size */
 extern int	num_preplay_max_txn;		/* If less than max_connections, max_connections will be taken */
 extern int	PR_buf_size_mb;				/* Buffer size in MB (2^^10)  */
 extern bool PR_test;					/* Option to sync to the debugger */
+
+/*
+ * Flag to ignore error during parallel replay.
+ */
+#ifdef PR_IGNORE_REPLAY_ERROR
+extern bool pr_during_redo;
+#endif
 
 
 #define MAX_PR_NUM_WORKERS	127			/* Max number of replay worker */

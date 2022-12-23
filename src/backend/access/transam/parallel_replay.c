@@ -87,6 +87,14 @@ int		num_preplay_max_txn;		/* Max transaction at any given time in recovery. */
 int		num_preplay_max_txn;		/* If less than max_connections, max_connections will be taken */
 
 /*
+ * Flag to ignore error during parallel replay.
+ */
+#ifdef PR_IGNORE_REPLAY_ERROR
+bool	pr_during_redo;
+jmp_buf	pr_jmpbuf;
+#endif
+
+/*
  ************************************************************************************************
  * Parallel replay shared memory
  ************************************************************************************************
@@ -3697,6 +3705,9 @@ blockWorkerLoop(void)
 #ifdef WAL_DEBUG
 	PRDebug_log("Started %s()\n", __func__);
 #endif
+#ifdef PR_IGNORE_REPLAY_ERROR
+	pr_during_redo = false;
+#endif
 	for (;;)
 	{
 		XLogRecPtr	currRecPtr;
@@ -3753,7 +3764,14 @@ blockWorkerLoop(void)
 #endif
 			/* REDO */
 
+#ifdef PR_IGNORE_REPLAY_ERROR
+			pr_during_redo = true;
+			if (!setjmp(pr_jmpbuf))
+#endif
 			RmgrTable[record->xl_rmid].rm_redo(data->reader);
+#ifdef PR_IGNORE_REPLAY_ERROR
+			pr_during_redo = false;
+#endif
 
 #ifdef WAL_DEBUG
 			PRDebug_log("Replay DONE. Ser_no(%ld)\n", data->reader->ser_no);
@@ -3863,6 +3881,9 @@ txnWorkerLoop(void)
 #ifdef WAL_DEBUG
 	PRDebug_log("Started %s()\n", __func__);
 #endif
+#ifdef PR_IGNORE_REPLAY_ERROR
+	pr_during_redo = false;
+#endif
 	for (;;)
 	{
 		XLogRecPtr	currRecPtr;
@@ -3909,7 +3930,14 @@ txnWorkerLoop(void)
 #ifdef WAL_DEBUG
 		PRDebug_log("Ser no (%ld), Replaying: \"%s\"\n", xlogreader->ser_no, xlogreader->xlog_string);
 #endif
+#ifdef PR_IGNORE_REPLAY_ERROR
+		pr_during_redo = true;
+		if (!setjmp(pr_jmpbuf))
+#endif
 		RmgrTable[record->xl_rmid].rm_redo(xlogreader);
+#ifdef PR_IGNORE_REPLAY_ERROR
+		pr_during_redo = false;
+#endif
 #ifdef WAL_DEBUG
 		PRDebug_log("Replay done. Ser_no(%ld).\n", xlogreader->ser_no);
 #endif

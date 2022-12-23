@@ -67,6 +67,7 @@
 #endif
 
 #include "access/transam.h"
+#include "access/parallel_replay.h"
 #include "access/xact.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
@@ -3614,3 +3615,5 @@ trace_recovery(int trace_level)
 
 	return trace_level;
 }
+
+

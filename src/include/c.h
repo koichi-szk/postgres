@@ -250,6 +250,8 @@
  * be something that the compiler understands, to aid code generation.
  * In assert-enabled builds, we prefer abort() for debugging reasons.
  */
+#ifndef PR_IGNORE_REPLAY_ERROR
+
 #if defined(HAVE__BUILTIN_UNREACHABLE) && !defined(USE_ASSERT_CHECKING)
 #define pg_unreachable() __builtin_unreachable()
 #elif defined(_MSC_VER) && !defined(USE_ASSERT_CHECKING)
@@ -257,6 +259,29 @@
 #else
 #define pg_unreachable() abort()
 #endif
+
+#else /* PR_IGNORE_REPLAY_ERROR */
+
+#include <setjmp.h>
+extern jmp_buf pr_jmpbuf;
+
+#if defined(HAVE__BUILTIN_UNREACHABLE) && !defined(USE_ASSERT_CHECKING)
+#define pg_unreachable_int() __builtin_unreachable()
+#elif defined(_MSC_VER) && !defined(USE_ASSERT_CHECKING)
+#define pg_unreachable_int() __assume(0)
+#else
+#define pg_unreachable_int() abort()
+#endif
+
+#define pg_unreachable() \
+	do { \
+		if (pr_during_redo) \
+			longjmp(pr_jmpbuf, 1); \
+		else \
+			pg_unreachable_int(); \
+	}while(0)
+
+#endif /* PR_IGNORE_REPLAY_ERROR */
 
 /*
  * Hints to the compiler about the likelihood of a branch. Both likely() and
@@ -1360,5 +1385,10 @@ typedef intptr_t sigjmp_buf[5];
 
 /* /port compatibility functions */
 #include "port.h"
+
+/* PR_IGNORE_REPLAY_ERROR */
+#ifdef PR_IGNORE_REPLAY_ERROR
+extern bool pr_during_redo;
+#endif
 
 #endif							/* C_H */
