@@ -88,10 +88,16 @@ int		num_preplay_max_txn;		/* If less than max_connections, max_connections will
 
 /*
  * Flag to ignore error during parallel replay.
+ *
+ * Please note:
+ *	To make this, we need to change the behavior of elog() series of functions (in fact, pg_unreachable()),
+ *	This is done in "c.h" header files.
  */
 #ifdef PR_IGNORE_REPLAY_ERROR
 bool	pr_during_redo;
 jmp_buf	pr_jmpbuf;
+
+static void set_sigsegv_handler(void);
 #endif
 
 /*
@@ -3649,6 +3655,10 @@ invalidPageWorkerLoop(void)
 		PRDebug_log("Fetched\n");
 		dump_invalidPageData(page);
 #endif
+#ifdef PR_IGNORE_REPLAY_ERROR
+		PR_freeBuffer(page, true);
+		continue;
+#endif
 		switch(page->cmd)
 		{
 			case PR_LOG:
@@ -3707,6 +3717,7 @@ blockWorkerLoop(void)
 #endif
 #ifdef PR_IGNORE_REPLAY_ERROR
 	pr_during_redo = false;
+	set_sigsegv_handler();
 #endif
 	for (;;)
 	{
@@ -3767,9 +3778,16 @@ blockWorkerLoop(void)
 #ifdef PR_IGNORE_REPLAY_ERROR
 			pr_during_redo = true;
 			if (!setjmp(pr_jmpbuf))
+			{
 #endif
 			RmgrTable[record->xl_rmid].rm_redo(data->reader);
 #ifdef PR_IGNORE_REPLAY_ERROR
+			}
+#ifdef WAL_DEBUG
+			else
+				PRDebug_log("Error in replay function, ser_no: %ld, XLogRecord: %s",
+						data->reader->ser_no, data->reader->xlog_string);
+#endif
 			pr_during_redo = false;
 #endif
 
@@ -3883,6 +3901,7 @@ txnWorkerLoop(void)
 #endif
 #ifdef PR_IGNORE_REPLAY_ERROR
 	pr_during_redo = false;
+	set_sigsegv_handler();
 #endif
 	for (;;)
 	{
@@ -4220,3 +4239,35 @@ dispatchDataToXLogHistory(XLogDispatchData_PR *dispatch_data)
 	dispatch_data->xlog_history_el = el;
 }
 
+/*
+ * Handler for SIGSEGV, to isgnore this signal while in the replay process.   If not, then restore
+ * the action to old state and signal SIGSEGV to myself.
+ *
+ * Due to ignorance of elog() for ERROR or higher error level, sugsequent redo routines may encounter
+ * SIGSEGV due to inconsistent values in pages and other internal inforamtion.   To keep replay running
+ * just for scalability estimation, we need to ignore such signal while redo code is running.
+ *
+ * If SIGSEGV occurs outside the redo routine, we need to handle this in usual way.
+ */
+
+#ifdef PR_IGNORE_REPLAY_ERROR
+static pqsigfunc	oldfunc;
+
+static void sigsegv_handler(int signo)
+{
+	Assert(signo == SIGSEGV);
+
+	if (pr_during_redo)
+		longjmp(pr_jmpbuf, 1);
+	else
+	{
+		pqsignal(SIGSEGV, oldfunc);
+		kill(getpid(), SIGSEGV);
+	}
+}
+
+static void set_sigsegv_handler(void)
+{
+	oldfunc = pqsignal(SIGSEGV, sigsegv_handler);
+}
+#endif
