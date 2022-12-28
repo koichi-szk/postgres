@@ -487,7 +487,7 @@ PR_recvSync(void)
 static bool
 set_syncFlag(int worker_id, uint32 flag_to_set)
 {
-	Assert (worker_id != my_worker_id);
+	Assert (worker_id != my_worker_idx);
 
 	SpinLockAcquire(&pr_worker[worker_id].slock);
 	if (pr_worker[worker_id].wait_dispatch)
@@ -752,7 +752,7 @@ PR_initShm(void)
 	Size	my_worker_sz;
 	Size	my_queue_sz;
 
-	Assert(my_worker_idx == PR_READER_WORKER);
+	Assert(my_worker_idx == PR_READER_WORKER_IDX);
 
 	my_shm_size = pr_sizeof(PR_shm)
 #ifdef WAL_DEBUG
@@ -1065,7 +1065,7 @@ removeDispatchDataFromTxn(XLogDispatchData_PR *dispatch_data, bool need_lock)
 	else if (dispatch_data->prev)
 	{
 		/* Tail */
-		Assert(dispatchh_data == txn_cell->tail);
+		Assert(dispatch_data == txn_cell->tail);
 		dispatch_data->prev->next = NULL;
 		txn_cell->tail = dispatch_data->prev;
 	}
