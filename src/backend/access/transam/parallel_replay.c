@@ -128,6 +128,7 @@ static char	*buffer_dump_data;
 static int           my_worker_idx = 0;         /* Index of the worker.  Set when the worker starts. */
 static PR_worker    *my_worker = NULL;      	/* My worker structure */
 
+#ifdef WAL_DEBUG
 /* For test code */
 /*
  * Mainly usage:
@@ -143,6 +144,8 @@ static char	*debug_log_dir = NULL;
 static char	*debug_log_file_path = NULL;
 static char	*debug_log_file_link = NULL;
 static int	 my_worker_idx;
+
+#endif
 
 /* Module-global definition */
 #define PR_MAXPATHLEN	512
@@ -3056,6 +3059,7 @@ concat_prev_chunk(PR_BufChunk *chunk)
 	return prev;
 }
 
+#ifdef WAL_DEBUG
 /*
  ******************************************************************************************************
  *
@@ -3404,8 +3408,6 @@ PRDebug_finish(void)
 		debug_log_file_link = NULL;
 	}
 }
-
-#ifdef WAL_DEBUG
 
 /*
  * Intended to ba called from XtartupXLOG() for the test of buffer allocation/free.
