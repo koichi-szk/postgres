@@ -7713,8 +7713,10 @@ StartupXLOG(void)
 				PR_WorkerFinish();
 				PR_finishShm();
 				PR_syncFinishSockDir();
+#ifdef WAL_DEBUG
 				if (PR_test)
 					PRDebug_finish();
+#endif
 				/*
 				 * We need to call this here to check all the outstanding WAL
 				 * replay not found in the previous call.
