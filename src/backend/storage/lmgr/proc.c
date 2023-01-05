@@ -156,9 +156,7 @@ ProcGlobalSemas(void)
  * pointers must be propagated specially for EXEC_BACKEND operation.
  */
 
-#ifdef WAL_DEBUG
 uint32 aux_proc_num = 0;
-#endif
 
 void
 InitProcGlobal(void)
