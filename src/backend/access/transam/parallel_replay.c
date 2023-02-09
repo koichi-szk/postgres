@@ -18,6 +18,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#ifdef PR_SKIP_REPLAY
+#include <stdlib.h>
+#endif
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -284,6 +287,11 @@ static int txnWorkerLoop(void);
 static int invalidPageWorkerLoop(void);
 static int blockWorkerLoop(void);
 
+/* REDO function */
+
+static void PR_redo(XLogDispatchData_PR	*data);
+
+
 /* Test code */
 #ifdef WAL_DEBUG
 static void PRDebug_out(StringInfo s);
@@ -293,6 +301,19 @@ static char *now_timeofday(void);
 static void dump_invalidPageData(XLogInvalidPageData_PR *page);
 static char *forkNumName(ForkNumber forknum);
 static char *invalidPageCmdName(PR_invalidPageCheckCmd cmd);
+#endif
+
+#ifdef PR_SKIP_REPLAY
+static unsigned int	pr_rand_seed;
+static void init_wait_time(void)
+{
+	pr_rand_seed = (unsigned int)my_worker_idx;
+}
+#define MAXWAIT 1000L
+static void wait_a_bit(void)
+{
+	pg_usleep(((long)rand_r(&pr_rand_seed)) % MAXWAIT);
+}
 #endif
 
 /*
@@ -3632,7 +3653,7 @@ invalidPageWorkerLoop(void)
 
 #ifdef WAL_DEBUG
 	PRDebug_log("Started %s()\n", __func__);
-#endif
+#endif /* WAL_DEBUG */
 
 	SpinLockAcquire(&my_worker->slock);
 	my_worker->handledRecPtr = 0;
@@ -3642,7 +3663,7 @@ invalidPageWorkerLoop(void)
 	{
 #ifdef WAL_DEBUG
 		PRDebug_log("Fetching queue\n");
-#endif
+#endif /* WAL_DEBUG */
 		el = PR_fetchQueue();
 		if (el == NULL)
 			break;	/* Process termination request */
@@ -3656,11 +3677,11 @@ invalidPageWorkerLoop(void)
 #ifdef WAL_DEBUG
 		PRDebug_log("Fetched\n");
 		dump_invalidPageData(page);
-#endif
+#endif	/* WAL_DEBUG */
 #ifdef PR_IGNORE_REPLAY_ERROR
 		PR_freeBuffer(page, true);
 		continue;
-#endif
+#endif /* PR_IGNORE_REPLAY_ERROR */
 		switch(page->cmd)
 		{
 			case PR_LOG:
@@ -3691,7 +3712,7 @@ invalidPageWorkerLoop(void)
 	}
 #ifdef WAL_DEBUG
 	PRDebug_log("Terminating %s()\n", __func__);
-#endif
+#endif /* WAL_DEBUG */
 	return loop_exit_code;
 }
 
@@ -3707,7 +3728,6 @@ blockWorkerLoop(void)
 {
 	PR_queue_el	*el;
 	XLogDispatchData_PR	*data;
-	XLogRecord	*record;
 	int		*worker_list;
 #ifdef WAL_DEBUG
 	int		 sync_worker;
@@ -3716,18 +3736,21 @@ blockWorkerLoop(void)
 	
 #ifdef WAL_DEBUG
 	PRDebug_log("Started %s()\n", __func__);
-#endif
+#endif /* WAL_DEBUG */
 #ifdef PR_IGNORE_REPLAY_ERROR
 	pr_during_redo = false;
 	set_sigsegv_handler();
-#endif
+#endif	/* PR_IGNORE_REPLAY_ERROR */
+#ifdef PR_SKIP_REPLAY
+	init_wait_time();
+#endif	/* PR_SKIP_REPLAY */
 	for (;;)
 	{
 		XLogRecPtr	currRecPtr;
 
 #ifdef WAL_DEBUG
 		PRDebug_log("Fetching queue\n");
-#endif
+#endif	/* WAL_DEBUG */
 		el = PR_fetchQueue();
 		if (el == NULL)
 			break;	/* Process termination request */
@@ -3744,7 +3767,7 @@ blockWorkerLoop(void)
 
 #ifdef WAL_DEBUG
 		PRDebug_log("Fetched: ser_no: %ld, xlogrecord: \"%s\"\n", data->reader->ser_no, data->reader->xlog_string);
-#endif
+#endif	/* WAL_DEBUG */
 		data->n_remaining--;
 		currRecPtr = data->reader->ReadRecPtr;
 
@@ -3756,11 +3779,11 @@ blockWorkerLoop(void)
 #ifdef WAL_DEBUG
 			PRDebug_log("Xlogrecord is assigned to multiple worker.  Waiting for other workers to finish.\n");
 			sync_worker =
-#endif
+#endif	/* WAL_DEBUG */
 			PR_recvSync();
 #ifdef WAL_DEBUG
 			PRDebug_log("Sync reeived from the worker (%d).\n", sync_worker);
-#endif
+#endif	/* WAL_DEBUG */
 		}
 		else
 		{
@@ -3769,36 +3792,16 @@ blockWorkerLoop(void)
 			/* Dequeue */
 
 			/* OK. I should handle this. Nobody is handling this and safe to release the lock. */
-			record = data->reader->record;
+
 			SpinLockRelease(&data->slock);
 
-#ifdef WAL_DEBUG
-			PRDebug_log("Now I can replay the XLOGRecord.\n");
-#endif
 			/* REDO */
 
-#ifdef PR_IGNORE_REPLAY_ERROR
-			pr_during_redo = true;
-			if (!setjmp(pr_jmpbuf))
-			{
-#endif
-			RmgrTable[record->xl_rmid].rm_redo(data->reader);
-#ifdef PR_IGNORE_REPLAY_ERROR
-			}
-#ifdef WAL_DEBUG
-			else
-				PRDebug_log("Error in replay function, ser_no: %ld, XLogRecord: %s",
-						data->reader->ser_no, data->reader->xlog_string);
-#endif
-			pr_during_redo = false;
-#endif
+			PR_redo(data);
 
-#ifdef WAL_DEBUG
-			PRDebug_log("Replay DONE. Ser_no(%ld)\n", data->reader->ser_no);
-#endif
 			/* Koichi: TBD: ここで、XLogHistory と txn history の更新を行うこと */
 			
-			if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
+			if ((data->reader->record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
 				checkXLogConsistency(data->reader);
 
 			/*
@@ -3905,6 +3908,9 @@ txnWorkerLoop(void)
 	pr_during_redo = false;
 	set_sigsegv_handler();
 #endif
+#ifdef PR_SKIP_REPLAY
+	init_wait_time();
+#endif	/* PR_SKIP_REPLAY */
 	for (;;)
 	{
 		XLogRecPtr	currRecPtr;
@@ -3947,21 +3953,10 @@ txnWorkerLoop(void)
 			/* Deallocate the trancaction cell */
 			free_txn_cell(txn_cell, true);
 		}
-		/* Now apply the WAL record itself */
-#ifdef WAL_DEBUG
-		PRDebug_log("Ser no (%ld), Replaying: \"%s\"\n", xlogreader->ser_no, xlogreader->xlog_string);
-#endif
-#ifdef PR_IGNORE_REPLAY_ERROR
-		pr_during_redo = true;
-		if (!setjmp(pr_jmpbuf))
-#endif
-		RmgrTable[record->xl_rmid].rm_redo(xlogreader);
-#ifdef PR_IGNORE_REPLAY_ERROR
-		pr_during_redo = false;
-#endif
-#ifdef WAL_DEBUG
-		PRDebug_log("Replay done. Ser_no(%ld).\n", xlogreader->ser_no);
-#endif
+
+		/* REDO */
+
+		PR_redo(dispatch_data);
 
 		/*
 		 * After redo, check whether the backup pages associated with
@@ -4224,6 +4219,44 @@ dispatcherWorkerLoop(void)
 	PRDebug_log("Terminating %s()\n", __func__);
 #endif
 	return loop_exit_code;
+}
+
+/*
+ * Body of REDO, with various debug facility
+ */
+static void
+PR_redo(XLogDispatchData_PR	*data)
+{
+#ifdef WAL_DEBUG
+	PRDebug_log("Now I can replay the XLOGRecord.\n");
+#endif	/* WAL_DEBUG */
+
+	/* REDO */
+
+#ifdef PR_SKIP_REPLAY
+	wait_a_bit();
+	return;
+#else	/* PR_SKIP_REPLAY */
+#ifdef PR_IGNORE_REPLAY_ERROR
+	pr_during_redo = true;
+	if (!setjmp(pr_jmpbuf))
+	{
+#endif	/* PR_IGNORE_REPLAY_ERROR */
+	RmgrTable[data->reader->record->xl_rmid].rm_redo(data->reader);
+#ifdef PR_IGNORE_REPLAY_ERROR
+	}
+#ifdef WAL_DEBUG
+	else
+		PRDebug_log("Error in replay function, ser_no: %ld, XLogRecord: %s",
+				data->reader->ser_no, data->reader->xlog_string);
+#endif	/* WAL_DEBUG */
+	pr_during_redo = false;
+#endif	/* PR_IGNORE_REPLAY_ERROR */
+#endif	/* PR_SKIP_REPLAY */
+
+#ifdef WAL_DEBUG
+	PRDebug_log("Replay DONE. Ser_no(%ld)\n", data->reader->ser_no);
+#endif	/* WAL_DEBUG */
 }
 
 /*
