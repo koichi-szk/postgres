@@ -101,7 +101,9 @@ struct PR_shm
 	PR_XLogHistory	*history;
 	PR_queue	*queue;
 	PR_buffer	*buffer;
-	slock_t		slock;			/* Spin lock for EndRecPtr and MinTimeLineID */
+	bool		*worker_wait;	/* Used by PR_recv_sync() to detect deadlock among workers. */
+	slock_t		slock;			/* Spin lock for EndRecPtrand MinTimeLineID */
+	slock_t		wait_flag_lock;	/* Spin lock for PR_recvSync() */
 	bool		some_failed;	/* Indicates if some worker failed and exited. */
 	XLogRecPtr	EndRecPtr;		/* Minimum EndRecPtr among workers */
 	TimeLineID  MinTimeLineID;	/* Min Timeline ID among workers */
@@ -125,8 +127,9 @@ struct PR_invalidPages
  */
 struct PR_XLogHistory
 {
-	PR_XLogHistory_el	*hist_head;
-	PR_XLogHistory_el	*hist_end;	/* Last + 1 */
+	PR_XLogHistory_el	*hist_element;	/* List of the history element */
+	unsigned long		 hist_count;	/* Count of the update of whole history */
+	int					 num_elements;	/* Number of occupied elements.  Initial: 0. */
 	slock_t		 slock;
 };
 
@@ -164,6 +167,7 @@ typedef struct PR_worker
 	bool	 	wait_dispatch;	/* Flag to indicate the worker is waiting for xlogrec to handle */
 								/* Dispatcher check this and sync. */
 	bool		worker_failed;	/* Indicates this worker failed and exited. */
+	bool		worker_waiting;	/* Flag to indicate the work is waiting for sync.  Protected by pr_shm->wait_flag_lock. */
 	unsigned	flags;			/* Indicates instructions from outside */
 	XLogRecPtr	assignedRecPtr;	/* Latest assigned XLOG record ptr. */
 								/* Set by enqueue side worker. */
@@ -218,6 +222,12 @@ typedef struct PR_worker
 #define PR_INVALID_PAGE_WORKER_IDX	3
 #define PR_BLK_WORKER_MIN_IDX		4
 #define PR_IS_BLK_WORKER_IDX(i)		((i) >= PR_BLK_WORKER_MIN_IDX)
+
+/*
+ * Sync timeout between workers: at present 1sec.
+ */
+#define PR_SYNC_TIMEOUT_SEC		1
+#define PR_SYNC_TIMEOUT_USEC	0
 
 
 /*
@@ -416,8 +426,10 @@ struct PR_buffer
 	Size		 area_size;			/* Exluding this buffer */
 	slock_t		 slock;				/* For allocation/free operation */
 #ifdef WAL_DEBUG
+	bool		 dump_opt;			/* Control to dump buffer area or not, control in debugging. */
 	uint64		 update_sno;
 #endif
+	uint64		 curr_sno;			/* Serial No. for the chunk */
 	void		*head;				/* Start of the area: Initialized and then static */
 	void		*tail;				/* Next of the end of the area: Initialized and then static */
 	void		*alloc_start;		/* Can allocate from here. */
@@ -433,8 +445,9 @@ struct PR_BufChunk
 	 * XLogRec is stored between these.
 	 */
 	 
-	Size		size;	/* Whole chunk size */
+	Size		size;	/* Whole chunk size, including this header */
 	uint64		magic;
+	uint64		sno;	/* Serial number of the chunk. Cout from the start */
 	char		data[0];
 	/*
 	 * The trailor appears after the data[].

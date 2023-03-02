@@ -6492,6 +6492,9 @@ CheckRequiredParameterValues(void)
 	}
 }
 
+int PR_loop_num = 0;
+int PR_loop_count = 0;
+
 /*
  * This must be called ONCE during postmaster or standalone-backend startup
  */
@@ -7606,18 +7609,22 @@ StartupXLOG(void)
 					XLogReaderStateCleanupDecodedData(xlogreader, false);
 #ifdef WAL_DEBUG
 					xlogreader_PR->ser_no = ++ser_no;
-#endif
-#ifdef WAL_DEBUG
+
 					xlogreader_PR->xlog_string = xlog_string;
 
 					PRDebug_log("========================================================================================================\n");
 					PRDebug_log("Enqueue, ser_no(%ld) to %s, XLOGrecord: \"%s\"\n",
 							ser_no, PR_worker_name(PR_DISPATCHER_WORKER_IDX, workername), xlogreader_PR->xlog_string);
-#define	PR_ITER_NUM 10
-					if (ser_no && (ser_no % PR_ITER_NUM == 0))
+
+					if (PR_loop_count >= PR_loop_num)
+					{
+						PR_loop_count = 0;
 						PR_breakpoint();
-#undef PR_ITER_NUM
+					}
+					else
+						PR_loop_count++;
 #endif
+
 					PR_enqueue(xlogreader_PR, ReaderState, PR_DISPATCHER_WORKER_IDX);
 #ifdef WAL_DEBUG
 					PRDebug_log("Enqueue done, ser_no(%ld)\n", ser_no);
