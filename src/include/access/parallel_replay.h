@@ -100,9 +100,8 @@ struct PR_shm
 	PR_XLogHistory	*history;
 	PR_queue	*queue;
 	PR_buffer	*buffer;
-	bool		*worker_wait;	/* Used by PR_recv_sync() to detect deadlock among workers. */
-	slock_t		slock;			/* Spin lock for EndRecPtrand MinTimeLineID */
-	slock_t		sync_lock;		/* Spin lock for PR_recvSync() */
+	slock_t		shm_slock;			/* Spin lock for EndRecPtrand MinTimeLineID */
+	slock_t		sync_lock;		/* Spin lock for PR_recvSync(). Protects worker->worker_waiting */
 	bool		some_failed;	/* Indicates if some worker failed and exited. */
 	XLogRecPtr	EndRecPtr;		/* Minimum EndRecPtr among workers */
 	TimeLineID  MinTimeLineID;	/* Min Timeline ID among workers */
@@ -216,6 +215,8 @@ struct PR_txn_info
 {
 	PR_txn_hash_entry	*txn_hash;		/* Hash */
 	PR_txn_cell			*cell_pool;		/* Cell pool */
+	PR_txn_cell			*cell_head;
+	PR_txn_cell			*cell_tail;
 	slock_t				 cell_slock;	/* Slock for cell pool */
 };
 
@@ -237,8 +238,7 @@ struct PR_txn_cell
 	PR_txn_cell			*next;
 	PR_txn_cell			*prev;					/* Used only when the cell is from PR_txn_hash_entry */
 	TransactionId		 xid;
-												/* this is sreset to invalidXLogRecPtr. */
-	int					 blk_walker_to_wait;	/* Indicates id of the block worker which txn worker is waiting for. */
+	int					 blk_worker_to_wait;	/* Indicates id of the block worker which txn worker is waiting for. */
 												/* If TXN worker is waiting for specific block worker to finish assigned LSN, */
 												/* TXN worker specifies worker id of such BLOCK worker. (if not waiting for */
 												/* any, */

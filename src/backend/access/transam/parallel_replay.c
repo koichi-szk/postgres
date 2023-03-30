@@ -202,8 +202,8 @@ static char	 my_worker_msg[PR_SYNC_MSG_SZ + 1];
 static Size	 my_worker_msg_sz = 0;
 
 /* Lock macro */
-#define lock_shm()		SpinLockAcquire(&pr_shm->slock)
-#define unlock_shm()	SpinLockRelease(&pr_shm->slock)
+#define lock_shm()		SpinLockAcquire(&pr_shm->shm_slock)
+#define unlock_shm()	SpinLockRelease(&pr_shm->shm_slock)
 #define lock_sync_status()		SpinLockAcquire(&pr_shm->sync_lock)
 #define unlock_sync_status()	SpinLockRelease(&pr_shm->sync_lock)
 
@@ -324,7 +324,7 @@ static void dump_xlog_history(StringInfo s, bool need_lock);
 
 #define NUM_HASH_ENTRY_FACTOR 10
 #define num_hash_entry   (num_preplay_max_txn/NUM_HASH_ENTRY_FACTOR)
-#define txn_cell_size()    (pr_sizeof(PR_txn_cell) + (sizeof(XLogRecPtr) * (num_preplay_workers - PR_BLK_WORKER_MIN_IDX)))
+#define txn_cell_size()    (pr_sizeof(PR_txn_cell) + (pr_sizeof(XLogRecPtr) * (num_preplay_workers - PR_BLK_WORKER_MIN_IDX)))
 #define get_txn_hash(xid) (&pr_txn_hash_entry[xid%num_hash_entry])
 #define lock_txn_hash(xid)		SpinLockAcquire(&(get_txn_hash(xid)->slock))
 #define unlock_txn_hash(xid)	SpinLockRelease(&(get_txn_hash(xid)->slock))
@@ -909,7 +909,7 @@ PR_initShm(void)
 	pr_shm->EndRecPtr = InvalidXLogRecPtr;
 	pr_shm->MinTimeLineID = 0;
 
-	SpinLockInit(&pr_shm->slock);
+	SpinLockInit(&pr_shm->shm_slock);
 
 	init_txn_hash();
 	initXLogHistory();
@@ -970,7 +970,8 @@ static void
 init_txn_hash(void)
 {
 	int	ii, jj;
-	PR_txn_cell			*cell_pool;
+	PR_txn_cell			*pooled_cell;
+	PR_txn_cell			*prev_cell;
 	PR_txn_hash_entry	*txn_hash_entry;
 
 
@@ -990,25 +991,27 @@ init_txn_hash(void)
 	txn_cell_head = pr_txn_info->cell_pool;
 #endif
 	/* Initialize TXN cell pool */
-	for (ii = 0, cell_pool = pr_txn_info->cell_pool; ii < num_preplay_max_txn; ii++)
+	/* Koichi バグめっけ！ cell pool のサイズは BLK Worker のサイズで決まるので、単純に添字でアドレスを解決してはいけないのだ */
+	for (ii = 0, pooled_cell = pr_txn_info->cell_pool; ii < num_preplay_max_txn; ii++, pooled_cell = pooled_cell->next)
 	{
-		XLogRecPtr *lastLSN;
+		XLogRecPtr *lastLSN_array;
 
-		cell_pool[ii].next = &cell_pool[ii+1];
-		cell_pool[ii].prev = NULL;
-		cell_pool[ii].xid = InvalidTransactionId;
-		cell_pool[ii].blk_walker_to_wait = 0;
-		lastLSN = & cell_pool[ii].lastXLogLSN[0];
+		prev_cell = pooled_cell;
+		pooled_cell->next = addr_forward(pooled_cell, txn_cell_size());
+		pooled_cell->prev = NULL;
+		pooled_cell->xid = InvalidTransactionId;
+		pooled_cell->blk_worker_to_wait = 0;
+		lastLSN_array = &(pooled_cell->lastXLogLSN[0]);
 
 		/* Initialize last LSN array */
 		for (jj = 0; jj < (num_preplay_workers - PR_BLK_WORKER_MIN_IDX); jj++)
-			lastLSN[jj] = InvalidXLogRecPtr;
+			lastLSN_array[jj] = InvalidXLogRecPtr;
 
 	}
-	cell_pool[num_preplay_max_txn - 1].next = NULL;
+	prev_cell->next = NULL;
 
 #ifdef WAL_DEBUG
-	txn_cell_tail = &cell_pool[num_preplay_max_txn - 1];
+	txn_cell_tail = addr_forward(prev_cell, txn_cell_size());
 #endif
 
 }
@@ -1023,17 +1026,38 @@ static PR_txn_cell *
 get_txn_cell(bool need_lock)
 {
 	PR_txn_cell	*rv;
+#ifdef WAL_DEBUG
+	static long my_count = 0;
 
+	my_count++;
+#endif
 	if (need_lock)
 		lock_txn_pool();
+#ifdef WAL_DEBUG
+	if (pr_txn_cell_pool->next == NULL)
+		PR_error_here();
+#endif
 	rv = pr_txn_cell_pool->next;
 	if (rv)
 	{
+#ifdef WAL_DEBUG
+		if (rv && (addr_before(rv, txn_cell_head) || addr_after_eq(rv, txn_cell_tail)))
+		{
+			PRDebug_log("%s(), my_count: %ld, return value %p is out of bounds, txn_cell_head: %p, txn_cell_tail: %p\n",
+					__func__, my_count, rv, txn_cell_head, txn_cell_tail);
+			PR_error_here();
+		}
+#endif
 		pr_txn_cell_pool->next = rv->next;
 		rv->next = NULL;
 	}
 	if (need_lock)
 		unlock_txn_pool();
+
+#ifdef WAL_DEBUG
+	if (rv == NULL)
+		PR_error_here();
+#endif
 	return rv;
 }
 
@@ -1045,7 +1069,7 @@ free_txn_cell(PR_txn_cell *txn_cell, bool need_lock)
 {
 	PR_txn_hash_entry	*hash_entry;
 	TransactionId		 xid;
-	XLogRecPtr		    *lastLSN;
+	XLogRecPtr		    *lastLSN_array;
 	int	ii;
 
 #ifdef WAL_DEBUG
@@ -1055,7 +1079,6 @@ free_txn_cell(PR_txn_cell *txn_cell, bool need_lock)
 		PR_error_here();
 	}
 #endif
-			
 
 	xid = txn_cell->xid;
 	hash_entry = get_txn_hash(xid);
@@ -1095,10 +1118,10 @@ free_txn_cell(PR_txn_cell *txn_cell, bool need_lock)
 
 	/* Reset the cell */
 	txn_cell->xid = InvalidTransactionId;
-	txn_cell->blk_walker_to_wait = 0;
-	lastLSN = &txn_cell->lastXLogLSN[0];
+	txn_cell->blk_worker_to_wait = 0;
+	lastLSN_array= &txn_cell->lastXLogLSN[0];
 	for (ii = 0; ii < (num_preplay_workers - PR_BLK_WORKER_MIN_IDX); ii++)
-		lastLSN[ii] = InvalidXLogRecPtr;
+		lastLSN_array[ii] = InvalidXLogRecPtr;
 
 	/* Return the cell to cell pool */
 	if (need_lock)
@@ -1123,6 +1146,9 @@ find_txn_cell(TransactionId xid, bool create, bool need_lock, bool *created)
 
 	Assert(created);
 
+#ifdef WAL_DEBUG
+	PRDebug_log("%s(xid: %d, create: %s)\n", __func__, xid, create == true ? "true" : "false");
+#endif
 	*created = false;
 
 	hash_entry = get_txn_hash(xid);
@@ -1130,6 +1156,14 @@ find_txn_cell(TransactionId xid, bool create, bool need_lock, bool *created)
 		lock_txn_hash(xid);
 	for (txn_cell = hash_entry->head; txn_cell; txn_cell = txn_cell->next)
 	{
+#ifdef WAL_DEBUG
+		if (addr_before(txn_cell, txn_cell_head) || addr_after_eq(txn_cell, txn_cell_tail))
+		{
+			PRDebug_log("%s(), txn_cell(%p) out of bounds, txn_cell_head: %p, txn_cell_tail: %p.\n",
+					__func__, txn_cell, txn_cell_head, txn_cell_tail);
+			PR_error_here();
+		}
+#endif
 		if (txn_cell->xid == xid)
 			goto return_value;
 	}
@@ -1146,6 +1180,14 @@ find_txn_cell(TransactionId xid, bool create, bool need_lock, bool *created)
 
 	txn_cell = get_txn_cell(need_lock);
 
+#ifdef WAL_DEBUG
+	if (txn_cell == NULL)
+	{
+		PRDebug_log("%s(%d, true) returning NULL.\n", __func__, xid);
+		PR_error_here();
+	}
+#endif
+
 	if (need_lock)
 		lock_txn_hash(xid);
 
@@ -1154,7 +1196,7 @@ find_txn_cell(TransactionId xid, bool create, bool need_lock, bool *created)
 
 	/* Initialize the cell data */
 	txn_cell->xid = xid;
-	txn_cell->blk_walker_to_wait = 0;
+	txn_cell->blk_worker_to_wait = 0;
 	for (ii = 0; ii < (num_preplay_workers - PR_BLK_WORKER_MIN_IDX); ii++)
 	{
 		txn_cell->lastXLogLSN[ii] = InvalidXLogRecPtr;
@@ -1176,18 +1218,25 @@ find_txn_cell(TransactionId xid, bool create, bool need_lock, bool *created)
 		txn_cell->next = NULL;
 		hash_entry->tail = txn_cell;
 	}
+	*created = true;
 	goto return_value;
 
 return_null:
 	if (need_lock)
 		unlock_txn_hash(xid);
 	*created = false;
+#ifdef WAL_DEBUG
+	PRDebug_log("%s(): returning NULL.\n", __func__);
+#endif
 	return NULL;
 
 return_value:
 	if (need_lock)
 		unlock_txn_hash(xid);
-	*created = true;
+
+#ifdef WAL_DEBUG
+	PRDebug_log("%s(): returning %p, created: %s\n", __func__, txn_cell, *created == true ? "true" : "false");
+#endif
 	return txn_cell;
 
 }
@@ -1263,7 +1312,7 @@ freeDispatchData(XLogDispatchData_PR *dispatch_data, bool need_lock)
 		 */
 		for (ii = 0; ii <= dispatch_data->reader->max_block_id; ii++)
 		{
-			if (dispatch_data->reader->blocks[ii].has_data)
+			if (dispatch_data->reader->blocks[ii].data)
 			{
 #ifdef WAL_DEBUG
 				appendStringInfo(s, "blk: %d: ", ii);
@@ -1306,8 +1355,8 @@ static StringInfo
 dump_txn_cell(StringInfo s, PR_txn_cell *txn_cell)
 {
 	int	ii;
-	appendStringInfo(s, "Transaction Cell: xid: %d, next: %p, prev: %p, blk_walker_to_wait: %d\n\t",
-			txn_cell->xid, txn_cell->next, txn_cell->prev, txn_cell->blk_walker_to_wait);
+	appendStringInfo(s, "Transaction Cell: xid: %d, next: %p, prev: %p, blk_worker_to_wait: %d\n\t",
+			txn_cell->xid, txn_cell->next, txn_cell->prev, txn_cell->blk_worker_to_wait);
 	for (ii = 0; ii < (num_preplay_workers - PR_BLK_WORKER_MIN_IDX); ii++)
 		appendStringInfo(s, "lastXLogLSN[%d]: %016lx, ", ii, txn_cell->lastXLogLSN[ii]);
 	appendStringInfoChar(s, '\n');
@@ -1421,10 +1470,10 @@ updateTxnInfoAfterReplay(TransactionId xid, XLogRecPtr lsn, bool need_lock)
 	{
 		/* OK. This is the last LSN assigned to me in the list */
 		txn_cell->lastXLogLSN[my_worker_idx - PR_BLK_WORKER_MIN_IDX] = InvalidXLogRecPtr;
-		if (txn_cell->blk_walker_to_wait == my_worker_idx)
+		if (txn_cell->blk_worker_to_wait == my_worker_idx)
 		{
 			/* TXN worker is waiting for me */
-			txn_cell->blk_walker_to_wait = 0;
+			txn_cell->blk_worker_to_wait = 0;
 			if (need_lock)
 				unlock_txn_hash(xid);
 			PR_sendSync(PR_TXN_WORKER_IDX);
@@ -2062,9 +2111,9 @@ initQueueElement(void)
 		el->next = el + 1;
 		el->data_type = Init;
 		el->data = NULL;
-		if (ii == (num_preplay_worker_queue - 1))
-			el->next = NULL;
 	}
+	el--;
+	el->next = NULL;
 }
 
 static PR_queue_el *
@@ -2934,7 +2983,7 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	}
 
 	if (need_lock)
-		SpinLockRelease(&pr_buffer->slock);
+		unlock_buffer();
 	/*
 	 * Now all the relevant spin locks were released.  Safe to send sync.
 	 */
@@ -3851,6 +3900,7 @@ invalidPageWorkerLoop(void)
 			unlock_my_worker();
 
 			PR_sendSync(el->source_worker);
+			PR_freeBuffer(page, true);
 
 			break;	/* Process termination request */
 		}
@@ -3955,6 +4005,7 @@ blockWorkerLoop(void)
 			unlock_my_worker();
 
 			PR_sendSync(el->source_worker);
+			PR_freeQueueElement(el);
 
 			break;	/* Process termination request */
 		}
@@ -4112,6 +4163,7 @@ txnWorkerLoop(void)
 			unlock_my_worker();
 
 			PR_sendSync(el->source_worker);
+			PR_freeQueueElement(el);
 
 			break;	/* Process termination request */
 		}
@@ -4125,6 +4177,7 @@ txnWorkerLoop(void)
 #ifdef WAL_DEBUG
 		PRDebug_log("Fetched: ser_no: %ld, xlogrecord: \"%s\"\n", dispatch_data->reader->ser_no, dispatch_data->reader->xlog_string);
 #endif
+		PR_freeQueueElement(el);
 		xlogreader = DispatchDataGetReader(dispatch_data);
 		record = DispatchDataGetRecord(dispatch_data);
 		currRecPtr = DispatchDataGetLSN(dispatch_data);
@@ -4289,7 +4342,7 @@ syncTxn_blockWorker(PR_txn_cell *txn_cell)
 
 		if (txn_cell->lastXLogLSN[ii] != InvalidXLogRecPtr)
 		{
-			txn_cell->blk_walker_to_wait = ii + PR_BLK_WORKER_MIN_IDX;
+			txn_cell->blk_worker_to_wait = ii + PR_BLK_WORKER_MIN_IDX;
 			unlock_txn_hash(xid);
 #ifdef WAL_DEBUG
 			PRDebug_log("Waiting for BLK WORKER(%d) (worker_id %d) to replay %016lx WAL record.\n",
@@ -4310,6 +4363,8 @@ syncTxn_blockWorker(PR_txn_cell *txn_cell)
  * Dispatcher worker
  *************************************************************************************************************
  */
+
+long PR_handled_wal_records = 0;
 
 static int
 dispatcherWorkerLoop(void)
@@ -4346,6 +4401,7 @@ dispatcherWorkerLoop(void)
 
 			PR_sendSync(el->source_worker);
 			PR_freeQueueElement(el);
+
 			break;	/* Process termination request */
 		}
 		else if (el->data_type != ReaderState)
@@ -4378,6 +4434,7 @@ dispatcherWorkerLoop(void)
 		lock_my_worker();
 		my_worker->handledRecPtr = currRecPtr;
 		unlock_my_worker();
+		PR_handled_wal_records++;
 	}
 #ifdef WAL_DEBUG
 	PRDebug_log("Terminating %s()\n", __func__);
