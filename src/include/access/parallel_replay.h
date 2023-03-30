@@ -11,7 +11,6 @@
  */
 #ifndef PARALLEL_REPLAY_H
 #define PARALLEL_REPLAY_H
-
 #ifdef PR_IGNORE_REPLAY_ERROR
 #include <setjmp.h>
 extern	jmp_buf	pr_jmpbuf;
@@ -19,6 +18,7 @@ extern	jmp_buf	pr_jmpbuf;
 
 #include "postgres.h"
 
+#include "lib/stringinfo.h"
 #include "storage/block.h"
 #include "storage/relfilenode.h"
 #include "storage/spin.h"
@@ -74,7 +74,6 @@ typedef struct PR_worker	PR_worker;
 typedef struct PR_queue		PR_queue;
 typedef struct PR_queue_el	PR_queue_el;
 typedef struct PR_buffer	PR_buffer;
-typedef struct PR_queue_el	PR_queue_el;
 typedef struct PR_RecChunk	PR_RecChunk;
 #if 0
 typedef struct XLogReaderState_PR	XLogReaderState_PR;
@@ -82,10 +81,10 @@ typedef struct XLogReaderState_PR	XLogReaderState_PR;
 typedef struct XLogInvalidPageData_PR XLogInvalidPageData_PR;
 typedef struct PR_BufChunk PR_BufChunk;
 
-typedef struct txn_wal_info_PR	txn_wal_info_PR;
-typedef struct txn_hash_el_PR	txn_hash_el_PR;
-typedef struct txn_cell_PR		txn_cell_PR;
-typedef struct txn_cell_pool_PR	txn_cell_pool_PR;
+typedef struct PR_txn_info			PR_txn_info;
+typedef struct PR_txn_hash_entry	PR_txn_hash_entry;
+typedef struct PR_txn_cell			PR_txn_cell;
+typedef struct PR_txn_cell_pool		PR_txn_cell_pool;
 typedef struct XLogDispatchData_PR XLogDispatchData_PR;
 
 /*
@@ -95,15 +94,15 @@ extern PR_shm *pr_shm;
 
 struct PR_shm
 {
-	PR_worker	*workers;
-	txn_wal_info_PR	*txn_wal_info;
+	PR_worker		*workers;
+	PR_txn_info		*txn_info;
 	PR_invalidPages	*invalidPages;
 	PR_XLogHistory	*history;
 	PR_queue	*queue;
 	PR_buffer	*buffer;
 	bool		*worker_wait;	/* Used by PR_recv_sync() to detect deadlock among workers. */
 	slock_t		slock;			/* Spin lock for EndRecPtrand MinTimeLineID */
-	slock_t		wait_flag_lock;	/* Spin lock for PR_recvSync() */
+	slock_t		sync_lock;		/* Spin lock for PR_recvSync() */
 	bool		some_failed;	/* Indicates if some worker failed and exited. */
 	XLogRecPtr	EndRecPtr;		/* Minimum EndRecPtr among workers */
 	TimeLineID  MinTimeLineID;	/* Min Timeline ID among workers */
@@ -124,24 +123,29 @@ struct PR_invalidPages
  * This is ring-shaped link of the element.
  * If all the elements from head to some point is replayed,
  * this is reflected to XCloCtl.
+ *
  */
 struct PR_XLogHistory
 {
-	PR_XLogHistory_el	*hist_element;	/* List of the history element */
+	PR_XLogHistory_el	*head;			/* Head of the history element */
+	PR_XLogHistory_el	*tail;			/* Tail of the history element */
 	unsigned long		 hist_count;	/* Count of the update of whole history */
+	int					 num_whole_elements;	/* Whole number of elements */
 	int					 num_elements;	/* Number of occupied elements.  Initial: 0. */
 	slock_t		 slock;
 };
 
 /*
- * Num of element is num_preplay_worker_queue.
+ * Num of element is num_preplay_worker_queue + 2
+ *
+ * This number can be insufficient though.  This is chaind in ring.
  */
 struct PR_XLogHistory_el
 {
 	PR_XLogHistory_el	*next;
-	XLogRecPtr	 		 curr_ptr;
-	XLogRecPtr	 		 end_ptr;
-	TimeLineID	 		 my_timeline;
+	XLogRecPtr	 		 curr_ptr;		/* from xlogreader->ReadRecPtr */
+	XLogRecPtr	 		 end_ptr;		/* from xlogreader->EndRecPtr */
+	TimeLineID	 		 my_timeline;	/* from xlogreader->timeline */
 	bool		 		 replayed;
 };
 
@@ -168,7 +172,7 @@ typedef struct PR_worker
 								/* Dispatcher check this and sync. */
 	bool		worker_failed;	/* Indicates this worker failed and exited. */
 	bool		worker_waiting;	/* Flag to indicate the work is waiting for sync.  Protected by pr_shm->wait_flag_lock. */
-	unsigned	flags;			/* Indicates instructions from outside */
+	bool		worker_terminated;	/* Indicates the workerr has successfully terminated. */
 	XLogRecPtr	assignedRecPtr;	/* Latest assigned XLOG record ptr. */
 								/* Set by enqueue side worker. */
 	XLogRecPtr	handledRecPtr;	/* Last andled XLOG record ptr by this worker. */
@@ -178,38 +182,6 @@ typedef struct PR_worker
 } PR_worker;
 
 #define PR_worker_sz	(pr_sizeof(PR_worker) * num_preplay_workers)
-
-/* Flag values */
-/*
- * In addition to the flag values below, each BLK worker process need to sync
- * to others if XLogRecord is assigned to more than one worker.
- * This happens if XLogRecord contains multiple block update image.
- */
-/*
- * Following flags work as follows:
- *	When each worker handles all the assigned queues and no queue elelemt is found in the queue,
- *	each worker checks flags.
- *  1. If PR_WK_TERMINATE is set, then the worker terminates.
- *  2. If PR_WK_SYNC_READER is set, then the worker writes sync message to READER worker.
- *  3. If PR_WK_SYNC_DISPATCHER is set, then the worker writes sync message to DISPATCHER worker.
- *  4. If PR_WK_SYNC_TXN is set, then the worker writes sync message to TXN worker.
- *
- *  If the worker finishes all the assigned queue, the worker sets wait_dispatch flag and wait for
- *  sync() from dispatching worker (READER, DISPATCHER and other worker in the case of 
- *  INVALID PAGE worker.
- *
- *  When dispatching queue element to a worker, dispatching worker shoud:
- *
- *  1. Simply and queue element to worker's queue,
- *  2. If this worker sets wait_dispatch, then clear them and write sync to the target worker.
- */
-
-#define PR_WK_TERMINATE			0x00000001	/* Instruction to terminate the worker process peacefully */
-#define PR_WK_SYNC_READER		0x00000002	/* Sync to the READER when all the dispatched data was done */
-#define PR_WK_SYNC_DISPATCHER	0x00000004	/* Sync to the DISPATCHER when all the didpsatched data was done */
-#define PR_WK_SYNC_TXN			0x00000008	/* Sync to the TXN worker when all the didpsatched data was done */
-#define PR_WK_SYNC				0x0000000E	/* Mask to indicate any of SYNC bit above */
-#define PR_ERROR_TERMINATE		0x80000000	/* Some worker failed.   Exit immediately. */
 
 /* Worker Idx */
 /*
@@ -240,34 +212,49 @@ typedef struct PR_worker
  */
 
 
-struct txn_wal_info_PR
+struct PR_txn_info
 {
-	txn_hash_el_PR	*txn_hash;		/* Hash */
-	txn_cell_PR		*cell_pool;		/* Cell pool */
-	slock_t			 cell_slock;	/* Slock for cell pool */
+	PR_txn_hash_entry	*txn_hash;		/* Hash */
+	PR_txn_cell			*cell_pool;		/* Cell pool */
+	slock_t				 cell_slock;	/* Slock for cell pool */
 };
 
 /*
  * Transaction hash entry.
  */
-struct txn_hash_el_PR
+struct PR_txn_hash_entry
 {
 	slock_t		 slock;
-	txn_cell_PR	*head;
-	txn_cell_PR	*tail;
+	PR_txn_cell	*head;
+	PR_txn_cell	*tail;
 };
 
 /*
  * Entry for each transaction
  */
-struct txn_cell_PR
+struct PR_txn_cell
 {
-	txn_cell_PR			*next;
+	PR_txn_cell			*next;
+	PR_txn_cell			*prev;					/* Used only when the cell is from PR_txn_hash_entry */
 	TransactionId		 xid;
-	bool				 txn_worker_waiting;	/* if true, last replayed worker should sync with txn worker */
-	XLogDispatchData_PR *head;
-	XLogDispatchData_PR *tail;
+												/* this is sreset to invalidXLogRecPtr. */
+	int					 blk_walker_to_wait;	/* Indicates id of the block worker which txn worker is waiting for. */
+												/* If TXN worker is waiting for specific block worker to finish assigned LSN, */
+												/* TXN worker specifies worker id of such BLOCK worker. (if not waiting for */
+												/* any, */
+												/*zero) If block worker replies WAL with lastXLogLSN, it checks if the BLOCK */
+												/* worker is here. If so, then the BLOCK worker writes a synch to TXN worker. */
+   												/* When TXN worker get sync, then it checks next BLOCK worker. */
+												/* Protected with spinlock at PR_txn_hash_entry */
+	XLogRecPtr			 lastXLogLSN[0];		/* LSN of last outstanding WAL record.  If WAL record of this LSN is replayed, */
+												/* This i an array of LSN assigned to each BLOCK WORKER.  If a block worker */
+												/* replays a WAL record with this LSN, then it will be reset to Invalid LSN (zero) */
+												/* Nuber of meber is (num_preplay_workers - PR_BLK_WORKER_MIN_IDX) and is */
+												/* determined at initialization */
+												/* This LSN is set by the DIDPATCHER worker and reset by BLOCK worker. */
+												/* Use XLogReaderState->ReadRecPtr for this value. */
 };
+
 
 /*
  ************************************************************************************************
@@ -315,14 +302,14 @@ struct XLogInvalidPageData_PR
 struct XLogDispatchData_PR
 {
 	slock_t	 	 		 slock;
+#if 0		/* Now synchronization is done using separate dispatched data */
 	unsigned			 flags;		/* Flag,same as PR_worker->flags */
+#endif
 	XLogReaderState		*reader;	/* Allocated in the separated buffer area */
+	PR_XLogHistory_el	*xlog_history_el;	/* XLog history to maintain XLogRecPtr */
 	RmgrId				 rmid;
 	uint8				 info;
 	uint8				 rminfo;
-	PR_XLogHistory_el	*xlog_history_el;	/* PTR to history data */
-	XLogDispatchData_PR	*next;		/* Chain in txn_cell_PR, use txn_hash_el_PR->slock for this */
-	XLogDispatchData_PR	*prev;		/* Chain in txn_cell_PR, use txn_hash_el_PR->slock for this */
 	TransactionId		 xid;
 	int		 	 n_remaining;		/* If this becomes zero, then this worker should replay */
 	int		 	 n_involved;		/* Total number of BLK workers assigned */
@@ -359,6 +346,8 @@ typedef enum PR_QueueDataType
 	ReaderState,			/* XLogReaderState */
 	XLogDispatchData,		/* XLogDispatchData_PR */
 	InvalidPageData,		/* XLogInvalidPageData_PR */
+	RequestSync,			/* Requesting sync */
+	RequestTerminate,		/* Request to terminate relevant workers */
 	MAX_value
 } PR_QueueDataType;
 
@@ -370,6 +359,7 @@ struct PR_queue_el
 {
 	PR_queue_el			*next;	/* Next element */
 	PR_QueueDataType	 data_type;
+	int					 source_worker;	/* Worker id which enqueued this element */
 	void				*data;
 };
 
@@ -476,6 +466,7 @@ extern void PRDebug_start(int worker_idx);
 extern void PRDebug_attach(void);
 extern void PRDebug_sync(void);
 extern void PRDebug_log(char *fmt, ...) __attribute__ ((format (printf, 1, 2)));
+extern void PRDebug_out(StringInfo s);
 extern void PRDebug_finish(void);
 extern void PR_debug_buffer(void);
 extern void PR_debug_buffer2(void);
@@ -539,7 +530,7 @@ extern void PR_XLogCheckInvalidPages(void);
 extern void	 PR_syncInitSockDir(void);
 extern void	 PR_syncFinishSockDir(void);
 extern void  PR_syncInit(void);
-extern void  PR_syncAll(void);
+extern void  PR_syncAll(bool terminate);
 extern void  PR_sendSync(int worker_idx);
 extern int	 PR_recvSync(void);
 extern void	 PR_syncFinish(void);
@@ -548,6 +539,9 @@ extern void	 PR_syncFinish(void);
 extern void	*PR_allocBuffer(Size sz, bool need_lock);
 extern void	 PR_freeBuffer(void *buffer, bool need_lock);
 bool PR_isInBuffer(void *addr);
+#ifdef WAL_DEBUG
+extern bool	PR_bufferCheck(StringInfo s, void *addr, bool need_lock);
+#endif
 
 
 /* Queue functions */

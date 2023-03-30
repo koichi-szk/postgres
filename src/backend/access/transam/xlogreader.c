@@ -21,6 +21,9 @@
 
 #ifndef FRONTEND
 #include "access/parallel_replay.h"
+#ifdef WAL_DEBUG
+#include "lib/stringinfo.h"
+#endif
 #endif
 #include "access/transam.h"
 #include "access/xlog_internal.h"
@@ -1230,18 +1233,34 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 	uint32		datatotal;
 	RelFileNode *rnode = NULL;
 	uint8		block_id;
+#ifndef FRONTEND
+#ifdef WAL_DEBUG
+	static StringInfo s = NULL;
+#endif
+#endif
 
 	ResetDecoder(state);
 
 #ifndef FRONTEND
 	if (PR_isInParallelRecovery())
 	{
+#ifdef WAL_DEBUG
+		if (s == NULL)
+			s = makeStringInfo();
+		else
+			resetStringInfo(s);
+#endif
 		/*
 		 * In parallel recovery, all the data area are consumed by corresponding worker
 		 * and should be freed there.
 		 * We just need to cleanup corresponding pointers.
 		 */
 		state->decoded_record = PR_allocBuffer(record->xl_tot_len, true);
+#ifdef WAL_DEBUG
+		appendStringInfo(s, "========== %s() shared buffer allocation ===========\n", __func__);
+		appendStringInfoString(s, "state->decoded_record: ");
+		PR_bufferCheck(s, state->decoded_record, true);
+#endif
 		memcpy(state->decoded_record, record, record->xl_tot_len);
 		record = state->decoded_record;
 		state->record = record;
@@ -1482,6 +1501,10 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 			{
 				blk->data_bufsz = MAXALIGN(Max(blk->data_len, BLCKSZ));
 				blk->data = PR_allocBuffer(blk->data_bufsz, true);
+#ifdef WAL_DEBUG
+				appendStringInfo(s, "blk->data(%d): ", block_id);
+				PR_bufferCheck(s, blk->data, true);
+#endif
 			}
 			else
 #endif
@@ -1501,6 +1524,13 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 			memcpy(blk->data, ptr, blk->data_len);
 			ptr += blk->data_len;
 		}
+#ifndef FRONTEND
+		else
+		{
+			blk->data_bufsz = 0;
+			blk->data = NULL;
+		}
+#endif
 	}
 
 	/* and finally, the main data */
@@ -1512,6 +1542,10 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 			state->main_data_bufsz = MAXALIGN(Max(state->main_data_len,
 												  BLCKSZ / 2));
 			state->main_data = PR_allocBuffer(state->main_data_bufsz, true);
+#ifdef WAL_DEBUG
+			appendStringInfoString(s, "state->main_dat: ");
+			PR_bufferCheck(s, state->main_data, true);
+#endif
 		}
 		else
 #endif
@@ -1540,6 +1574,23 @@ DecodeXLogRecord(XLogReaderState *state, XLogRecord *record, char **errormsg)
 		memcpy(state->main_data, ptr, state->main_data_len);
 		ptr += state->main_data_len;
 	}
+#ifndef FRONTEND
+	else
+	{
+		if (PR_isInParallelRecovery())
+		{
+			state->main_data_bufsz = 0;
+			state->main_data = NULL;
+		}
+	}
+#endif
+
+#ifndef FRONTEND
+#ifdef WAL_DEBUG
+	if (PR_isInParallelRecovery())
+		PRDebug_out(s);
+#endif
+#endif
 
 	return true;
 
@@ -1550,6 +1601,12 @@ shortdata_err:
 err:
 	*errormsg = state->errormsg_buf;
 
+#ifndef FRONTEND
+#ifdef WAL_DEBUG
+	if (PR_isInParallelRecovery())
+		PRDebug_out(s);
+#endif
+#endif
 	return false;
 }
 

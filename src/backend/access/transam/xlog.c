@@ -6492,8 +6492,10 @@ CheckRequiredParameterValues(void)
 	}
 }
 
+#ifdef WAL_DEBUG
 int PR_loop_num = 0;
 int PR_loop_count = 0;
+#endif
 
 /*
  * This must be called ONCE during postmaster or standalone-backend startup
@@ -7443,10 +7445,6 @@ StartupXLOG(void)
 				 * the records.
 				 */
 #ifdef WAL_DEBUG
-#if 0
-				PR_breakpoint();		/* Sync point with GDB: Don't needed any more */
-#endif
-
 				xlog_string = NULL;
 
 				initStringInfo(&buf);
