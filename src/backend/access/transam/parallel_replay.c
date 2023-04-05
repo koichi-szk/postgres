@@ -423,9 +423,7 @@ extern int PR_loop_num;
 extern int PR_loop_count;
 
 /* Function to stop at error detection */
-static void	PR_error_here(void);
-
-static void PR_error_here(void)
+void PR_error_here(void)
 {
 	return;
 }
@@ -679,13 +677,15 @@ PR_recvSync(void)
  * If terminate is true, then tell other workers to terminate and sync until they all terminates.
  *-------------------------------------------------------------------------------------------
  */
+/*
+ * Koichi: これ、READER WORKER からも呼ばれるので、改修すること */
 void
 PR_syncAll(bool terminate)
 {
 	int		ii;
 	bool	terminated;
 
-	Assert(my_worker_idx == PR_DISTRIBUTOR_WORKER_IDX);
+	Assert(my_worker_idx == PR_DISPATCHER_WORKER_IDX);
 
 	for (ii = PR_TXN_WORKER_IDX; ii < num_preplay_workers; ii++)
 	{
@@ -4031,6 +4031,7 @@ blockWorkerLoop(void)
 			/* This worker is not eligible to handle this */
 			unlock_dispatch_data(data);
 			/* Wait another BLOCK worker to handle this and sync to me */
+			updateTxnInfoAfterReplay(DispatchDataGetXid(data), DispatchDataGetLSN(data), true);
 #ifdef WAL_DEBUG
 			PRDebug_log("Xlogrecord is assigned to multiple worker.  Waiting for other workers to finish.\n");
 			sync_worker =

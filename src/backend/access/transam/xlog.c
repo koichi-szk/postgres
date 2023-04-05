@@ -6524,6 +6524,9 @@ StartupXLOG(void)
 	bool		promoted = false;
 	struct stat st;
 
+	static int	PR_sync_interval = 200;
+	int	PR_handled_wal_records_in_the_loop = 0;
+
 	/*
 	 * We should have an aux process resource owner to use, and we should not
 	 * be in a transaction that's installed some other resowner.
@@ -7614,6 +7617,7 @@ StartupXLOG(void)
 					PRDebug_log("Enqueue, ser_no(%ld) to %s, XLOGrecord: \"%s\"\n",
 							ser_no, PR_worker_name(PR_DISPATCHER_WORKER_IDX, workername), xlogreader_PR->xlog_string);
 
+#if 0
 					if (PR_loop_count >= PR_loop_num)
 					{
 						PR_loop_count = 0;
@@ -7622,8 +7626,20 @@ StartupXLOG(void)
 					else
 						PR_loop_count++;
 #endif
+#endif
 
+					if (PR_handled_wal_records_in_the_loop >= PR_sync_interval)
+					{
+						PR_handled_wal_records_in_the_loop = 0;
+#if 0
+						PR_enqueue(NULL, RequestSync, PR_DISPATCHER_WORKER_IDX);
+#endif
+#ifdef WAL_DEBUG
+						PR_error_here();	/* For GDB breakpoint */
+#endif
+					}
 					PR_enqueue(xlogreader_PR, ReaderState, PR_DISPATCHER_WORKER_IDX);
+					PR_handled_wal_records_in_the_loop++;
 #ifdef WAL_DEBUG
 					PRDebug_log("Enqueue done, ser_no(%ld)\n", ser_no);
 #endif
