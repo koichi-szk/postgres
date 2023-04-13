@@ -2164,7 +2164,6 @@ PR_freeQueueElement(PR_queue_el *el)
 }
 
 
-/* Returns NULL if no queue element is assigned and terminate flag is set */
 PR_queue_el *
 PR_fetchQueue(void)
 {
@@ -2172,38 +2171,43 @@ PR_fetchQueue(void)
 
 	lock_my_worker();
 
-	el = my_worker->head;
-	if (el)
+	for(;;)
 	{
-		/*
-		 * Available queue.
-		 */
-		my_worker->head = el->next;
-		if (my_worker->head == NULL)
-			my_worker->tail = NULL;
-
-		unlock_my_worker();
-
-		if (el->data_type == RequestSync)
+		el = my_worker->head;
+		if (el)
 		{
-			if (my_worker_idx == PR_DISPATCHER_WORKER_IDX)
-				/* Sync all the other workers, not terminating */
-				PR_syncAll(false);
+			/*
+			 * Available queue.
+			 */
+			my_worker->head = el->next;
+			if (my_worker->head == NULL)
+				my_worker->tail = NULL;
 
-			PR_sendSync(el->source_worker);
-			PR_freeQueueElement(el);
-			el = PR_fetchQueue();
+			unlock_my_worker();
+
+			if (el->data_type == RequestSync)
+			{
+				if (my_worker_idx == PR_DISPATCHER_WORKER_IDX)
+					/* Sync all the other workers, not terminating */
+					PR_syncAll(false);
+
+				PR_sendSync(el->source_worker);
+				PR_freeQueueElement(el);
+				continue;
+			}
+			else
+				return el;
+		}
+		else {
+			my_worker->wait_dispatch = true;
+
+			unlock_my_worker();
+
+			PR_recvSync();
+			continue;
 		}
 	}
-	else {
-		my_worker->wait_dispatch = true;
-
-		unlock_my_worker();
-
-		PR_recvSync();
-		el = PR_fetchQueue();
-	}
-	return el;
+	return el;	/* Never reaches here */
 }
 
 /*
@@ -3968,6 +3972,7 @@ blockWorkerLoop(void)
 	PR_queue_el	*el;
 	XLogDispatchData_PR	*data;
 	int		*worker_list;
+	int		 n_remaining;
 #ifdef WAL_DEBUG
 	int		 sync_worker;
 	char	 workername[64];
@@ -4024,12 +4029,14 @@ blockWorkerLoop(void)
 		PRDebug_log("Fetched: ser_no: %ld, xlogrecord: \"%s\"\n", data->reader->ser_no, data->reader->xlog_string);
 #endif	/* WAL_DEBUG */
 		data->n_remaining--;
+		n_remaining = data->n_remaining;
 		currRecPtr = data->reader->ReadRecPtr;
 
-		if (data->n_remaining > 0)
+		unlock_dispatch_data(data);
+
+		if (n_remaining > 0)
 		{
 			/* This worker is not eligible to handle this */
-			unlock_dispatch_data(data);
 			/* Wait another BLOCK worker to handle this and sync to me */
 			updateTxnInfoAfterReplay(DispatchDataGetXid(data), DispatchDataGetLSN(data), true);
 #ifdef WAL_DEBUG
@@ -4047,8 +4054,6 @@ blockWorkerLoop(void)
 			/* Dequeue */
 
 			/* OK. I should handle this. Nobody is handling this and safe to release the lock. */
-
-			unlock_dispatch_data(data);
 
 			/* REDO */
 
