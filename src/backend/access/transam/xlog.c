@@ -6495,6 +6495,8 @@ CheckRequiredParameterValues(void)
 #ifdef WAL_DEBUG
 int PR_loop_num = 0;
 int PR_loop_count = 0;
+int PR_loop_sync_num = 0;
+int PR_loop_sync_count = 0;
 #endif
 
 /*
@@ -7624,13 +7626,19 @@ StartupXLOG(void)
 					}
 					else
 						PR_loop_count++;
+					if (PR_loop_sync_count >= PR_loop_sync_num)
+					{
+						PR_loop_sync_count = 0;
+						PR_enqueue(NULL, RequestSyncAll, PR_DISPATCHER_WORKER_IDX);
+					}
+					PR_loop_sync_count++;
 #endif
 
 					if (PR_handled_wal_records_in_the_loop >= PR_sync_interval)
 					{
 						PR_handled_wal_records_in_the_loop = 0;
 #if 0
-						PR_enqueue(NULL, RequestSync, PR_DISPATCHER_WORKER_IDX);
+						PR_enqueue(NULL, RequestSyncAll, PR_DISPATCHER_WORKER_IDX);
 #endif
 #ifdef WAL_DEBUG
 						PR_error_here();	/* For GDB breakpoint */

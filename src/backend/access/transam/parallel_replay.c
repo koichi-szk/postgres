@@ -3190,18 +3190,27 @@ initBuffer(void)
 
 	Assert(pr_buffer);
 
-	pr_buffer->area_size = buffer_size() - (pr_sizeof(Size) * num_preplay_workers) - pr_sizeof(PR_buffer);
+	pr_buffer->area_size = buffer_size()
+		- pr_sizeof(PR_buffer)
+		- (pr_sizeof(Size) * num_preplay_workers)
+		- (pr_sizeof(void *) * num_preplay_workers);
 	pr_buffer->needed_by_worker = (Size *)addr_forward(pr_buffer, pr_sizeof(PR_buffer));
 	pr_buffer->curr_sno = 0;
+
 	needed_by_worker = &pr_buffer->needed_by_worker[0];
 	for(ii = 0; ii < num_preplay_workers; ii++)
 		needed_by_worker[ii] = 0;
-	pr_buffer->head = addr_forward(needed_by_worker, (pr_sizeof(Size) * num_preplay_workers));
+
+	pr_buffer->allocated_buffer = (void **)addr_forward(pr_buffer->needed_by_worker, pr_sizeof(Size) * num_preplay_workers);
+	for (ii = 0; ii < num_preplay_workers; ii++)
+		pr_buffer->allocated_buffer[ii] = NULL;
+
+	pr_buffer->head = addr_forward(pr_buffer->allocated_buffer, (pr_sizeof(void *) * num_preplay_workers));
 	pr_buffer->tail = addr_forward(pr_buffer, buffer_size());
 	pr_buffer->alloc_start = pr_buffer->head;
 	pr_buffer->alloc_end = pr_buffer->tail;
 	chunk = (PR_BufChunk *)pr_buffer->alloc_start;
-	chunk->size = pr_buffer->area_size;
+	chunk->size = addr_difference(pr_buffer->tail, pr_buffer->head);
 	chunk->magic = PR_BufChunk_Free;
 	size_at_tail = SizeAtTail(chunk);
 	*size_at_tail = chunk->size;
