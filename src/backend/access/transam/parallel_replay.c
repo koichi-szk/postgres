@@ -4008,19 +4008,18 @@ blockWorkerLoop(void)
 
 		lock_dispatch_data(data);
 
-#ifdef WAL_DEBUG
-		PRDebug_log("Fetched: ser_no: %ld, xlogrecord: \"%s\"\n", data->reader->ser_no, data->reader->xlog_string);
-		n_involved = data->n_involved;
-#endif	/* WAL_DEBUG */
 		data->n_remaining--;
 		n_remaining = data->n_remaining;
 		currRecPtr = data->reader->ReadRecPtr;
 
-		unlock_dispatch_data(data);
 #ifdef WAL_DEBUG
+		n_involved = data->n_involved;
+		PRDebug_log("Fetched: ser_no: %ld, xlogrecord: \"%s\", n_involved: %d, n_remaining: %d\n",
+				data->reader->ser_no, data->reader->xlog_string, n_involved, n_remaining);
 		if (n_involved > 1)
 			PR_breakpoint();
 #endif
+		unlock_dispatch_data(data);
 
 		if (n_remaining > 0)
 		{
@@ -4413,6 +4412,10 @@ dispatcherWorkerLoop(void)
 		record = reader->decoded_record;
 		dispatch_data = PR_analyzeXLogReaderState(reader, record);
 
+#ifdef WAL_DEBUG
+		if (dispatch_data->n_involved > 1)
+			PR_breakpoint();
+#endif
 		if (isSyncBeforeDispatchNeeded(reader))
 			PR_syncAll(false);
 
