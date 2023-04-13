@@ -469,7 +469,6 @@ PR_syncInitSockDir(void)
 		/* sync sock directory sync error */
 		if (my_errno != ENOENT)
 		{
-			PR_breakpoint();
 			PR_failing();
 			elog(PANIC, "Failed to stat PR debug directory, %s", strerror(my_errno));
 		}
@@ -477,7 +476,6 @@ PR_syncInitSockDir(void)
         local_errno = errno;
         if (rv != 0)
 		{
-			PR_breakpoint();
 			PR_failing();
             elog(PANIC, "Failed to create PR debug directory, %s", strerror(local_errno));
 		}
@@ -487,7 +485,6 @@ PR_syncInitSockDir(void)
 		/* Debug directory stat successfful */
 		if ((statbuf.st_mode & S_IFDIR) == 0)
 		{
-			PR_breakpoint();
 			/* It was not a directory */
 			PR_failing();
 			elog(PANIC, "%s must be a directory but not.", sync_sock_dir);
@@ -543,7 +540,6 @@ PR_syncInit(void)
 		sync_sock_info[ii].syncsock = socket(AF_UNIX, SOCK_DGRAM, 0);
 		if (sync_sock_info[ii].syncsock < 0)
 		{
-			PR_breakpoint();
 			ereport(FATAL,
 					(errcode_for_socket_access(),
 					 errmsg("Could not create the socket: %m")));
@@ -554,7 +550,6 @@ PR_syncInit(void)
 			rc = bind(sync_sock_info[ii].syncsock, &sync_sock_info[ii].sockaddr, sizeof(struct sockaddr_un));
 			if (rc < 0)
 			{
-				PR_breakpoint();
 				ereport(FATAL,
 					(errcode_for_socket_access(),
 					 errmsg("Could not bind the socket to \"%s\": %m",
@@ -596,7 +591,6 @@ PR_sendSync(int worker_idx)
 			&sync_sock_info[worker_idx].sockaddr, sizeof(struct sockaddr_un));
     if (ll != my_worker_msg_sz)
 	{
-		PR_breakpoint();
         ereport(ERROR,
                 (errcode_for_socket_access(),
                  errmsg("Can not send sync message from worker %d to %d: %m",
@@ -643,7 +637,6 @@ PR_recvSync(void)
 	{
 #ifdef WAL_DEBUG
 		PRDebug_log("**** All the parallel replay workers are waiting for something.  Cannot move forward.***\n");
-		PR_breakpoint();
 #else
 		PR_failing();
 		elog(PANIC, "**** All the parallel replay workers are waiting for something.  Cannot move forward.***");
@@ -659,7 +652,6 @@ PR_recvSync(void)
 
     if (sz < 0)
 	{
-		PR_breakpoint();
         ereport(ERROR,
                 (errcode_for_socket_access(),
                  errmsg("Could not receive message.  worker %d: %m", my_worker_idx)));
@@ -2530,7 +2522,6 @@ dump_buffer(const char *funcname, StringInfo outs, bool need_lock)
 									curr_chunk->size,
 									*size_at_tail);
 			rv = false;
-			PR_breakpoint();
 			break;
 		}
 	}
@@ -2691,7 +2682,6 @@ retry_allocBuffer(Size sz, bool need_lock)
 	void	*rv;
 #ifdef WAL_DEBUG
 	static StringInfo	s = NULL;
-	bool	buf_ok;
 #endif
 
 	Assert(sz > 0);
@@ -2701,9 +2691,7 @@ retry_allocBuffer(Size sz, bool need_lock)
 		s = makeStringInfo();
 	else
 		resetStringInfo(s);
-	buf_ok = dump_buffer(__func__, s, need_lock);
-	if (buf_ok != true)
-		PR_breakpoint();
+	dump_buffer(__func__, s, need_lock);
 	PRDebug_out(s);
 	resetStringInfo(s);
 #endif
@@ -2896,7 +2884,6 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	static bool *sync_alloc_target = NULL;
 #ifdef WAL_DEBUG
 	static StringInfo	s = NULL;
-	bool	buf_ok;
 #endif
 
 
@@ -2916,12 +2903,10 @@ PR_freeBuffer(void *buffer, bool need_lock)
 		resetStringInfo(s);
 	appendStringInfo(s, "--- %s: freeing: %p ---\n", __func__, buffer);
 	dump_chunk(Chunk(buffer), __func__, s, need_lock);
-	buf_ok = dump_buffer(__func__, s, need_lock);
+	dump_buffer(__func__, s, need_lock);
 	PRDebug_out(s);
 	resetStringInfo(s);
 
-	if (buf_ok != true)
-		PR_breakpoint();
 #endif
 	if (addr_before(buffer, pr_buffer->head) || addr_after(buffer, pr_buffer->tail))
 		return;
@@ -2998,9 +2983,7 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	}
 
 #ifdef WAL_DEBUG
-	buf_ok = dump_buffer(__func__, s, need_lock);
-	if (buf_ok != true)
-		PR_breakpoint();
+	dump_buffer(__func__, s, need_lock);
 	PRDebug_out(s);
 #endif
 	return;
@@ -3974,6 +3957,7 @@ blockWorkerLoop(void)
 	int		*worker_list;
 	int		 n_remaining;
 #ifdef WAL_DEBUG
+	int		 n_involved;
 	int		 sync_worker;
 	char	 workername[64];
 #endif
@@ -3992,7 +3976,7 @@ blockWorkerLoop(void)
 	{
 		XLogRecPtr		currRecPtr;
 
-#ifdef WAL_DEBUG
+#if 0
 		PRDebug_log("%s: fetching queue\n", __func__);
 		if (PR_loop_count >= PR_loop_num)
 		{
@@ -4016,7 +4000,6 @@ blockWorkerLoop(void)
 		}
 		else if (el->data_type != XLogDispatchData)
 		{
-			PR_breakpoint();		/* GDB breakpoint */
 			PR_failing();
 			elog(PANIC, "Invalid internal status for block worker.");
 		}
@@ -4027,12 +4010,17 @@ blockWorkerLoop(void)
 
 #ifdef WAL_DEBUG
 		PRDebug_log("Fetched: ser_no: %ld, xlogrecord: \"%s\"\n", data->reader->ser_no, data->reader->xlog_string);
+		n_involved = data->n_involved;
 #endif	/* WAL_DEBUG */
 		data->n_remaining--;
 		n_remaining = data->n_remaining;
 		currRecPtr = data->reader->ReadRecPtr;
 
 		unlock_dispatch_data(data);
+#ifdef WAL_DEBUG
+		if (n_involved > 1)
+			PR_breakpoint();
+#endif
 
 		if (n_remaining > 0)
 		{
@@ -4151,7 +4139,7 @@ txnWorkerLoop(void)
 	{
 		XLogRecPtr	currRecPtr;
 
-#ifdef WAL_DEBUG
+#if 0
 		PRDebug_log("%s: fetching queue\n", __func__);
 		if (PR_loop_count >= PR_loop_num)
 		{
@@ -4175,7 +4163,7 @@ txnWorkerLoop(void)
 		}
 		else if (el->data_type != XLogDispatchData)
 		{
-			PR_breakpoint();		/* GDB breakpoint */
+			PR_error_here();		/* GDB breakpoint */
 			PR_failing();
 			elog(PANIC, "Invalid internal status for transaction worker.");
 		}
@@ -4412,7 +4400,7 @@ dispatcherWorkerLoop(void)
 		}
 		else if (el->data_type != ReaderState)
 		{
-			PR_breakpoint();
+			PR_error_here();
 			PR_failing();
 			elog(PANIC, "Invalid internal status for dispatcher worker.");
 		}

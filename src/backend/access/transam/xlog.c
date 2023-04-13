@@ -7617,7 +7617,6 @@ StartupXLOG(void)
 					PRDebug_log("Enqueue, ser_no(%ld) to %s, XLOGrecord: \"%s\"\n",
 							ser_no, PR_worker_name(PR_DISPATCHER_WORKER_IDX, workername), xlogreader_PR->xlog_string);
 
-#if 0
 					if (PR_loop_count >= PR_loop_num)
 					{
 						PR_loop_count = 0;
@@ -7625,7 +7624,6 @@ StartupXLOG(void)
 					}
 					else
 						PR_loop_count++;
-#endif
 #endif
 
 					if (PR_handled_wal_records_in_the_loop >= PR_sync_interval)
@@ -7640,9 +7638,6 @@ StartupXLOG(void)
 					}
 					PR_enqueue(xlogreader_PR, ReaderState, PR_DISPATCHER_WORKER_IDX);
 					PR_handled_wal_records_in_the_loop++;
-#ifdef WAL_DEBUG
-					PRDebug_log("Enqueue done, ser_no(%ld)\n", ser_no);
-#endif
 				}
 				else
 				{
