@@ -7626,12 +7626,14 @@ StartupXLOG(void)
 					}
 					else
 						PR_loop_count++;
+#if 0
 					if (PR_loop_sync_count >= PR_loop_sync_num)
 					{
 						PR_loop_sync_count = 0;
 						PR_enqueue(NULL, RequestSyncAll, PR_DISPATCHER_WORKER_IDX);
 					}
 					PR_loop_sync_count++;
+#endif
 #endif
 
 					if (PR_handled_wal_records_in_the_loop >= PR_sync_interval)
