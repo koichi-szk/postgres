@@ -7622,6 +7622,7 @@ StartupXLOG(void)
 					if (PR_loop_count >= PR_loop_num)
 					{
 						PR_loop_count = 0;
+						PR_dump_buffer(__func__, true);
 						PR_breakpoint();
 					}
 					else

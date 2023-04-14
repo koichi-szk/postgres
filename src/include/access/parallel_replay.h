@@ -473,6 +473,7 @@ extern void PR_debug_buffer2(void);
 extern void PR_debug_analyzeState(XLogReaderState *state, XLogRecord *record);
 extern void PR_breakpoint_func(void);
 extern void PR_error_here(void);
+extern void PR_dump_buffer(const char *funcname, bool need_lock);
 #endif
 
 #ifdef WAL_DEBUG

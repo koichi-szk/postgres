@@ -2441,6 +2441,20 @@ next_chunk(PR_BufChunk *chunk)
  * In this case, the caller must have initialized s.
  * If s is NULL, then all the output data will be written to the debuf file.
  */
+void
+PR_dump_buffer(const char *funcname, bool need_lock)
+{
+	static StringInfo	s = NULL;
+
+	if (s == NULL)
+		s = makeStringInfo();
+	else
+		resetStringInfo(s);
+
+	dump_buffer(funcname, s, need_lock);
+	PRDebug_out(s);
+}
+
 static bool
 dump_buffer(const char *funcname, StringInfo outs, bool need_lock)
 {
