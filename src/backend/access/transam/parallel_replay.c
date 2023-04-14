@@ -2617,11 +2617,14 @@ PR_allocBuffer_int(Size sz, bool need_lock, bool retry_opt)
 	PR_BufChunk	*new_chunk;
 	Size		 chunk_sz;
 	void		*rv;
+#if 0
 #ifdef WAL_DEBUG
 	static StringInfo	 s = NULL;
 #endif
+#endif
 
 
+#if 0
 #ifdef WAL_DEBUG
 	if (s == NULL)
 		s = makeStringInfo();
@@ -2632,6 +2635,7 @@ PR_allocBuffer_int(Size sz, bool need_lock, bool retry_opt)
 	dump_buffer(__func__, s, need_lock);
 	PRDebug_out(s);
 	resetStringInfo(s);
+#endif
 #endif
 
 	if (need_lock)
@@ -2648,8 +2652,10 @@ PR_allocBuffer_int(Size sz, bool need_lock, bool retry_opt)
 	if (new_chunk)
 	{
 		/* Successful to allocate buffer */
+#if 0
 #ifdef WAL_DEBUG
 		dump_chunk(new_chunk, __func__, s, need_lock);
+#endif
 #endif
 		return &new_chunk->data[0];
 	}
@@ -2663,9 +2669,11 @@ PR_allocBuffer_int(Size sz, bool need_lock, bool retry_opt)
 
 	rv = retry_allocBuffer(sz, need_lock);
 
+#if 0
 #ifdef WAL_DEBUG
 	new_chunk = Chunk(rv);
 	dump_chunk(new_chunk, __func__, s, need_lock);
+#endif
 #endif
 
 	return rv;
@@ -2925,7 +2933,9 @@ PR_freeBuffer(void *buffer, bool need_lock)
 		elog(LOG, "Attempt to free wrong buffer.");
 		return;
 	}
+#ifdef WAL_DEBUG
 	resetStringInfo(s);
+#endif
 
 	free_chunk(chunk);
 
@@ -2995,6 +3005,7 @@ static void
 free_chunk(PR_BufChunk *chunk)
 {
 	PR_BufChunk	*new_chunk;
+	PR_BufChunk *head_chunk;
 
 	if (chunk->magic != PR_BufChunk_Allocated)
 		return;
@@ -3011,7 +3022,7 @@ free_chunk(PR_BufChunk *chunk)
 				pr_buffer->alloc_end = pr_buffer->tail;
 			}
 		}
-		return;
+		goto returning;
 	}
 	if (next_chunk(chunk) == pr_buffer->tail)
 	{
@@ -3022,7 +3033,7 @@ free_chunk(PR_BufChunk *chunk)
 		}
 		else
 			concat_prev_chunk(chunk);
-		return;
+		goto returning;
 
 	}
 	if (addr_before(pr_buffer->alloc_start, pr_buffer->alloc_end))
@@ -3124,6 +3135,12 @@ free_chunk(PR_BufChunk *chunk)
 			/* (14) Releasing chunk in intermediate place */
 			concat_surrounding_chunks(chunk);
 	}
+returning:
+	head_chunk = (PR_BufChunk *)(pr_buffer->head);
+
+	if ((pr_buffer->alloc_end == pr_buffer->tail) && (head_chunk->magic == PR_BufChunk_Free))
+		pr_buffer->alloc_end = next_chunk(head_chunk);
+
 	return;
 }
 
