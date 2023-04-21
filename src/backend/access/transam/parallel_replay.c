@@ -17,6 +17,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <mqueue.h>
 #include <stdarg.h>
 #ifdef PR_SKIP_REPLAY
 #include <stdlib.h>
@@ -134,8 +135,11 @@ static PR_XLogHistory		*pr_history = NULL;				/* List of outstanding XLogRecord 
 static PR_worker	*pr_worker = NULL;						/* Paralle replay workers */
 static PR_queue		*pr_queue = NULL;						/* Dispatch queue element to workers */
 static PR_buffer	*pr_buffer = NULL;						/* Buffer are for other usage */
+static pid_t		 pr_reader_pid;							/* Reader PID */
 #ifdef WAL_DEBUG
 static StringInfo dump_txn_cell(StringInfo s, PR_txn_cell *txn_cell);
+static void dump_worker_queue(StringInfo s, int worker_id, bool need_lock);
+static char *queueTypeName(PR_QueueDataType type);
 #endif
 
 /* Queue lock */
@@ -146,6 +150,7 @@ static StringInfo dump_txn_cell(StringInfo s, PR_txn_cell *txn_cell);
 /* My worker process knfo */
 static int           my_worker_idx = 0;         /* Index of the worker.  Set when the worker starts. */
 static PR_worker    *my_worker = NULL;      	/* My worker structure */
+char				*my_worker_name = NULL;
 
 /*
  ************************************************************************************************
@@ -560,7 +565,6 @@ PR_syncInit(void)
     snprintf(my_worker_msg, PR_SYNC_MSG_SZ, "%04d\n", my_worker_idx);
     my_worker_msg_sz = strlen(my_worker_msg);
 }
-
 /*
  * Close all the sync sock info
  */
@@ -587,10 +591,13 @@ PR_sendSync(int worker_idx)
 
     Assert(pr_shm && worker_idx != my_worker_idx);
 
-    ll = sendto(sync_sock_info[worker_idx].syncsock, my_worker_msg, my_worker_msg_sz, 0,
+    ll = sendto(sync_sock_info[worker_idx].syncsock, &my_worker_idx, sizeof(my_worker_idx), 0,
 			&sync_sock_info[worker_idx].sockaddr, sizeof(struct sockaddr_un));
-    if (ll != my_worker_msg_sz)
+    if (ll != sizeof(my_worker_idx))
 	{
+#ifdef WAL_DEBUG
+		PR_error_here();
+#endif
         ereport(ERROR,
                 (errcode_for_socket_access(),
                  errmsg("Can not send sync message from worker %d to %d: %m",
@@ -611,12 +618,29 @@ PR_sendSync(int worker_idx)
 int
 PR_recvSync(void)
 {
-    char    recv_buf[PR_SYNC_RECV_BUF_SZ];
+	int		recv_data;
 	int		ii;
 	bool	is_some_running;
     Size    sz;
+#if 0
+	int		nn;
+	static struct timeval *tv = NULL;
+	fd_set	readfs;
+	fd_set	fds;
+#endif
 
     Assert (pr_shm);
+
+#if 0
+	if (tv == NULL)
+	{
+		tv = malloc(sizeof(struct timeval));
+		tv->tv_sec = 5;	/* Recv Timeout */
+		tv->tv_usec = 0;
+	}
+	FD_ZERO(&readfs);
+	FD_SET(sync_sock_info[my_worker_idx].syncsock, &readfs);
+#endif
 
 	lock_sync_status();
 
@@ -643,7 +667,7 @@ PR_recvSync(void)
 #endif
 	}
 
-    sz = recv(sync_sock_info[my_worker_idx].syncsock, recv_buf, PR_SYNC_RECV_BUF_SZ, 0);
+    sz = recv(sync_sock_info[my_worker_idx].syncsock, &recv_data, sizeof(my_worker_idx), 0);
 
 	lock_sync_status();
 
@@ -652,11 +676,14 @@ PR_recvSync(void)
 
     if (sz < 0)
 	{
+#ifdef WAL_DEBUG
+		PR_error_here();
+#endif
         ereport(ERROR,
                 (errcode_for_socket_access(),
                  errmsg("Could not receive message.  worker %d: %m", my_worker_idx)));
 	}
-    return(atoi(recv_buf));
+    return(recv_data);
 }
 
 /*
@@ -669,8 +696,7 @@ PR_recvSync(void)
  * If terminate is true, then tell other workers to terminate and sync until they all terminates.
  *-------------------------------------------------------------------------------------------
  */
-/*
- * Koichi: これ、READER WORKER からも呼ばれるので、改修すること */
+
 void
 PR_syncAll(bool terminate)
 {
@@ -900,6 +926,7 @@ PR_initShm(void)
 	pr_shm->some_failed = false;
 	pr_shm->EndRecPtr = InvalidXLogRecPtr;
 	pr_shm->MinTimeLineID = 0;
+	pr_reader_pid = pr_shm->reader_pid = getpid();
 
 	SpinLockInit(&pr_shm->shm_slock);
 
@@ -968,6 +995,8 @@ init_txn_hash(void)
 
 
 	pr_txn_info = pr_shm->txn_info;
+	pr_txn_info->free_in_pool = num_preplay_max_txn;
+	pr_txn_info->total_available = num_preplay_max_txn;
 	pr_txn_info->txn_hash = pr_txn_hash_entry = (PR_txn_hash_entry *)addr_forward(pr_txn_info, pr_sizeof(PR_txn_info));
 	pr_txn_info->cell_pool = pr_txn_cell_pool = (PR_txn_cell *)addr_forward(pr_txn_info->txn_hash, pr_sizeof(PR_txn_hash_entry) * num_hash_entry);
 	SpinLockInit(&pr_txn_info->cell_slock);
@@ -983,7 +1012,6 @@ init_txn_hash(void)
 	txn_cell_head = pr_txn_info->cell_pool;
 #endif
 	/* Initialize TXN cell pool */
-	/* Koichi バグめっけ！ cell pool のサイズは BLK Worker のサイズで決まるので、単純に添字でアドレスを解決してはいけないのだ */
 	for (ii = 0, pooled_cell = pr_txn_info->cell_pool; ii < num_preplay_max_txn; ii++, pooled_cell = pooled_cell->next)
 	{
 		XLogRecPtr *lastLSN_array;
@@ -1042,11 +1070,14 @@ get_txn_cell(bool need_lock)
 #endif
 		pr_txn_cell_pool->next = rv->next;
 		rv->next = NULL;
+		pr_txn_info->free_in_pool--;
 	}
 	if (need_lock)
 		unlock_txn_pool();
 
 #ifdef WAL_DEBUG
+	PRDebug_log("%s() returning txn_cell %p, totqal cell: %ld, remaining: %ld\n",
+			__func__, rv, pr_txn_info->total_available, pr_txn_info->free_in_pool);
 	if (rv == NULL)
 		PR_error_here();
 #endif
@@ -1070,6 +1101,7 @@ free_txn_cell(PR_txn_cell *txn_cell, bool need_lock)
 		PRDebug_log("Returning cell %p is invalid.  Worker ID: %d\n", txn_cell, my_worker_idx);
 		PR_error_here();
 	}
+	PRDebug_log("%s(): returning %p, xid=%d, worker_id: %d\n", __func__, txn_cell, txn_cell->xid, my_worker_idx);
 #endif
 
 	xid = txn_cell->xid;
@@ -1121,6 +1153,11 @@ free_txn_cell(PR_txn_cell *txn_cell, bool need_lock)
 	txn_cell->prev = NULL;
 	txn_cell->next = pr_txn_cell_pool->next;
 	pr_txn_cell_pool->next = txn_cell;
+	pr_txn_info->free_in_pool++;
+#ifdef WAL_DEBUG
+	PRDebug_log("%s(): returning txn_cell %p, total %ld, remaining %ld\n",
+			__func__, txn_cell, pr_txn_info->total_available, pr_txn_info->free_in_pool);
+#endif
 	if(need_lock)
 		unlock_txn_pool();
 }
@@ -1460,6 +1497,12 @@ updateTxnInfoAfterReplay(TransactionId xid, XLogRecPtr lsn, bool need_lock)
 		lock_txn_hash(xid);
 	if (txn_cell->lastXLogLSN[my_worker_idx - PR_BLK_WORKER_MIN_IDX] == lsn)
 	{
+#if 0
+#ifdef WALDEBUG
+		/* Koichi: トランザクションの終わりの試験のため */
+		PR_error_here();
+#endif
+#endif
 		/* OK. This is the last LSN assigned to me in the list */
 		txn_cell->lastXLogLSN[my_worker_idx - PR_BLK_WORKER_MIN_IDX] = InvalidXLogRecPtr;
 		if (txn_cell->blk_worker_to_wait == my_worker_idx)
@@ -1621,7 +1664,7 @@ initXLogHistory(void)
 }
 
 PR_XLogHistory_el *
-PR_addXLogHistory(XLogRecPtr currPtr, XLogRecPtr endPtr, TimeLineID myTimeline)
+PR_addXLogHistory(XLogRecPtr currPtr, XLogRecPtr endPtr, TimeLineID myTimeline, long ser_no, TransactionId xid)
 {
 	PR_XLogHistory_el	*el;
 #ifdef WAL_DEBUG
@@ -1659,14 +1702,16 @@ PR_addXLogHistory(XLogRecPtr currPtr, XLogRecPtr endPtr, TimeLineID myTimeline)
 	el->end_ptr = endPtr;
 	el->my_timeline = myTimeline;
 	el->replayed = false;
+	el->ser_no = ser_no;
+	el->xid = xid;
 	pr_history->num_elements++;
 
 	unlock_xlog_history();
 
 #ifdef WAL_DEBUG
 	appendStringInfo(s, "\n========== Add XLogHistory ================\n"
-			    "%s: returning %p, num_elements: %d, currPtr %016lx, endPtr: %016lx, Timeline: %d\n",
-			    __func__, el, pr_history->num_elements, currPtr, endPtr, myTimeline);
+			    "%s: returning %p, num_elements: %d, currPtr %016lx, endPtr: %016lx, Timeline: %d, ser_no: %ld, xid: %d\n",
+			    __func__, el, pr_history->num_elements, currPtr, endPtr, myTimeline, ser_no, xid);
 	dump_xlog_history(s, true);
 	PRDebug_out(s);
 #endif
@@ -1723,18 +1768,19 @@ PR_setXLogReplayed(PR_XLogHistory_el *el)
 	}
 	pr_history->head = head;
 
-	unlock_xlog_history();
-
-#ifdef WAL_DEBUG
-	dump_xlog_history(s, true);
-	PRDebug_out(s);
-#endif
 	/*
 	 * Then all the elements were replayed
 	 * We can update EndPtr and cleanup the list
 	 */
 	XLogCtlDataUpdatePtr(last_el->end_ptr, last_el->my_timeline, true);
 
+	/* May need unlock after pointer was updated */
+	unlock_xlog_history();
+
+#ifdef WAL_DEBUG
+	dump_xlog_history(s, true);
+	PRDebug_out(s);
+#endif
 
 }
 
@@ -1744,6 +1790,9 @@ dump_xlog_history(StringInfo s, bool need_lock)
 {
 	PR_XLogHistory_el *el;
 
+#if 1
+	return;
+#endif
 	if (need_lock)
 		lock_xlog_history();
 	appendStringInfo(s, "======== XLogHistory =================\n");
@@ -1751,9 +1800,8 @@ dump_xlog_history(StringInfo s, bool need_lock)
 			pr_history->head, pr_history->tail, pr_history->hist_count, pr_history->num_whole_elements, pr_history->num_elements);
 	for (el = pr_history->head; el != pr_history->tail; el = el->next)
 	{
-		appendStringInfo(s, "\tElement: %p, next: %p, curr_ptr: %016lx, end_ptr: %016lx, timeline: %d replayed: %s\n",
-				el, el->next, el->curr_ptr, el->end_ptr, el->my_timeline,
-				el->replayed ? "true" : "false");
+		appendStringInfo(s, "\tElement: %p, next: %p, curr_ptr: %016lx, end_ptr: %016lx, timeline: %d, ser_no: %ld, xid: %d,  replayed: %s\n",
+				el, el->next, el->curr_ptr, el->end_ptr, el->my_timeline, el->ser_no, el->xid, el->replayed ? "true" : "false");
 	}
 	if (need_lock)
 		unlock_xlog_history();
@@ -1801,22 +1849,34 @@ PR_setWorker(int worker_idx)
 		elog(PANIC, "Worker idex %d out of range.", worker_idx);
 	}
 	my_worker_idx = worker_idx;
+	my_worker_name = PR_worker_name(worker_idx, NULL);
 	my_worker = &pr_worker[worker_idx];
 }
 
 char *
 PR_worker_name(int worker_idx, char *buff)
 {
-	if (worker_idx == PR_READER_WORKER_IDX)
-		strcpy(buff, "READER");
-	else if (worker_idx == PR_DISPATCHER_WORKER_IDX)
-		strcpy(buff, "DISPATCHER");
-	else if (worker_idx == PR_TXN_WORKER_IDX)
-		strcpy(buff, "TXN WORKER");
-	else if (worker_idx == PR_INVALID_PAGE_WORKER_IDX)
-		strcpy(buff, "INVALID PAGE WORKER");
+	StringInfo s = NULL;
+
+	if (s == NULL)
+		s = makeStringInfo();
 	else
-		sprintf(buff, "BLOCK WORKER(%d)", worker_idx - PR_BLK_WORKER_MIN_IDX);
+		resetStringInfo(s);
+
+	if (worker_idx == PR_READER_WORKER_IDX)
+		appendStringInfoString(s, "READER_0");
+	else if (worker_idx == PR_DISPATCHER_WORKER_IDX)
+		appendStringInfoString(s, "DISPATCHER_1");
+	else if (worker_idx == PR_TXN_WORKER_IDX)
+		appendStringInfoString(s, "TXN WORKER_2");
+	else if (worker_idx == PR_INVALID_PAGE_WORKER_IDX)
+		appendStringInfoString(s, "INVALID PAGE WORKER_3");
+	else
+		appendStringInfo(s, "BLOCK WORKER_%d(%d)", worker_idx, worker_idx - PR_BLK_WORKER_MIN_IDX);
+	if (buff == NULL)
+		buff = strdup(s->data);
+	else
+		strcpy(buff, s->data);
 	return buff;
 }
 
@@ -1847,6 +1907,7 @@ initWorker(void)
 		worker->wait_dispatch = false;
 		worker->worker_failed = false;
 		worker->worker_terminated = false;
+		worker->num_queued_el = 0;
 		worker->head = NULL;
 		worker->tail = NULL;
 		SpinLockInit(&worker->slock);
@@ -1942,6 +2003,11 @@ PR_WorkerFinish(void)
 	 */
 
 	Assert(my_worker_idx == PR_READER_WORKER_IDX);
+
+	/*
+	 * Send DISPATCHER terminate rquest
+	 */
+	PR_enqueue(NULL, RequestTerminate, PR_DISPATCHER_WORKER_IDX);
 
 	/* First, need to terminate DISPATCHER worker */
 	lock_worker(PR_DISPATCHER_WORKER_IDX);
@@ -2101,7 +2167,7 @@ initQueueElement(void)
 	for (ii = 0, el = pr_queue->element; ii < num_preplay_worker_queue; ii++, el++)
 	{
 		el->next = el + 1;
-		el->data_type = Init;
+		el->data_type = PR_QueueInit;
 		el->data = NULL;
 	}
 	el--;
@@ -2156,15 +2222,147 @@ PR_freeQueueElement(PR_queue_el *el)
 }
 
 
+typedef enum PR_MqDataType
+{
+	PR_Mq_Init = 0,
+	PR_MqData,
+	PR_MqSyncData,
+	PR_MqMax_Value
+} PR_MqDataType;
+
+typedef struct PR_mqueue_data PR_mqueue_data;
+
+struct PR_mqueue_data
+{
+	PR_MqDataType	 cmd;
+	int				 sender_worker_idx;
+	uint64			 ser_no;
+	void			*data;
+};
+
+typedef struct PR_MqInfo PR_MqInfo;
+
+struct PR_MqInfo
+{
+	mqd_t	 queue;
+	bool	 opened;
+	char	*queue_name;
+};
+
+static PR_MqInfo *queue_info = NULL;
+
+/* Mqueue attributes */
+static struct mq_attr queue_attr =
+{
+	.mq_flags = 0,
+	.mq_maxmsg = 10,
+	.mq_msgsize = sizeof(struct PR_mqueue_data),
+	.mq_curmsgs = 0
+};
+
+/*
+ * Wrapper for malloc().
+ */
+static void *
+Malloc(Size sz)
+{
+	void *rv;
+
+	rv = malloc(sz);
+	if (rv == NULL)
+		elog(PANIC, "Out of memory.  Exiting.");
+	return rv;
+}
+
+#define	QUEUENAMLEN	128
+
+/*
+ * Create POSIX message queue to pass WAL records.
+ */
+void
+PR_initMq(void)
+{
+	int ii;
+
+	/* MQ information area */
+	queue_info = (PR_MqInfo *)Malloc(sizeof(PR_MqInfo) * num_preplay_workers);
+	for (ii = 0; ii < num_preplay_workers; ii++)
+	{
+		queue_info[ii].queue_name = (char *)Malloc(QUEUENAMLEN);
+		snprintf(queue_info[ii].queue_name, QUEUENAMLEN, "/pg_%d_%03d", pr_reader_pid, ii);
+		mq_unlink(queue_info[ii].queue_name);
+		queue_info[ii].queue = mq_open(queue_info[ii].queue_name, O_CREAT | O_RDWR, 0600, &queue_attr);
+		if (queue_info[ii].queue < 0)
+			elog(PANIC, "Mq_open() error.\n");
+		queue_info[ii].opened = true;
+	}
+}
+
+/*
+ * Remove all the message queues.
+ */
+void
+PR_finishMq(void)
+{
+	int	ii;
+	for (ii = 0; ii < num_preplay_workers; ii++)
+	{
+		if (queue_info[ii].opened == true)
+			mq_close(queue_info[ii].queue);
+		mq_unlink(queue_info[ii].queue_name);
+	}
+	free(queue_info);
+	queue_info = NULL;
+}
+
+
+/* Message queue version . */
+PR_queue_el *
+PR_fetchQueue(void)
+{
+	PR_queue_el *el;
+	PR_mqueue_data	mqueue_data;
+
+#ifdef WAL_DEBUG
+	PRDebug_log("****** %s() *********\n", __func__);
+#endif
+	for (;;)
+	{
+		mq_receive(queue_info[my_worker_idx].queue, (char *)&mqueue_data, sizeof(PR_mqueue_data), NULL);
+#ifdef WAL_DEBUG
+		PRDebug_log("*** FetchQueue: ser_no %02d-%ld, target: %d ***\n", mqueue_data.sender_worker_idx, mqueue_data.ser_no, my_worker_idx);
+#endif
+		el = (PR_queue_el *)mqueue_data.data;
+		if (el->data_type == RequestSync)
+		{
+			PR_sendSync(el->source_worker);
+			PR_freeQueueElement(el);
+			continue;
+		}
+		else if (el->data_type == RequestSyncAll)
+		{
+			if (my_worker_idx == PR_DISPATCHER_WORKER_IDX)
+				PR_syncAll(false);
+			PR_sendSync(el->source_worker);
+			PR_freeQueueElement(el);
+			continue;
+		}
+		else
+			return el;
+	}
+}
+
+/* Old version of PR_fetchQueue() */
+#if 0
 PR_queue_el *
 PR_fetchQueue(void)
 {
 	PR_queue_el *el;
 
-	lock_my_worker();
 
 	for(;;)
 	{
+		lock_my_worker();
 		el = my_worker->head;
 		if (el)
 		{
@@ -2173,22 +2371,39 @@ PR_fetchQueue(void)
 			 */
 			my_worker->head = el->next;
 			if (my_worker->head == NULL)
+			{
 				my_worker->tail = NULL;
+				my_worker->num_queued_el = 0;
+			}
+			else
+				my_worker->num_queued_el--;
 
 			unlock_my_worker();
 
-			if (el->data_type == RequestSync)
+			if (el->data_type == RequestSyncAll)
 			{
 				if (my_worker_idx == PR_DISPATCHER_WORKER_IDX)
+				{
 					/* Sync all the other workers, not terminating */
 					PR_syncAll(false);
-
+				}
+				PR_sendSync(el->source_worker);
+				PR_freeQueueElement(el);
+				continue;
+			}
+			else if (el->data_type == RequestSync)
+			{
 				PR_sendSync(el->source_worker);
 				PR_freeQueueElement(el);
 				continue;
 			}
 			else
+			{
+#ifdef WAL_DEBUG
+				PR_dump_fetchQueue(__func__, el);
+#endif
 				return el;
+			}
 		}
 		else {
 			my_worker->wait_dispatch = true;
@@ -2196,15 +2411,129 @@ PR_fetchQueue(void)
 			unlock_my_worker();
 
 			PR_recvSync();
+			lock_my_worker();
+			my_worker->wait_dispatch = false;
+			my_worker->num_queued_el = 0;	/* Just in case */
+			unlock_my_worker();
+
 			continue;
+
 		}
 	}
 	return el;	/* Never reaches here */
 }
+#endif
+
+#ifdef WAL_DEBUG
+void
+PR_dump_fetchQueue(const char *funcname, PR_queue_el *el)
+{
+	XLogReaderState		*state;
+	XLogDispatchData_PR *dispatch_data;
+
+	if (el == NULL)
+		return;
+
+	switch(el->data_type)
+	{
+		case ReaderState :
+			state = (XLogReaderState *)(el->data);
+			PRDebug_log("%s:(): ReaderState, ser_no: %ld.\n", funcname, state->ser_no);
+			break;
+		case XLogDispatchData :
+			dispatch_data = (XLogDispatchData_PR *)(el->data);
+			PRDebug_log("%s(): XLogDispatchData, ser_no: %ld.\n", funcname, dispatch_data->reader->ser_no);
+			break;
+		case InvalidPageData :
+			PRDebug_log("%s(): InvalidPageData.\n", funcname);
+			break;
+		case RequestSync :
+			PRDebug_log("%s(): RequestSync.\n", funcname);
+			break;
+		case RequestTerminate :
+			PRDebug_log("%s(): RequestTerminate.\n", funcname);
+			break;
+		default:
+			PRDebug_log("%s(): Unknown.\n", funcname);
+	}
+}
+#endif
 
 /*
  * Enqueue
  */
+
+void
+PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx)
+{
+	PR_queue_el	*el;
+	PR_worker	*target_worker;
+	XLogRecPtr	 currRecPtr;
+	PR_mqueue_data	mqueue_data;
+	static uint64   ser_no = 0;
+
+#ifdef WAL_DEBUG
+	PRDebug_log("****** %s() *********\n", __func__);
+#endif
+
+	target_worker = &pr_worker[worker_idx];
+
+	el = getQueueElement();
+	el->next = NULL;
+	el->data_type = type;
+	el->data = data;
+	el->source_worker = my_worker_idx;
+	switch(type)
+	{
+		case ReaderState:
+			currRecPtr = ((XLogReaderState *)data)->ReadRecPtr;
+			break;
+		case XLogDispatchData:
+			currRecPtr = ((XLogDispatchData_PR *)data)->reader->ReadRecPtr;
+			break;
+		default:
+			currRecPtr = InvalidXLogRecPtr;
+	}
+	if (currRecPtr != InvalidXLogRecPtr)
+	{
+		lock_worker(worker_idx);
+		target_worker->assignedRecPtr = currRecPtr;
+		unlock_worker(worker_idx);
+	}
+	mqueue_data.cmd = PR_MqData;
+	mqueue_data.sender_worker_idx = my_worker_idx;
+	mqueue_data.data = (void *)el;
+	mqueue_data.ser_no = ser_no++;
+
+#ifdef WAL_DEBUG
+	PRDebug_log("*** Enqueue: ser_no: %02d-%ld, target: %d ***\n", my_worker_idx, ser_no, worker_idx);
+#endif
+	if (mq_send(queue_info[worker_idx].queue, (char *)&mqueue_data, sizeof(PR_mqueue_data), 0) == -1)
+	{
+#ifdef WAL_DEBUG
+		PRDebug_log("mq_send() failed. %s.\n", strerror(errno));
+		PR_error_here();
+#endif
+		elog(ERROR, "Failed to assign WAL.");
+	}
+	if (type == RequestSync)
+		PR_recvSync();
+	return;
+}
+
+#if 0
+/* OLD VERSION PR_enqueue, based on only shm */
+
+/* Flow control of the queue */
+
+/* Max assigned element number in the queue */
+static int max_elements_in_queue = 20;
+/*
+ * When max number is reached, number of queues to be handled by
+ * the target worker before synching.
+ */
+static int num_elements_before_sync = 2;
+
 void
 PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx)
 {
@@ -2215,8 +2544,45 @@ PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx)
 	char	workername[64];
 #endif
 
+#ifdef WAL_DEBUG
+	PR_dump_enqueue(__func__, data, type, worker_idx);
+#endif
 
 	target_worker = &pr_worker[worker_idx];
+
+	/* Check queue outstanding queue element */
+
+	if (type != RequestSync)
+	{
+		PR_queue_el *sync_el;
+		PR_queue_el *curr_el;
+		int	ii;
+
+		lock_worker(worker_idx);
+		if (target_worker->num_queued_el >= max_elements_in_queue)
+		{
+			/* Insert RequestSync element in the middle of the queue */
+			sync_el = getQueueElement();
+			sync_el->next = NULL;
+			sync_el->data_type = RequestSync;
+			sync_el->data = NULL;
+			sync_el->source_worker = my_worker_idx;
+			lock_worker(worker_idx);
+			/* We expect num_elements_before_queue is small enough to iterate simply. */
+			for (ii = 1, curr_el = target_worker->head; ii < num_elements_before_sync; ii++, curr_el = curr_el->next);
+			sync_el->next = curr_el->next;
+			curr_el->next = sync_el;
+			target_worker->num_queued_el++;
+			unlock_worker(worker_idx);
+			/* Wait the target worker to reach this element */
+			PR_recvSync();
+		}
+		else
+			unlock_worker(worker_idx);
+	}
+
+	/* Now enqueue */
+
 	el = getQueueElement();
 	el->next = NULL;
 	el->data_type = type;
@@ -2242,9 +2608,9 @@ PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx)
 		target_worker->tail->next = el;
 		target_worker->tail = el;
 	}
+	target_worker->num_queued_el++;
 	if (target_worker->wait_dispatch == true)
 	{
-		target_worker->wait_dispatch = false;
 		unlock_worker(worker_idx);
 #ifdef WAL_DEBUG
 		PRDebug_log("%s queue is empty and it is waiting. Sending sync.\n", PR_worker_name(worker_idx, workername));
@@ -2260,6 +2626,102 @@ PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx)
 		PR_recvSync();
 	return;
 }
+#endif
+
+#ifdef WAL_DEBUG
+void
+PR_dump_enqueue(const char *funcname, void *data, PR_QueueDataType type, int	worker_idx)
+{
+	XLogReaderState		*state;
+	XLogDispatchData_PR *dispatch_data;
+
+	switch(type)
+	{
+		case ReaderState :
+			state = (XLogReaderState *)data;
+			PRDebug_log("%s:(): ReaderState, ser_no: %ld.\n", funcname, state->ser_no);
+			break;
+		case XLogDispatchData :
+			dispatch_data = (XLogDispatchData_PR *)data;
+			PRDebug_log("%s(): XLogDispatchData, ser_no: %ld.\n", funcname, dispatch_data->reader->ser_no);
+			break;
+		case InvalidPageData :
+			PRDebug_log("%s(): InvalidPageData.\n", funcname);
+			break;
+		case RequestSync :
+			PRDebug_log("%s(): RequestSync.\n", funcname);
+			break;
+		case RequestTerminate :
+			PRDebug_log("%s(): RequestTerminate.\n", funcname);
+			break;
+		default:
+			PRDebug_log("%s(): Unknown.\n", funcname);
+	}
+}
+
+void
+PR_dump_queue(bool need_lock)
+{
+	static 	StringInfo s = NULL;
+	int		ii;
+
+#if 1
+	return;
+#endif
+
+	if (s == NULL)
+		s = makeStringInfo();
+	else
+		resetStringInfo(s);
+
+	appendStringInfoString(s, "******** Dump queue **************\n");
+	for (ii = 0; ii < num_preplay_workers; ii++)
+		dump_worker_queue(s, ii, need_lock);
+	appendStringInfoString(s, "******** End Dump queue **************\n");
+	PRDebug_out(s);
+}
+
+static void
+dump_worker_queue(StringInfo s, int worker_id, bool need_lock)
+{
+	PR_queue_el	*curr;
+
+	appendStringInfo(s, "---- Dump Queue for worker: %d ------\n", worker_id);
+	if (need_lock)
+		lock_worker(worker_id);
+	curr = pr_worker[worker_id].head;
+	for(; curr; curr = curr->next)
+		appendStringInfo(s, "queue %p, source: %d, type: %s\n", curr, curr->source_worker, queueTypeName(curr->data_type));
+	appendStringInfo(s,  "---- End Dump Queue for worker: %d ------\n", worker_id);
+	if (need_lock)
+		unlock_worker(worker_id);
+}
+
+static char *
+queueTypeName(PR_QueueDataType type)
+{
+	switch(type)
+	{
+		case PR_QueueInit :
+			return "INIT";
+		case ReaderState :
+			return "ReaderState";
+		case XLogDispatchData :
+			return "XLogDispatchData";
+		case InvalidPageData :
+			return "InvalidPageData";
+		case RequestSync :
+			return "RequestSync";
+		case RequestTerminate :
+			return "RequestTerminate";
+		case PR_QueueMAX_value :
+			return "MAX_value";
+		default:
+			return "Unknown";
+	}
+	return "Unknown";
+}
+#endif
 
 /*
  ****************************************************************************
@@ -2446,6 +2908,10 @@ PR_dump_buffer(const char *funcname, bool need_lock)
 {
 	static StringInfo	s = NULL;
 
+#if 1
+	return;
+#endif
+
 	if (s == NULL)
 		s = makeStringInfo();
 	else
@@ -2463,6 +2929,10 @@ dump_buffer(const char *funcname, StringInfo outs, bool need_lock)
 	int	ii;
 	PR_BufChunk	*curr_chunk;
 	bool	rv = true;
+
+#if 1
+	return true;
+#endif
 
 	if (!pr_buffer->dump_opt)
 		return true;
@@ -2548,6 +3018,40 @@ dump_buffer(const char *funcname, StringInfo outs, bool need_lock)
 	return rv;
 }
 
+void
+PR_dump_chunk(void *buf, const char *funcname, bool need_lock)
+{
+	static StringInfo s = NULL;
+	PR_BufChunk	*chunk;
+
+#if 1
+	return;
+#endif
+	if (s == NULL)
+		s = makeStringInfo();
+	else
+		resetStringInfo(s);
+	if (need_lock)
+		lock_buffer();
+	if (!PR_isInBuffer(buf))
+	{
+		appendStringInfo(s, "%s(): address %p is not in parallel replay shared buffer.\n", funcname, buf);
+		goto returning;
+	}
+	chunk = Chunk(buf);
+	if ((chunk->magic != PR_BufChunk_Allocated) && (chunk->magic != PR_BufChunk_Free))
+	{
+		appendStringInfo(s, "%s(): address %p is not the beginning of buffer.\n", funcname, buf);
+		goto returning;
+	}
+	dump_chunk(chunk, funcname, s, false);
+returning:
+	if (need_lock)
+		unlock_buffer();
+	PRDebug_out(s);
+	return;
+}
+
 static void
 dump_chunk(PR_BufChunk *chunk, const char *funcname, StringInfo outs, bool need_lock)
 {
@@ -2555,6 +3059,9 @@ dump_chunk(PR_BufChunk *chunk, const char *funcname, StringInfo outs, bool need_
 	static StringInfo	ss = NULL;
 	Size	*size_at_tail;
 
+#if 1
+	return;
+#endif
 	if (!pr_buffer->dump_opt)
 		return;
 
@@ -2737,6 +3244,122 @@ retry_allocBuffer(Size sz, bool need_lock)
 /*
  * Allocate chunk in the free area.  pr_buffer->slock has to be acquired by the caller.
  */
+#if 0
+static PR_BufChunk *
+alloc_chunk(Size chunk_sz)
+{
+	PR_BufChunk	*free_chunk;	/* Free chunk to allocate new chunk */
+	PR_BufChunk	*new_free_chunk;
+	PR_BufChunk *new_chunk;
+	Size		 new_free_chunk_size;
+	Size		*size_at_tail_free;
+	Size		*size_at_tail_new;
+
+	/* Arrange the size to boundary */
+	chunk_sz = size_boundary(chunk_sz);
+
+	free_chunk = (PR_BufChunk *)pr_buffer->alloc_start;
+
+	Assert(free_chunk->magic == PR_BufChunk_Free);
+
+	if (pr_buffer->alloc_start == pr_buffer->alloc_end)
+		/* No more area to allocate */
+		return NULL;
+
+	if (free_chunk->size >= chunk_sz)
+	{
+		/* Can allocate chunk from this free chunk */
+		if (free_chunk->size > (chunk_sz + CHUNK_OVERHEAD))
+		{
+			/* Next start will begin after this new chunk */
+			/* Next block is almost identical to the following one. */
+			/* Ned improvement for more portable code */
+			new_free_chunk_size = free_chunk->size - chunk_sz;
+
+			new_chunk = free_chunk;
+			new_free_chunk = addr_forward(free_chunk, chunk_sz);
+
+			new_chunk->size = chunk_sz;
+			new_chunk->magic = PR_BufChunk_Allocated;
+			new_chunk->sno = pr_buffer->curr_sno++;
+			size_at_tail_new = SizeAtTail(new_chunk);
+			*size_at_tail_new = chunk_sz;
+
+			new_free_chunk->size = new_free_chunk_size;
+			new_free_chunk->magic = PR_BufChunk_Free;
+			size_at_tail_free = SizeAtTail(new_free_chunk);
+			*size_at_tail_free = new_free_chunk_size;
+
+			pr_buffer->alloc_start = new_chunk;
+			return new_chunk;
+		}
+		else
+		{
+			/* Whole current free chunk has to be new chunk */
+			free_chunk->magic = PR_BufChunk_Allocated;
+			pr_buffer->alloc_start = next_chunk(free_chunk);
+			if (pr_buffer->alloc_start == pr_buffer->tail)
+			{
+				pr_buffer->alloc_start = pr_buffer->head;
+				if (pr_buffer->alloc_end == pr_buffer->tail)
+					pr_buffer->alloc_end = pr_buffer->head;
+			}
+			return free_chunk;
+		}
+	}
+	else if (addr_before(pr_buffer->alloc_end, pr_buffer->alloc_start))
+	{
+		/* We need to allocate the chunk from next free chunk, at the beginning */
+		free_chunk = pr_buffer->head;
+
+		if (free_chunk->magic != PR_BufChunk_Free)
+			/* No more area to allocate */
+			return NULL;
+		if (free_chunk->size < chunk_sz)
+			return NULL;
+		if (free_chunk->size > (chunk_sz + CHUNK_OVERHEAD))
+		{
+			/* Next start will begin after this new chunk */
+			/* Next block is almost identical to the above one. */
+			/* Ned improvement for more portable code */
+			new_free_chunk_size = free_chunk->size - chunk_sz;
+
+			new_chunk = free_chunk;
+			new_free_chunk = addr_forward(free_chunk, chunk_sz);
+
+			new_chunk->size = chunk_sz;
+			new_chunk->magic = PR_BufChunk_Allocated;
+			new_chunk->sno = pr_buffer->curr_sno++;
+			size_at_tail_new = SizeAtTail(new_chunk);
+			*size_at_tail_new = chunk_sz;
+
+			new_free_chunk->size = new_free_chunk_size;
+			new_free_chunk->magic = PR_BufChunk_Free;
+			size_at_tail_free = SizeAtTail(new_free_chunk);
+			*size_at_tail_free = new_free_chunk_size;
+
+			pr_buffer->alloc_start = new_free_chunk;
+			return new_chunk;
+		}
+		else
+		{
+			/* Whole current free chunk has to be new chunk */
+			free_chunk->magic = PR_BufChunk_Allocated;
+			pr_buffer->alloc_start = next_chunk(free_chunk);
+			if (pr_buffer->alloc_start == pr_buffer->tail)
+			{
+				pr_buffer->alloc_start = pr_buffer->head;
+				if (pr_buffer->alloc_end == pr_buffer->tail)
+					pr_buffer->alloc_end = pr_buffer->head;
+			}
+			return free_chunk;
+		}
+	}
+
+	return NULL;
+}
+/* Old version */
+#else
 static PR_BufChunk *
 alloc_chunk(Size chunk_sz)
 {
@@ -2814,12 +3437,14 @@ alloc_chunk(Size chunk_sz)
 				 */
 				pr_buffer->alloc_start = old_alloc_start;
 			}
-			new_chunk->sno = pr_buffer->curr_sno++;
+			else
+				new_chunk->sno = pr_buffer->curr_sno++;
 			return new_chunk;
 		}
 	}
 	return NULL;	/* Does not reach here */
 }
+#endif
 
 #ifdef WAL_DEBUG
 /*
@@ -2904,8 +3529,10 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	PR_BufChunk	*chunk;
 	int			 ii;
 	static bool *sync_alloc_target = NULL;
+#if 0
 #ifdef WAL_DEBUG
 	static StringInfo	s = NULL;
+#endif
 #endif
 
 
@@ -2918,6 +3545,7 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	/* Do not forget to ping reader or dispatcher if there's free area available */
 	/* Ping the reader worker only when dispatcher does not require the buffer */
 
+#if 0
 #ifdef WAL_DEBUG
 	if (s == NULL)
 		s = makeStringInfo();
@@ -2929,6 +3557,7 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	PRDebug_out(s);
 	resetStringInfo(s);
 
+#endif
 #endif
 	if (addr_before(buffer, pr_buffer->head) || addr_after(buffer, pr_buffer->tail))
 		return;
@@ -2947,15 +3576,19 @@ PR_freeBuffer(void *buffer, bool need_lock)
 		elog(LOG, "Attempt to free wrong buffer.");
 		return;
 	}
+#if 0
 #ifdef WAL_DEBUG
 	resetStringInfo(s);
+#endif
 #endif
 
 	free_chunk(chunk);
 
+#if 0
 #ifdef WAL_DEBUG
 	dump_buffer(__func__, s, false);
 	PRDebug_out(s);
+#endif
 #endif
 
 	/*
@@ -3006,9 +3639,11 @@ PR_freeBuffer(void *buffer, bool need_lock)
 			PR_sendSync(ii);
 	}
 
+#if 0
 #ifdef WAL_DEBUG
 	dump_buffer(__func__, s, need_lock);
 	PRDebug_out(s);
+#endif
 #endif
 	return;
 
@@ -3447,7 +4082,7 @@ my_timeofday(void)
 	current_time = time(NULL);
 	timeofday = localtime(&current_time);
 	sprintf(my_timeofday_val, "%04d%02d%02d_%02d%02d%02d",
-			    timeofday->tm_year + 1900, timeofday->tm_mon, timeofday->tm_mday,
+			    timeofday->tm_year + 1900, timeofday->tm_mon + 1, timeofday->tm_mday,
 				timeofday->tm_hour, timeofday->tm_min, timeofday->tm_sec);
 	return my_timeofday_val;
 }
@@ -3640,15 +4275,7 @@ PRDebug_out(StringInfo s)
 static void
 build_PRDebug_log_hdr(void)
 {
-	char workername[64];
-
-	pr_debug_log_hdr = (char *)malloc(PRDEBUG_HDRSZ);
-	if (my_worker_idx < PR_BLK_WORKER_MIN_IDX)
-		sprintf(pr_debug_log_hdr, "%s(%d): ",
-				PR_worker_name(my_worker_idx, workername), my_worker_idx);
-	else
-		sprintf(pr_debug_log_hdr, "%s_%02d(%d): ",
-				PR_worker_name(my_worker_idx, workername), (my_worker_idx - PR_BLK_WORKER_MIN_IDX), my_worker_idx);
+	pr_debug_log_hdr = PR_worker_name(my_worker_idx, NULL);
 }
 
 /*
@@ -4363,6 +4990,9 @@ syncTxn_blockWorker(PR_txn_cell *txn_cell)
 	char	workername[64];
 #endif
 
+#ifdef WAL_DEBUG
+	PRDebug_log("%s(): Beginning.  txn_cell=%p, xid=%d.\n", __func__, txn_cell, txn_cell->xid);
+#endif
 	Assert(my_worker_idx == PR_TXN_WORKER_IDX);
 	Assert(txn_cell);
 
@@ -4375,12 +5005,13 @@ syncTxn_blockWorker(PR_txn_cell *txn_cell)
 
 		if (txn_cell->lastXLogLSN[ii] != InvalidXLogRecPtr)
 		{
+#ifdef WAL_DEBUG
+			PRDebug_log("Waiting for BLK WORKER(%d) (worker_id %d) to replay LSN:%016lx.\n",
+					ii, (ii + PR_BLK_WORKER_MIN_IDX), txn_cell->lastXLogLSN[ii]);
+			/* Koichi: 以下、トランザクションの終わりのチェックのため */
+#endif
 			txn_cell->blk_worker_to_wait = ii + PR_BLK_WORKER_MIN_IDX;
 			unlock_txn_hash(xid);
-#ifdef WAL_DEBUG
-			PRDebug_log("Waiting for BLK WORKER(%d) (worker_id %d) to replay %016lx WAL record.\n",
-					ii, (ii + PR_BLK_WORKER_MIN_IDX), txn_cell->lastXLogLSN[ii]);
-#endif
 			PR_recvSync();
 #ifdef WAL_DEBUG
 			PRDebug_log("Synch done from %s\n", PR_worker_name(ii + PR_BLK_WORKER_MIN_IDX, workername));
@@ -4389,6 +5020,9 @@ syncTxn_blockWorker(PR_txn_cell *txn_cell)
 		else
 			unlock_txn_hash(xid);
 	}
+#ifdef WAL_DEBUG
+	PRDebug_log("%s(): Done. txn_cell=%p, xid=%d.\n", __func__, txn_cell, txn_cell->xid);
+#endif
 }
 
 /*
@@ -4528,7 +5162,7 @@ dispatchDataToXLogHistory(XLogDispatchData_PR *dispatch_data)
 	PR_XLogHistory_el	*el;
 
 	reader = dispatch_data->reader;
-	el = PR_addXLogHistory(reader->ReadRecPtr, reader->EndRecPtr, reader->timeline);
+	el = PR_addXLogHistory(reader->ReadRecPtr, reader->EndRecPtr, reader->timeline, reader->ser_no, DispatchDataGetXid(dispatch_data));
 	dispatch_data->xlog_history_el = el;
 }
 

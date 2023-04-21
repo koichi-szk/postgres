@@ -102,6 +102,7 @@ struct PR_shm
 	PR_buffer	*buffer;
 	slock_t		shm_slock;			/* Spin lock for EndRecPtrand MinTimeLineID */
 	slock_t		sync_lock;		/* Spin lock for PR_recvSync(). Protects worker->worker_waiting */
+	pid_t		reader_pid;		/* Reader worker PID */
 	bool		some_failed;	/* Indicates if some worker failed and exited. */
 	XLogRecPtr	EndRecPtr;		/* Minimum EndRecPtr among workers */
 	TimeLineID  MinTimeLineID;	/* Min Timeline ID among workers */
@@ -145,6 +146,8 @@ struct PR_XLogHistory_el
 	XLogRecPtr	 		 curr_ptr;		/* from xlogreader->ReadRecPtr */
 	XLogRecPtr	 		 end_ptr;		/* from xlogreader->EndRecPtr */
 	TimeLineID	 		 my_timeline;	/* from xlogreader->timeline */
+	unsigned long		 ser_no;		/* Ser no of this WAL */
+	TransactionId		 xid;			/* xid of this WAL */
 	bool		 		 replayed;
 };
 
@@ -167,15 +170,16 @@ typedef struct PR_worker
 	slock_t	 	slock;			/* TXN and other BLK worker need to read worker status */
 								/* Dispatcher uses this lock to assign new XLogRec */
 								/* Can be spinlock */
-	bool	 	wait_dispatch;	/* Flag to indicate the worker is waiting for xlogrec to handle */
+	bool	 	 wait_dispatch;	/* Flag to indicate the worker is waiting for xlogrec to handle */
 								/* Dispatcher check this and sync. */
-	bool		worker_failed;	/* Indicates this worker failed and exited. */
-	bool		worker_waiting;	/* Flag to indicate the work is waiting for sync.  Protected by pr_shm->wait_flag_lock. */
-	bool		worker_terminated;	/* Indicates the workerr has successfully terminated. */
-	XLogRecPtr	assignedRecPtr;	/* Latest assigned XLOG record ptr. */
+	bool		 worker_failed;	/* Indicates this worker failed and exited. */
+	bool		 worker_waiting;	/* Flag to indicate the work is waiting for sync.  Protected by pr_shm->wait_flag_lock. */
+	bool		 worker_terminated;	/* Indicates the workerr has successfully terminated. */
+	XLogRecPtr	 assignedRecPtr;	/* Latest assigned XLOG record ptr. */
 								/* Set by enqueue side worker. */
-	XLogRecPtr	handledRecPtr;	/* Last andled XLOG record ptr by this worker. */
+	XLogRecPtr	 handledRecPtr;	/* Last andled XLOG record ptr by this worker. */
 								/* Set by fetchqueue side worker */
+	int			 num_queued_el;	/* Number of queue element in the que */
 	PR_queue_el	*head;			/* Dispatched queue head.   Pick queue element from here. */
 	PR_queue_el	*tail;			/* Dispatched queue tail.   Append queue element after this. */
 } PR_worker;
@@ -218,6 +222,8 @@ struct PR_txn_info
 	PR_txn_cell			*cell_head;
 	PR_txn_cell			*cell_tail;
 	slock_t				 cell_slock;	/* Slock for cell pool */
+	uint64				 free_in_pool;
+	uint64				 total_available;
 };
 
 /*
@@ -342,13 +348,14 @@ extern void			     	PR_free_XLogDispatchData_PR(XLogDispatchData_PR *dispatch_da
 
 typedef enum PR_QueueDataType
 {
-	Init = 0,
+	PR_QueueInit = 0,
 	ReaderState,			/* XLogReaderState */
 	XLogDispatchData,		/* XLogDispatchData_PR */
 	InvalidPageData,		/* XLogInvalidPageData_PR */
 	RequestSync,			/* Requesting sync */
+	RequestSyncAll,			/* Requesting sync */
 	RequestTerminate,		/* Request to terminate relevant workers */
-	MAX_value
+	PR_QueueMAX_value
 } PR_QueueDataType;
 
 /*
@@ -474,6 +481,10 @@ extern void PR_debug_analyzeState(XLogReaderState *state, XLogRecord *record);
 extern void PR_breakpoint_func(void);
 extern void PR_error_here(void);
 extern void PR_dump_buffer(const char *funcname, bool need_lock);
+extern void PR_dump_chunk(void *buf, const char *funcname, bool need_lock);
+extern void PR_dump_queue(bool need_lock);
+extern void PR_dump_enqueue(const char *funcname, void *data, PR_QueueDataType type, int  worker_idx);
+extern void PR_dump_fetchQueue(const char *funcname, PR_queue_el *el);
 #endif
 
 #ifdef WAL_DEBUG
@@ -496,12 +507,16 @@ extern void PR_dump_buffer(const char *funcname, bool need_lock);
  */
 extern void PR_initShm(void);
 extern void PR_finishShm(void);
+extern void PR_initMq(void);
+extern void PR_finishMq(void);
 
 /*
  * History data function
  */
 extern void PR_setXLogReplayed(PR_XLogHistory_el *el);
-extern PR_XLogHistory_el *PR_addXLogHistory(XLogRecPtr currPtr, XLogRecPtr endPtr, TimeLineID my_timeline);
+extern PR_XLogHistory_el
+	*PR_addXLogHistory(XLogRecPtr currPtr, XLogRecPtr endPtr, TimeLineID myTimeline,
+			long ser_no, TransactionId xid);
 
 /* Worker functions */
 

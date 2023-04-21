@@ -6526,7 +6526,9 @@ StartupXLOG(void)
 	bool		promoted = false;
 	struct stat st;
 
+#if 0
 	static int	PR_sync_interval = 200;
+#endif
 	int	PR_handled_wal_records_in_the_loop = 0;
 
 	/*
@@ -7376,6 +7378,7 @@ StartupXLOG(void)
 							num_preplay_workers)));
 			PR_syncInitSockDir();
 			PR_initShm();
+			PR_initMq();
 			PR_WorkerStartup();
 
 			/*
@@ -7623,30 +7626,12 @@ StartupXLOG(void)
 					{
 						PR_loop_count = 0;
 						PR_dump_buffer(__func__, true);
+						PR_dump_queue(true);
 						PR_breakpoint();
 					}
 					else
 						PR_loop_count++;
-#if 0
-					if (PR_loop_sync_count >= PR_loop_sync_num)
-					{
-						PR_loop_sync_count = 0;
-						PR_enqueue(NULL, RequestSyncAll, PR_DISPATCHER_WORKER_IDX);
-					}
-					PR_loop_sync_count++;
 #endif
-#endif
-
-					if (PR_handled_wal_records_in_the_loop >= PR_sync_interval)
-					{
-						PR_handled_wal_records_in_the_loop = 0;
-#if 0
-						PR_enqueue(NULL, RequestSyncAll, PR_DISPATCHER_WORKER_IDX);
-#endif
-#ifdef WAL_DEBUG
-						PR_error_here();	/* For GDB breakpoint */
-#endif
-					}
 					PR_enqueue(xlogreader_PR, ReaderState, PR_DISPATCHER_WORKER_IDX);
 					PR_handled_wal_records_in_the_loop++;
 				}
@@ -7737,9 +7722,11 @@ StartupXLOG(void)
 			 */
 			if (PR_isInParallelRecovery())
 			{
+				PR_breakpoint();		/* Breakpoint */
 				PR_WorkerFinish();
 				PR_finishShm();
 				PR_syncFinishSockDir();
+				PR_finishMq();
 #ifdef WAL_DEBUG
 				if (PR_test)
 					PRDebug_finish();
@@ -7810,6 +7797,7 @@ StartupXLOG(void)
 			{
 				PR_WorkerFinish();
 				PR_finishShm();
+				PR_finishMq();
 				/*
 				 * We need to call this here to check all the outstanding WAL
 				 * replay not found in the previous call.
