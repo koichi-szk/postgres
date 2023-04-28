@@ -2236,6 +2236,7 @@ struct PR_mqueue_data
 {
 	PR_MqDataType	 cmd;
 	int				 sender_worker_idx;
+	int				 receiver_worker_idx;
 	uint64			 ser_no;
 	void			*data;
 };
@@ -2330,7 +2331,7 @@ PR_fetchQueue(void)
 	{
 		mq_receive(queue_info[my_worker_idx].queue, (char *)&mqueue_data, sizeof(PR_mqueue_data), NULL);
 #ifdef WAL_DEBUG
-		PRDebug_log("*** FetchQueue: ser_no %02d-%ld, target: %d ***\n", mqueue_data.sender_worker_idx, mqueue_data.ser_no, my_worker_idx);
+		PRDebug_log("*** FetchQueue: ser_no %02d-%ld, target: %d ***\n", mqueue_data.sender_worker_idx, mqueue_data.ser_no, mqueue_data.receiver_worker_idx);
 #endif
 		el = (PR_queue_el *)mqueue_data.data;
 		if (el->data_type == RequestSync)
@@ -2474,6 +2475,8 @@ PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx)
 
 #ifdef WAL_DEBUG
 	PRDebug_log("****** %s() *********\n", __func__);
+	if (worker_idx == PR_INVALID_PAGE_WORKER_IDX)
+		PR_breakpoint();
 #endif
 
 	target_worker = &pr_worker[worker_idx];
@@ -2503,10 +2506,11 @@ PR_enqueue(void *data, PR_QueueDataType type, int	worker_idx)
 	mqueue_data.cmd = PR_MqData;
 	mqueue_data.sender_worker_idx = my_worker_idx;
 	mqueue_data.data = (void *)el;
+	mqueue_data.receiver_worker_idx = worker_idx;
 	mqueue_data.ser_no = ser_no++;
 
 #ifdef WAL_DEBUG
-	PRDebug_log("*** Enqueue: ser_no: %02d-%ld, target: %d ***\n", my_worker_idx, ser_no, worker_idx);
+	PRDebug_log("*** Enqueue: ser_no: %02d-%ld, target: %d, queue: %s  ***\n", my_worker_idx, mqueue_data.ser_no, worker_idx, queue_info[worker_idx].queue_name);
 #endif
 	if (mq_send(queue_info[worker_idx].queue, (char *)&mqueue_data, sizeof(PR_mqueue_data), 0) == -1)
 	{
@@ -4570,8 +4574,9 @@ invalidPageWorkerLoop(void)
 		PRDebug_log("Fetched\n");
 		dump_invalidPageData(page);
 #endif	/* WAL_DEBUG */
-#ifdef PR_IGNORE_REPLAY_ERROR
 		PR_freeBuffer(page, true);
+		PR_sendSync(source_worker);
+#ifdef PR_IGNORE_REPLAY_ERROR
 		continue;
 #endif /* PR_IGNORE_REPLAY_ERROR */
 		switch(page->cmd)
@@ -4580,6 +4585,10 @@ invalidPageWorkerLoop(void)
 				PR_log_invalid_page_int(page->node, page->forkno, page->blkno, page->present);
 				break;
 			case PR_FORGET_PAGES:
+#ifdef WAL_DEBUG
+				PRDebug_log("Received \"FORGET PAGES\"\n");
+				PR_breakpoint();
+#endif
 				PR_forget_invalid_pages_int(page->node, page->forkno, page->blkno);
 				break;
 			case PR_FORGET_DB:
@@ -4683,8 +4692,10 @@ blockWorkerLoop(void)
 		n_involved = data->n_involved;
 		PRDebug_log("Fetched: ser_no: %ld, xlogrecord: \"%s\", n_involved: %d, n_remaining: %d\n",
 				data->reader->ser_no, data->reader->xlog_string, n_involved, n_remaining);
+#if 0
 		if (n_involved > 1)
 			PR_breakpoint();
+#endif
 #endif
 		unlock_dispatch_data(data);
 
@@ -5087,8 +5098,10 @@ dispatcherWorkerLoop(void)
 		dispatch_data = PR_analyzeXLogReaderState(reader, record);
 
 #ifdef WAL_DEBUG
+#if 0
 		if (dispatch_data->n_involved > 1)
 			PR_breakpoint();
+#endif
 #endif
 		if (isSyncBeforeDispatchNeeded(reader))
 			PR_syncAll(false);
@@ -5098,7 +5111,16 @@ dispatcherWorkerLoop(void)
 
 		sync_needed = isSyncAfterDispatchNeeded(reader) ?  true : false;
 		for (worker_list = dispatch_data->worker_list; *worker_list > PR_DISPATCHER_WORKER_IDX; worker_list++)
+		{
+#ifdef WAL_DEBUG
+			if (*worker_list == PR_TXN_WORKER_IDX)
+			{
+				PRDebug_log("Dispatching to TXN worker.\n");
+				PR_breakpoint();
+			}
+#endif
 			PR_enqueue(dispatch_data, XLogDispatchData, *worker_list);
+		}
 		if (sync_needed)
 			PR_syncAll(false);
 

@@ -7430,6 +7430,10 @@ StartupXLOG(void)
 			/*
 			 * main redo apply loop
 			 */
+#ifdef WAL_DEBUG
+			PRDebug_log("Start redo apply loop.\n{");
+			PR_breakpoint();
+#endif
 			do
 			{
 				bool		 switchedTLI = false;
@@ -7615,10 +7619,8 @@ StartupXLOG(void)
 					XLogReaderStateCleanupDecodedData(xlogreader, false);
 #ifdef WAL_DEBUG
 					xlogreader_PR->ser_no = ++ser_no;
-
 					xlogreader_PR->xlog_string = xlog_string;
 
-					PRDebug_log("========================================================================================================\n");
 					PRDebug_log("Enqueue, ser_no(%ld) to %s, XLOGrecord: \"%s\"\n",
 							ser_no, PR_worker_name(PR_DISPATCHER_WORKER_IDX, workername), xlogreader_PR->xlog_string);
 
