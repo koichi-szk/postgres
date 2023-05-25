@@ -148,9 +148,17 @@ typedef enum LockTagType
 	LOCKTAG_VIRTUALTRANSACTION, /* virtual transaction (ditto) */
 	LOCKTAG_SPECULATIVE_TOKEN,	/* speculative insertion Xid and token */
 	LOCKTAG_OBJECT,				/* non-relation database object */
+	LOCKTAG_EXTERNAL,           /* External lock to represent child remote transaction */
+								/* ID info for an external txn is pgprocno, pid, xid and serial no. */
+								/* All the above is taken from the lock group leader */
 	LOCKTAG_USERLOCK,			/* reserved for old contrib/userlock code */
 	LOCKTAG_ADVISORY			/* advisory user locks */
 } LockTagType;
+
+/*
+ * Encapsulation of DEADLOCK_INFO
+ */
+typedef struct DEADLOCK_INFO DEADLOCK_INFO;
 
 #define LOCKTAG_LAST_TYPE	LOCKTAG_ADVISORY
 
@@ -488,6 +496,18 @@ typedef struct BlockedProcsData
 } BlockedProcsData;
 
 
+typedef struct ExternalLockInfo
+{
+	int			pid;
+	int			pgprocno;
+	LocalTransactionId	txnid;
+	int			serno;
+	char	   *dsn;
+	int			target_pid;
+	int			target_pgprocno;
+	LocalTransactionId	target_txn;
+} ExternalLockInfo;
+
 /* Result codes for LockAcquire() */
 typedef enum
 {
@@ -504,9 +524,68 @@ typedef enum
 	DS_NO_DEADLOCK,				/* no deadlock detected */
 	DS_SOFT_DEADLOCK,			/* deadlock avoided by queue rearrangement */
 	DS_HARD_DEADLOCK,			/* deadlock, no way out but ERROR */
-	DS_BLOCKED_BY_AUTOVACUUM	/* no deadlock; queue blocked by autovacuum
+	DS_BLOCKED_BY_AUTOVACUUM,	/* no deadlock; queue blocked by autovacuum
 								 * worker */
+	DS_EXTERNAL_LOCK,			/* waiting for remote transaction, need global
+								 * deadlock detection */
+	DS_DEADLOCK_INFO,			/* Set of deadlock/external_lock information is available.
+								 * Internal use */
+	DS_GLOBAL_ERROR				/* Used only to report internal error in global deadlock detection */
 } DeadLockState;
+
+
+/*
+ * Information saved about each edge in a detected deadlock cycle.  This
+ * is used to print a diagnostic message upon failure.
+ *
+ * Note: because we want to examine this info after releasing the lock
+ * manager's partition locks, we can't just store LOCK and PGPROC pointers;
+ * we must extract out all the info we want to be able to print.
+ */
+
+#define WfG_HAS_EXTERNAL_LOCK	0x00000001
+#define WfG_HAS_VISITED_PROC	0x00000002
+
+/* Used in serialized global/local wait-for-graph */
+#define WfG_GLOBAL_MAGIC		0x80800001
+#define WfG_LOCAL_MAGIC			0x80880001
+
+typedef struct DEADLOCK_INFO
+{
+    LOCKTAG     locktag;        /* ID of awaited lock object */
+    LOCKMODE    lockmode;       /* type of lock we're waiting for */
+    int         pid;            /* PID of blocked backend */
+    /*
+     * K.Suzuki: The following is used for global deadlock detection.
+     *           These information is backed up here to check if there are no change
+     *           in PID and TXID and Wait-for-graph is globally stable.
+     */
+    int         pgprocno;       /* PGPROC index of the blocked backend */
+    TransactionId   txid;       /* Transacito ID of the blocked backend */
+} DEADLOCK_INFO;
+
+typedef struct LOCAL_WFG
+{
+	int32			 	  local_wfg_flag;
+	int64			 	  database_system_identifier;
+	int32				  visitedProcPid;		/* PID of visitedProc[0], exist only in the origin node */
+	int32			      visitedProcPgprocno;	/* pgprocno of visitedProc[0], exist only in the origin node */
+	int32				  visitedProcLxid;		/* lxid of visitedProc[0], exist only in the origin node */
+	int32			 	  nDeadlockInfo;
+	DEADLOCK_INFO		 *deadlock_info;
+	char				**backend_activity;		/* Each backend's activity in deadlock_info[] above. */
+	ExternalLockInfo	 *external_lock;
+} LOCAL_WFG;
+
+/*
+ * local_wfg[0] represents the local wait-for-graph for origine database.  local_wfg[1] represents
+ * the next downstream database.
+ */
+typedef struct GLOBAL_WFG
+{
+	int32	  	  nLocalWfg;	/* Number of local wait-for-graph in this global wait-for-graph */
+	LOCAL_WFG	**local_wfg;	/* Local wait-for-graph for each database.  Local_wfg[0] represents origin */
+} GLOBAL_WFG;
 
 /*
  * The lockmgr's shared hash tables are partitioned to reduce contention.
@@ -533,6 +612,12 @@ typedef enum
  */
 #define LockHashPartitionLockByProc(leader_pgproc) \
 	LockHashPartitionLock((leader_pgproc)->pgprocno)
+
+#define CompleteExternalLock(l) \
+	do { (l)->locktag_type = LOCKTAG_EXTERNAL; \
+		 (l)->locktag_lockmethodid = DEFAULT_LOCKMETHOD; \
+	} while (0)
+
 
 /*
  * function prototypes
@@ -602,6 +687,7 @@ extern void RememberSimpleDeadLock(PGPROC *proc1,
 extern void InitDeadLockChecking(void);
 
 extern int	LockWaiterCount(const LOCKTAG *locktag);
+DEADLOCK_INFO *GetDeadLockInfo(int *nInfo);
 
 #ifdef LOCK_DEBUG
 extern void DumpLocks(PGPROC *proc);
@@ -612,5 +698,30 @@ extern void DumpAllLocks(void);
 extern void VirtualXactLockTableInsert(VirtualTransactionId vxid);
 extern void VirtualXactLockTableCleanup(void);
 extern bool VirtualXactLock(VirtualTransactionId vxid, bool wait);
+
+/* Functions for External Lock */
+extern	uint64	get_database_system_id(void);
+extern	const char *locktagTypeName(LockTagType type);
+extern	void	set_locktag_external(LOCKTAG *locktag, PGPROC *proc, bool incr);
+extern	LockAcquireResult ExternalLockAcquire(PGPROC *proc, LOCKTAG *locktag);
+extern	bool	ExternalLockRelease(LOCKTAG *locktag);
+extern	bool	ExternalLockWaitProc(const LOCKTAG *locktag, PGPROC *proc);
+extern	bool	ExternalLockWait(const LOCKTAG *locktag);
+extern	bool	ExternalLockUnWaitProc(const LOCKTAG *locktag, PGPROC *proc);
+extern	bool	ExternalLockUnWait(const LOCKTAG *locktag);
+extern	bool	ExternalLockSetProperties(LOCKTAG *locktag,
+					PGPROC *proc, char *dsn, int target_pgprocno,
+					int target_pid, TransactionId target_xid, bool update_flag);
+extern DEADLOCK_INFO *BuildLocalDeadlockInfo(int *nInfo);
+extern ExternalLockInfo *GetExternalLockProperties(const LOCKTAG *locktag);
+extern void FreeExternalLockProperties(ExternalLockInfo *ext_lockinfo);
+extern bool ExternalLockSetPropertiesWaiting(PGPROC *proc, char *dsn,
+					int target_pgprocno, int target_pid, TransactionId target_xid,
+					bool update_flag);
+
+
+/* Functions for Global deadlock detection */
+
+extern DeadLockState GlobalDeadlockCheck(PGPROC *proc);
 
 #endif							/* LOCK_H_ */
