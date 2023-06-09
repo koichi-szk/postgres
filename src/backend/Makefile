@@ -57,6 +57,8 @@ endif
 
 override LDFLAGS := $(LDFLAGS) $(LDFLAGS_EX) $(LDFLAGS_EX_BE)
 
+LIBS += ../../src/interfaces/libpq/libpq.a
+
 ##########################################################################
 
 all: submake-libpgport submake-catalog-headers submake-utils-headers postgres $(POSTGRES_IMP)

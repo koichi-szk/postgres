@@ -1248,6 +1248,14 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 							 tag->locktag_field2,
 							 tag->locktag_field1);
 			break;
+		case LOCKTAG_EXTERNAL:
+			appendStringInfo(buf,
+							 _("exetrnal lock [%u,%u,%u,%u]"),
+							 tag->locktag_field1,
+							 tag->locktag_field2,
+							 tag->locktag_field3,
+							 tag->locktag_field4);
+			break;
 		default:
 			appendStringInfo(buf,
 							 _("unrecognized locktag type %d"),
