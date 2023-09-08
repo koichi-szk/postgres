@@ -3576,7 +3576,9 @@ PR_freeBuffer(void *buffer, bool need_lock)
 	{
 		if (need_lock)
 			unlock_buffer();
+#ifdef WAL_DEBUG
 		PRDebug_log("Attempt to free wrong buffer. Addr: 0x%p.\n", buffer);
+#endif
 		elog(LOG, "Attempt to free wrong buffer.");
 		return;
 	}
@@ -4840,7 +4842,9 @@ txnWorkerLoop(void)
 		}
 		else if (el->data_type != XLogDispatchData)
 		{
+#ifdef WAL_DEBUG
 			PR_error_here();		/* GDB breakpoint */
+#endif
 			PR_failing();
 			elog(PANIC, "Invalid internal status for transaction worker.");
 		}
@@ -5084,7 +5088,9 @@ dispatcherWorkerLoop(void)
 		}
 		else if (el->data_type != ReaderState)
 		{
+#ifdef WAL_DEBUG
 			PR_error_here();
+#endif
 			PR_failing();
 			elog(PANIC, "Invalid internal status for dispatcher worker.");
 		}
@@ -5184,7 +5190,9 @@ dispatchDataToXLogHistory(XLogDispatchData_PR *dispatch_data)
 	PR_XLogHistory_el	*el;
 
 	reader = dispatch_data->reader;
+#ifdef WAL_DEBUG
 	el = PR_addXLogHistory(reader->ReadRecPtr, reader->EndRecPtr, reader->timeline, reader->ser_no, DispatchDataGetXid(dispatch_data));
+#endif
 	dispatch_data->xlog_history_el = el;
 }
 
