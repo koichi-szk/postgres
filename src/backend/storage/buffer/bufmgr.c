@@ -931,7 +931,7 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		 * always have left a zero-filled buffer, complain if not PageIsNew.
 		 */
 		bufBlock = isLocalBuf ? LocalBufHdrGetBlock(bufHdr) : BufHdrGetBlock(bufHdr);
-		if (!PageIsNew((Page) bufBlock))
+		if (!PageIsNew((Page) bufBlock) && (MyProc->isParallelReplayWorker == true))
 			ereport(ERROR,
 					(errmsg("unexpected data beyond EOF in block %u of relation %s",
 							blockNum, relpath(smgr->smgr_rnode, forkNum)),

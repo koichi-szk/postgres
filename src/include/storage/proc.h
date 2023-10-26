@@ -198,6 +198,7 @@ struct PGPROC
 	pg_atomic_uint64 waitStart; /* time at which wait for lock acquisition
 								 * started */
 
+	bool		isParallelReplayWorker;	/* Indicates if the process is parallel replay worker. */
 	bool		delayChkpt;		/* true if this proc delays checkpoint start */
 
 	uint8		statusFlags;	/* this backend's status flags, see PROC_*

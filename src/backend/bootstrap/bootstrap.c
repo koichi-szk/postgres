@@ -443,6 +443,8 @@ AuxiliaryProcessMain(int argc, char *argv[])
 	 */
 	SetProcessingMode(NormalProcessing);
 
+	MyProc->isParallelReplayWorker = false;
+
 	switch (MyAuxProcType)
 	{
 		case CheckerProcess:
@@ -493,6 +495,7 @@ AuxiliaryProcessMain(int argc, char *argv[])
 			proc_exit(1);
 
 		case ParallelRedoProcess:
+			MyProc->isParallelReplayWorker = true;
 			ParallelRedoProcessMain(MyAuxProcIdx);
 			proc_exit(1);		/* should never return */
 
