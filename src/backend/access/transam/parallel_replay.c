@@ -50,6 +50,7 @@
 #include "storage/dsm.h"
 #include "storage/ipc.h"
 #include "storage/pg_shmem.h"
+#include "storage/proc.h"
 #include "utils/elog.h"
 
 
@@ -1948,6 +1949,8 @@ PR_atStartWorker(int idx)
 	}
 	my_worker->worker_pid = getpid();
 	unlock_my_worker();
+
+	MyProc->isParallelReplayWorker = true;
 
 	/* Tell the READER worker that I'm ready */
 
@@ -5190,9 +5193,9 @@ dispatchDataToXLogHistory(XLogDispatchData_PR *dispatch_data)
 	PR_XLogHistory_el	*el;
 
 	reader = dispatch_data->reader;
-#ifdef WAL_DEBUG
+/*#ifdef WAL_DEBUG */
 	el = PR_addXLogHistory(reader->ReadRecPtr, reader->EndRecPtr, reader->timeline, reader->ser_no, DispatchDataGetXid(dispatch_data));
-#endif
+/*#endif */
 	dispatch_data->xlog_history_el = el;
 }
 

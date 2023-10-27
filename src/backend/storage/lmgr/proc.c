@@ -345,6 +345,7 @@ InitProcess(void)
 	if (MyProc != NULL)
 	{
 		*procgloballist = (PGPROC *) MyProc->links.next;
+		MyProc->isParallelReplayWorker = false;
 		SpinLockRelease(ProcStructLock);
 	}
 	else
@@ -565,6 +566,7 @@ InitAuxiliaryProcess(void)
 	((volatile PGPROC *) auxproc)->pid = MyProcPid;
 
 	MyProc = auxproc;
+	MyProc->isParallelReplayWorker = false;
 
 	SpinLockRelease(ProcStructLock);
 
