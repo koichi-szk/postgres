@@ -5189,13 +5189,15 @@ PR_redo(XLogDispatchData_PR	*data)
 static void
 dispatchDataToXLogHistory(XLogDispatchData_PR *dispatch_data)
 {
+#ifdef WAL_DEBUG
 	XLogReaderState		*reader;
-	PR_XLogHistory_el	*el;
+#endif
+	PR_XLogHistory_el	*el = NULL;
 
+#ifdef WAL_DEBUG
 	reader = dispatch_data->reader;
-/*#ifdef WAL_DEBUG */
 	el = PR_addXLogHistory(reader->ReadRecPtr, reader->EndRecPtr, reader->timeline, reader->ser_no, DispatchDataGetXid(dispatch_data));
-/*#endif */
+#endif
 	dispatch_data->xlog_history_el = el;
 }
 
